@@ -28,6 +28,8 @@ pub struct Field {
     pub step: usize,
     pub device: Device,
     pub peak_reserved_bytes: std::cell::Cell<u64>,
+    packed_tables: std::cell::RefCell<Option<(usize, Tensor<2>, Tensor<2>)>>,
+    inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
 }
 
 pub fn tensor<const D: usize>(data: Vec<f32>, shape: [usize; D], device: &Device) -> Tensor<D> {
@@ -61,14 +63,24 @@ impl Gradients {
     pub fn insert(&mut self, name: String, tensor: Tensor<2>) {
         self.params.insert(name, tensor);
     }
-    pub fn into_tensors(mut self, device: &Device) -> BTreeMap<String, Tensor<2>> {
+    pub fn into_tensors(mut self, field: &Field) -> BTreeMap<String, Tensor<2>> {
+        if let Some(packed) = self.params.remove("encoding.packed") {
+            let mut offset = 0;
+            for level in 0..field.active.min(14) {
+                let name = format!("encoding.embeddings.{level}");
+                let entries = field.params[&name].value.dims()[0];
+                self.params
+                    .insert(name, packed.clone().slice([offset..offset + entries, 0..2]));
+                offset += entries;
+            }
+        }
         for (level, data) in self.host_tables.into_iter().enumerate() {
             if data.is_empty() {
                 continue;
             }
             let name = format!("encoding.embeddings.{level}");
             let entries = data.len() / 2;
-            let g = tensor(data, [entries, 2], device);
+            let g = tensor(data, [entries, 2], &field.device);
             self.params
                 .entry(name)
                 .and_modify(|v| *v = (v.clone() + g.clone()).detach())
@@ -155,6 +167,8 @@ impl Field {
             step: 0,
             device,
             peak_reserved_bytes: std::cell::Cell::new(peak),
+            packed_tables: std::cell::RefCell::new(None),
+            inference_weights: std::cell::RefCell::new(None),
         }
     }
     pub fn load(path: &Path, device: Device) -> Result<Self> {
@@ -212,6 +226,8 @@ impl Field {
             step: m.step,
             device,
             peak_reserved_bytes: std::cell::Cell::new(peak),
+            packed_tables: std::cell::RefCell::new(None),
+            inference_weights: std::cell::RefCell::new(None),
         })
     }
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -265,7 +281,14 @@ impl Field {
     pub fn evaluate(&self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
         let mut values = Vec::with_capacity(points.len());
         for pts in points.chunks(chunk) {
-            values.extend(self.forward_impl(pts, false).try_into_vec_as::<f32>()?);
+            let n = pts.len();
+            let xyz = tensor(
+                pts.iter().flatten().copied().collect(),
+                [n, 3],
+                &self.device,
+            );
+            let features = self.compute_features_gpu(xyz);
+            values.extend(self.mlp_forward(features, false).try_into_vec_as::<f32>()?);
             self.trim_memory();
         }
         Ok(values)
@@ -347,44 +370,100 @@ impl Field {
     }
 
     pub fn mlp_forward(&self, x: Tensor<2>, training: bool) -> Tensor<2> {
+        let h = self.mlp_hidden(x, training);
+        self.mlp_output(h, training)
+    }
+
+    fn effective_weight(&self, layer: usize, training: bool) -> Tensor<2> {
+        if training {
+            let v = self.p(&format!("lin{layer}.weight_v"));
+            let g = self.p(&format!("lin{layer}.weight_g"));
+            return v.clone() * g / (v.clone() * v).sum_dim(1).sqrt();
+        }
+        if self.inference_weights.borrow().is_none() {
+            let build = |layer| {
+                let v = self.p(&format!("lin{layer}.weight_v")).detach();
+                let g = self.p(&format!("lin{layer}.weight_g")).detach();
+                (v.clone() * g / (v.clone() * v).sum_dim(1).sqrt()).detach()
+            };
+            *self.inference_weights.borrow_mut() = Some((build(0), build(1)));
+        }
+        let cache = self.inference_weights.borrow();
+        let weights = cache.as_ref().unwrap();
+        if layer == 0 {
+            weights.0.clone()
+        } else {
+            weights.1.clone()
+        }
+    }
+
+    fn mlp_hidden(&self, x: Tensor<2>, training: bool) -> Tensor<2> {
         let param = |name: &str| {
             let p = self.p(name);
             if training { p } else { p.detach() }
         };
-        let mut h = x;
-        for l in 0..2 {
-            let v = param(&format!("lin{l}.weight_v"));
-            let g = param(&format!("lin{l}.weight_g"));
-            let w = v.clone() * g / (v.clone() * v).sum_dim(1).sqrt();
-            h = h.matmul(w.transpose()) + param(&format!("lin{l}.bias"));
-            if l == 0 {
-                let scaled = h.clone() * 100.;
-                let soft = (scaled.clone().clamp_max(20.).exp() + 1.).log() / 100.;
-                h = soft.mask_where(scaled.greater_elem(20.), h);
+        let w = self.effective_weight(0, training);
+        let h = x.matmul(w.transpose()) + param("lin0.bias");
+        let scaled = h.clone() * 100.;
+        let soft = (scaled.clone().clamp_max(20.).exp() + 1.).log() / 100.;
+        soft.mask_where(scaled.greater_elem(20.), h)
+    }
+
+    fn mlp_output(&self, h: Tensor<2>, training: bool) -> Tensor<2> {
+        let bias = self.p("lin1.bias");
+        let bias = if training { bias } else { bias.detach() };
+        let w = self.effective_weight(1, training);
+        h.matmul(w.transpose()) + bias
+    }
+
+    fn output_weight_gradients(
+        &self,
+        hidden: Tensor<2>,
+        adjoints: Tensor<2>,
+    ) -> (Tensor<2>, Tensor<2>) {
+        let v = self.p("lin1.weight_v").detach();
+        let g = self.p("lin1.weight_g").detach();
+        let norm_squared = (v.clone() * v.clone()).sum_dim(1);
+        let norm = norm_squared.clone().sqrt();
+        let dw = adjoints.transpose().matmul(hidden);
+        let dot = (dw.clone() * v.clone()).sum_dim(1);
+        let dg = dot.clone() / norm.clone();
+        let dv = (dw - v * (dot / norm_squared)) * (g / norm);
+        (dv.detach(), dg.detach())
+    }
+
+    fn packed_tables(&self) -> (Tensor<2>, Tensor<2>) {
+        let active = self.active.min(14);
+        if let Some((cached_active, tables, metadata)) = self.packed_tables.borrow().as_ref() {
+            if *cached_active == active {
+                return (tables.clone(), metadata.clone());
             }
         }
-        h
+        let mut tables = Vec::with_capacity(active);
+        let mut metadata = Vec::with_capacity(active * 2);
+        let mut offset = 0usize;
+        for level in 0..active {
+            let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as usize;
+            let table = self.p(&format!("encoding.embeddings.{level}")).detach();
+            metadata.extend([res as f32, offset as f32]);
+            offset += table.dims()[0];
+            tables.push(table);
+        }
+        let packed = Tensor::cat(tables, 0);
+        let metadata = tensor(metadata, [active, 2], &self.device);
+        *self.packed_tables.borrow_mut() = Some((active, packed.clone(), metadata.clone()));
+        (packed, metadata)
     }
 
     pub fn compute_features_gpu(&self, xyz: Tensor<2>) -> Tensor<2> {
         let n = xyz.shape().dims::<2>()[0];
-        let mut features = Tensor::zeros([n, 31], &self.device);
-        let active_levels = self.active.min(14) as u32;
-        for level in 0..active_levels {
-            let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as u32;
-            let dense = (res as usize + 1).pow(3) <= 524288;
-            let table = self.p(&format!("encoding.embeddings.{level}")).detach();
-            features = crate::kernels::forward_level(
-                xyz.clone(),
-                table,
-                features,
-                res,
-                level,
-                dense,
-                level == 0,
-            );
+        let active = self.active.min(14);
+        if active == 0 {
+            return Tensor::cat(vec![xyz, Tensor::zeros([n, 28], &self.device)], 1);
         }
-        features
+        let features = Tensor::zeros([n, 31], &self.device);
+        let (tables, metadata) = self.packed_tables();
+        crate::kernels::forward_packed(xyz, tables, metadata, features, active)
     }
 
     fn forward_impl(&self, points: &[[f32; 3]], training: bool) -> Tensor<2> {
@@ -443,14 +522,19 @@ impl Field {
         accumulated: &mut Gradients,
     ) {
         let active_levels = self.active.min(14);
-        for level in 0..active_levels {
-            let table_name = format!("encoding.embeddings.{level}");
-            if !accumulated.params.contains_key(&table_name) {
-                let entries = self.params.get(&table_name).unwrap().value.dims()[0];
-                accumulated
-                    .params
-                    .insert(table_name, Tensor::zeros([entries, 2], &self.device));
-            }
+        let (_, metadata) = self.packed_tables();
+        if !accumulated.params.contains_key("encoding.packed") {
+            let entries: usize = (0..active_levels)
+                .map(|level| {
+                    self.params[&format!("encoding.embeddings.{level}")]
+                        .value
+                        .dims()[0]
+                })
+                .sum();
+            accumulated.params.insert(
+                "encoding.packed".into(),
+                Tensor::zeros([entries, 2], &self.device),
+            );
         }
 
         let mut offset = 0;
@@ -460,19 +544,22 @@ impl Field {
             offset += n;
 
             let feat = chunk.feat.detach().autodiff().require_grad();
-            let output = self.mlp_forward(feat.clone(), true);
-            let loss = (output * tensor(ds.to_vec(), [n, 1], &self.device)).sum();
+            let hidden = self.mlp_hidden(feat.clone(), true);
+            let output = self.mlp_output(hidden.clone(), true);
+            let ds_tensor = tensor(ds.to_vec(), [n, 1], &self.device);
+            let (dv, dg) = self.output_weight_gradients(hidden.detach(), ds_tensor.clone());
+            for (name, grad) in [("lin1.weight_v", dv), ("lin1.weight_g", dg)] {
+                accumulated
+                    .params
+                    .entry(name.to_string())
+                    .and_modify(|v| *v = (v.clone() + grad.clone()).detach())
+                    .or_insert(grad);
+            }
+            let loss = (output * ds_tensor).sum();
             let grads = loss.backward();
 
             // 1. MLP parameters
-            for name in [
-                "lin0.weight_v",
-                "lin0.weight_g",
-                "lin0.bias",
-                "lin1.weight_v",
-                "lin1.weight_g",
-                "lin1.bias",
-            ] {
+            for name in ["lin0.weight_v", "lin0.weight_g", "lin0.bias", "lin1.bias"] {
                 let p = self.params.get(name).unwrap();
                 if let Some(g) = p.value.grad(&grads) {
                     accumulated
@@ -485,21 +572,15 @@ impl Field {
 
             // 2. Hash table embeddings on GPU
             if let Some(d_feat_tensor) = feat.grad(&grads) {
-                for level in 0..active_levels {
-                    let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as u32;
-                    let dense = (res as usize + 1).pow(3) <= 524288;
-                    let table_name = format!("encoding.embeddings.{level}");
-                    let table_grad = accumulated.params.remove(&table_name).unwrap();
-                    let updated = crate::kernels::backward_level(
-                        chunk.pts_tensor.clone(),
-                        d_feat_tensor.clone(),
-                        table_grad,
-                        res,
-                        level as u32,
-                        dense,
-                    );
-                    accumulated.params.insert(table_name, updated);
-                }
+                let table_grad = accumulated.params.remove("encoding.packed").unwrap();
+                let updated = crate::kernels::backward_packed(
+                    chunk.pts_tensor.clone(),
+                    d_feat_tensor,
+                    metadata.clone(),
+                    table_grad,
+                    active_levels,
+                );
+                accumulated.params.insert("encoding.packed".into(), updated);
             }
             drop(grads);
         }
@@ -517,6 +598,8 @@ impl Field {
         self.accumulate_gradients_cached(cached, adjoints, accumulated);
     }
     pub fn apply_gradients(&mut self, gradients: BTreeMap<String, Tensor<2>>, lr: f64) {
+        self.packed_tables.get_mut().take();
+        self.inference_weights.get_mut().take();
         for (name, grad) in gradients {
             let p = self.params.get_mut(&name).unwrap();
             p.updates += 1;
@@ -544,6 +627,14 @@ pub fn verify(path: &Path, device: Device) -> Result<()> {
     let r: Reference = serde_json::from_slice(&std::fs::read(path.join("reference.json"))?)?;
     let y = field.forward(&r.points);
     let values = y.clone().try_into_vec_as::<f32>()?;
+    let (gpu_values, _) = field.evaluate_and_cache(&r.points, 8192)?;
+    let gpu_error = gpu_values
+        .iter()
+        .zip(&r.sdf)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    println!("packed GPU field forward max_abs={gpu_error:0.8e}");
+    ensure!(gpu_error < 2e-4, "packed GPU field output mismatch");
     let max_err = values
         .iter()
         .zip(&r.sdf)
@@ -552,6 +643,17 @@ pub fn verify(path: &Path, device: Device) -> Result<()> {
     let loss = (y.clone() * y).mean();
     let loss_val: f32 = loss.clone().into_scalar();
     let grads = loss.backward();
+    let (features, _, _) = field.compute_features_impl(&r.points, false);
+    let hidden = field.mlp_hidden(features, false);
+    let adjoint_values: Vec<f32> = values
+        .iter()
+        .map(|&sdf| 2. * sdf / values.len() as f32)
+        .collect();
+    let adjoints = tensor(adjoint_values.clone(), [values.len(), 1], &field.device);
+    let (output_dv, output_dg) = field.output_weight_gradients(hidden, adjoints);
+    let mut packed_gradients = Gradients::default();
+    field.accumulate_gradients(&r.points, &adjoint_values, 31, &mut packed_gradients);
+    let packed_gradients = packed_gradients.into_tensors(&field);
     println!(
         "field forward max_abs={max_err:0.8e}; loss={loss_val:?}, reference={}",
         r.loss
@@ -559,11 +661,23 @@ pub fn verify(path: &Path, device: Device) -> Result<()> {
     ensure!(max_err < 2e-4, "field output mismatch");
     for (name, expected_norm) in r.grad_norms {
         let p = field.params.get(&name).context("missing parameter")?;
-        let g = p
+        let mut g = p
             .value
             .grad(&grads)
             .context(format!("missing gradient {name}"))?
             .try_into_vec_as::<f32>()?;
+        if name == "lin1.weight_g" || name == "lin1.weight_v" {
+            let analytic = if name == "lin1.weight_g" {
+                output_dg.clone()
+            } else {
+                output_dv.clone()
+            };
+            println!(
+                "{name}: Burn autodiff norm={}",
+                g.iter().map(|x| x * x).sum::<f32>().sqrt()
+            );
+            g = analytic.try_into_vec_as::<f32>()?;
+        }
         let expected = read_f32(&path.join(format!("{}.grad.bin", name.replace('.', "_"))))?;
         let err = g
             .iter()
@@ -574,6 +688,21 @@ pub fn verify(path: &Path, device: Device) -> Result<()> {
         let max_ref = expected.iter().map(|x| x.abs()).fold(0f32, f32::max);
         println!("{name}: grad_max_abs={err:0.3e} norm={norm:0.6e} reference={expected_norm:0.6e}");
         ensure!(err < 2e-4 + max_ref * 2e-3, "gradient mismatch {name}");
+        let packed = packed_gradients
+            .get(&name)
+            .context(format!("missing packed gradient {name}"))?
+            .clone()
+            .try_into_vec_as::<f32>()?;
+        let packed_err = packed
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("{name}: packed_grad_max_abs={packed_err:0.3e}");
+        ensure!(
+            packed_err < 2e-4 + max_ref * 2e-3,
+            "packed gradient mismatch {name}"
+        );
     }
     Ok(())
 }

@@ -4,7 +4,7 @@ Native reconstruction for the `pure_pytorch_version` branch's `own_objects.conf`
 
 Implemented: EXR/PNG/NPZ ingestion, camera decomposition and patch rays, progressive hash encoding, weight-normalized SDF MLP, occupancy updates, sphere marching, visibility filtering, directional finite differences, packed normal/mask integration, all three training losses, analytical renderer backward, Burn field backward, Adam, native checkpoint/resume, and streaming marching cubes with largest-component filtering.
 
-The neural field and optimizer use WGPU. Sampling, hash-index preparation and the analytical compositor currently run on CPU. This is a working correctness-first implementation; fused GPU kernels and performance parity are unfinished. Training has not yet been validated over 30,000 native updates.
+The neural field, hash-grid interpolation and gradient scatter, and optimizer use WGPU. Ray sampling and the analytical compositor run on CPU, with point uploads and SDF readbacks between stages. Field inference for visibility and occupancy also uses the packed WGPU hash kernel. The earlier native training run was cancelled; short continuations from the 5k, 10k, and 30k Python checkpoints are measured in `VALIDATION.md`. Sustained speed and integrated-GPU performance remain to be validated.
 
 ## Build and diagnose
 

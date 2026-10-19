@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::Result;
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -99,34 +100,52 @@ pub fn march(
     step_size: f32,
     rng: &mut impl Rng,
 ) -> Vec<Sample> {
-    let mut samples = vec![];
-    for (p, patch) in patches.iter().enumerate() {
-        let d = patch.dirs[4];
-        let o = patch.origin;
-        let a = dot(d, d);
-        let b = 2. * dot(o, d);
-        let c = dot(o, o) - 1.;
-        let disc = b * b - 4. * a * c;
-        if disc <= 0. {
-            continue;
-        }
-        let near = (-b - disc.sqrt()) / (2. * a) + rng.random::<f32>() * step_size;
-        let far = (-b + disc.sqrt()) / (2. * a);
-        let steps = ((far - near) / step_size).ceil().max(0.) as usize;
-        for s in 0..steps {
-            let t = near + s as f32 * step_size;
-            let end = t + step_size;
-            let mid = (t + end) * 0.5;
-            if mid < far && occ.occupied(point(o, d, mid)) {
-                samples.push(Sample {
-                    patch: p,
-                    start: t,
-                    end,
-                });
+    // Draw in the original serial order; each ray can then march independently.
+    let jitter: Vec<_> = patches
+        .iter()
+        .map(|patch| {
+            let d = patch.dirs[4];
+            let o = patch.origin;
+            let a = dot(d, d);
+            let b = 2. * dot(o, d);
+            let c = dot(o, o) - 1.;
+            let disc = b * b - 4. * a * c;
+            (disc > 0.).then(|| rng.random::<f32>())
+        })
+        .collect();
+    let by_patch: Vec<Vec<Sample>> = patches
+        .par_iter()
+        .enumerate()
+        .map(|(p, patch)| {
+            let mut samples = Vec::new();
+            let d = patch.dirs[4];
+            let o = patch.origin;
+            let a = dot(d, d);
+            let b = 2. * dot(o, d);
+            let c = dot(o, o) - 1.;
+            let disc = b * b - 4. * a * c;
+            if disc <= 0. {
+                return samples;
             }
-        }
-    }
-    samples
+            let near = (-b - disc.sqrt()) / (2. * a) + jitter[p].unwrap() * step_size;
+            let far = (-b + disc.sqrt()) / (2. * a);
+            let steps = ((far - near) / step_size).ceil().max(0.) as usize;
+            for s in 0..steps {
+                let t = near + s as f32 * step_size;
+                let end = t + step_size;
+                let mid = (t + end) * 0.5;
+                if mid < far && occ.occupied(point(o, d, mid)) {
+                    samples.push(Sample {
+                        patch: p,
+                        start: t,
+                        end,
+                    });
+                }
+            }
+            samples
+        })
+        .collect();
+    by_patch.into_iter().flatten().collect()
 }
 pub fn visible(
     field: &Field,
@@ -463,7 +482,7 @@ pub fn verify_step(
         "variance".into(),
         tensor(vec![c.variance_grad], [1, 1], &field.device),
     );
-    let gradients = gradients.into_tensors(&field.device);
+    let gradients = gradients.into_tensors(&field);
     let mut oracle_gradients = BTreeMap::new();
     for (name, g) in &gradients {
         let expected = read_f32(&path.join(format!("{}.step.grad.bin", name.replace('.', "_"))))?;

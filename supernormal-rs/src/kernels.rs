@@ -1,6 +1,74 @@
 use cubecl::prelude::*;
 
 #[cube(launch)]
+pub fn hash_grid_packed_forward_kernel(
+    points: &Tensor<f32>,
+    tables: &Tensor<f32>,
+    metadata: &Tensor<f32>,
+    features: &mut Tensor<f32>,
+    active: u32,
+) {
+    let point_idx = ABSOLUTE_POS;
+    if point_idx >= points.shape(0) {
+        terminate!();
+    }
+    let p0 = points[point_idx * 3];
+    let p1 = points[point_idx * 3 + 1];
+    let p2 = points[point_idx * 3 + 2];
+    let row = point_idx * 31;
+    features[row] = p0;
+    features[row + 1] = p1;
+    features[row + 2] = p2;
+
+    let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
+    let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
+    let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
+    for level in 0..active {
+        let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+        let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+        let c0 = norm0 * f32::cast_from(res);
+        let c1 = norm1 * f32::cast_from(res);
+        let c2 = norm2 * f32::cast_from(res);
+        let b0 = f32::floor(c0);
+        let b1 = f32::floor(c1);
+        let b2 = f32::floor(c2);
+        let w0 = c0 - b0;
+        let w1 = c1 - b1;
+        let w2 = c2 - b2;
+        let base0 = u32::cast_from(b0);
+        let base1 = u32::cast_from(b1);
+        let base2 = u32::cast_from(b2);
+        let r1 = res + 1;
+        let dense = r1 * r1 * r1 <= 524288;
+        let mut feat0 = 0.0_f32;
+        let mut feat1 = 0.0_f32;
+        for corner in 0..8u32 {
+            let bit0 = corner & 1;
+            let bit1 = (corner >> 1) & 1;
+            let bit2 = (corner >> 2) & 1;
+            let v0 = base0 + bit0;
+            let v1 = base1 + bit1;
+            let v2 = base2 + bit2;
+            let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
+            let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
+            let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
+            let weight = kw0 * kw1 * kw2;
+            let idx = if dense {
+                v0 + v1 * r1 + v2 * r1 * r1
+            } else {
+                (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+            };
+            let entry = usize::cast_from(offset + idx) * 2;
+            feat0 += weight * tables[entry];
+            feat1 += weight * tables[entry + 1];
+        }
+        let col = row + 3 + usize::cast_from(level) * 2;
+        features[col] = feat0;
+        features[col + 1] = feat1;
+    }
+}
+
+#[cube(launch)]
 pub fn hash_grid_level_forward_kernel<F: Float>(
     points: &Tensor<F>,       // [N, 3]
     table: &Tensor<F>,        // [entries, 2]
@@ -193,6 +261,71 @@ pub fn hash_grid_level_backward_kernel(
     }
 }
 
+#[cube(launch)]
+pub fn hash_grid_packed_backward_kernel(
+    points: &Tensor<f32>,
+    d_features: &Tensor<f32>,
+    metadata: &Tensor<f32>,
+    table_grad: &Tensor<Atomic<u32>>,
+    active: u32,
+) {
+    let point_idx = ABSOLUTE_POS;
+    if point_idx >= points.shape(0) {
+        terminate!();
+    }
+    let p0 = points[point_idx * 3];
+    let p1 = points[point_idx * 3 + 1];
+    let p2 = points[point_idx * 3 + 2];
+    let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
+    let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
+    let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
+    for level in 0..active {
+        let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+        let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+        let c0 = norm0 * f32::cast_from(res);
+        let c1 = norm1 * f32::cast_from(res);
+        let c2 = norm2 * f32::cast_from(res);
+        let b0 = f32::floor(c0);
+        let b1 = f32::floor(c1);
+        let b2 = f32::floor(c2);
+        let w0 = c0 - b0;
+        let w1 = c1 - b1;
+        let w2 = c2 - b2;
+        let base0 = u32::cast_from(b0);
+        let base1 = u32::cast_from(b1);
+        let base2 = u32::cast_from(b2);
+        let r1 = res + 1;
+        let dense = r1 * r1 * r1 <= 524288;
+        let col = point_idx * 31 + 3 + usize::cast_from(level) * 2;
+        let g0 = d_features[col];
+        let g1 = d_features[col + 1];
+        for corner in 0..8u32 {
+            let bit0 = corner & 1;
+            let bit1 = (corner >> 1) & 1;
+            let bit2 = (corner >> 2) & 1;
+            let v0 = base0 + bit0;
+            let v1 = base1 + bit1;
+            let v2 = base2 + bit2;
+            let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
+            let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
+            let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
+            let weight = kw0 * kw1 * kw2;
+            let idx = if dense {
+                v0 + v1 * r1 + v2 * r1 * r1
+            } else {
+                (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+            };
+            let entry = usize::cast_from(offset + idx) * 2;
+            if weight * g0 != 0. {
+                atomic_add_f32(table_grad, entry, weight * g0);
+            }
+            if weight * g1 != 0. {
+                atomic_add_f32(table_grad, entry + 1, weight * g1);
+            }
+        }
+    }
+}
+
 use burn_backend::ExecutionError;
 use burn_cubecl::CubeBackend;
 use burn_cubecl::fusion::{CubeFusionHandle, FusionCubeRuntime};
@@ -205,6 +338,79 @@ use burn_fusion::{
 };
 
 type GpuBackend = Fusion<CubeBackend>;
+
+#[derive(Debug)]
+pub struct HashGridPackedForwardOp {
+    pub desc: CustomOpIr,
+}
+
+impl Operation<FusionCubeRuntime> for HashGridPackedForwardOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([p_ir, t_ir, m_ir, f_ir], [out_ir]) = self.desc.as_fixed();
+        let [ScalarIr::UInt(active)] = self.desc.scalars.as_slice() else {
+            panic!("Invalid scalar arguments for hash_grid_packed_forward")
+        };
+        let points = handles.get_float_tensor::<CubeBackend>(p_ir);
+        let tables = handles.get_float_tensor::<CubeBackend>(t_ir);
+        let metadata = handles.get_float_tensor::<CubeBackend>(m_ir);
+        let features = handles.get_float_tensor::<CubeBackend>(f_ir);
+        let client = points.client.clone();
+        let n = points.meta.shape().dims::<2>()[0];
+        let cube_dim = CubeDim::new(&client, n);
+        let cube_count = cubecl::calculate_cube_count_elemwise(&client, n, cube_dim);
+        hash_grid_packed_forward_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            points.into_tensor_arg(),
+            tables.into_tensor_arg(),
+            metadata.into_tensor_arg(),
+            features.clone().into_tensor_arg(),
+            *active as u32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&out_ir.id, features);
+        Ok(())
+    }
+}
+
+pub fn forward_packed(
+    points: burn::tensor::Tensor<2>,
+    tables: burn::tensor::Tensor<2>,
+    metadata: burn::tensor::Tensor<2>,
+    features: burn::tensor::Tensor<2>,
+    active: usize,
+) -> burn::tensor::Tensor<2> {
+    let p_prim = points.inner().try_into_primitive::<GpuBackend>().unwrap();
+    let t_prim = tables.inner().try_into_primitive::<GpuBackend>().unwrap();
+    let m_prim = metadata.inner().try_into_primitive::<GpuBackend>().unwrap();
+    let f_prim = features.inner().try_into_primitive::<GpuBackend>().unwrap();
+    let client = p_prim.client.clone();
+    let shape = f_prim.shape.clone();
+    let dtype = f_prim.dtype;
+    let out_ir = TensorIr::uninit(client.create_empty_handle(), shape, dtype);
+    let desc = CustomOpIr::with_scalars(
+        "hash_grid_packed_forward",
+        &[
+            p_prim.into_ir(),
+            t_prim.into_ir(),
+            m_prim.into_ir(),
+            f_prim.into_ir(),
+        ],
+        &[out_ir],
+        vec![ScalarIr::UInt(active as u64)],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            HashGridPackedForwardOp { desc },
+        )
+        .outputs();
+    burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out).autodiff()
+}
 
 #[derive(Debug)]
 pub struct HashGridLevelForwardOp {
@@ -381,6 +587,85 @@ pub fn backward_level(
         )
         .outputs();
 
+    burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)
+}
+
+#[derive(Debug)]
+pub struct HashGridPackedBackwardOp {
+    pub desc: CustomOpIr,
+}
+
+impl Operation<FusionCubeRuntime> for HashGridPackedBackwardOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([p_ir, df_ir, m_ir, tg_ir], [out_ir]) = self.desc.as_fixed();
+        let [ScalarIr::UInt(active)] = self.desc.scalars.as_slice() else {
+            panic!("Invalid scalar arguments for hash_grid_packed_backward")
+        };
+        let points = handles.get_float_tensor::<CubeBackend>(p_ir);
+        let d_features = handles.get_float_tensor::<CubeBackend>(df_ir);
+        let metadata = handles.get_float_tensor::<CubeBackend>(m_ir);
+        let table_grad = handles.get_float_tensor::<CubeBackend>(tg_ir);
+        let client = points.client.clone();
+        let n = points.meta.shape().dims::<2>()[0];
+        let cube_dim = CubeDim::new(&client, n);
+        let cube_count = cubecl::calculate_cube_count_elemwise(&client, n, cube_dim);
+        hash_grid_packed_backward_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            points.into_tensor_arg(),
+            d_features.into_tensor_arg(),
+            metadata.into_tensor_arg(),
+            table_grad.clone().into_tensor_arg(),
+            *active as u32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&out_ir.id, table_grad);
+        Ok(())
+    }
+}
+
+pub fn backward_packed(
+    points: burn::tensor::Tensor<2>,
+    d_features: burn::tensor::Tensor<2>,
+    metadata: burn::tensor::Tensor<2>,
+    table_grad: burn::tensor::Tensor<2>,
+    active: usize,
+) -> burn::tensor::Tensor<2> {
+    let p_prim = points.inner().try_into_primitive::<GpuBackend>().unwrap();
+    let df_prim = d_features
+        .inner()
+        .try_into_primitive::<GpuBackend>()
+        .unwrap();
+    let m_prim = metadata.inner().try_into_primitive::<GpuBackend>().unwrap();
+    let tg_prim = table_grad
+        .inner()
+        .try_into_primitive::<GpuBackend>()
+        .unwrap();
+    let client = p_prim.client.clone();
+    let shape = tg_prim.shape.clone();
+    let dtype = tg_prim.dtype;
+    let out_ir = TensorIr::uninit(client.create_empty_handle(), shape, dtype);
+    let desc = CustomOpIr::with_scalars(
+        "hash_grid_packed_backward",
+        &[
+            p_prim.into_ir(),
+            df_prim.into_ir(),
+            m_prim.into_ir(),
+            tg_prim.into_ir(),
+        ],
+        &[out_ir],
+        vec![ScalarIr::UInt(active as u64)],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            HashGridPackedBackwardOp { desc },
+        )
+        .outputs();
     burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)
 }
 

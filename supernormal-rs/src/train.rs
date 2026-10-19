@@ -132,12 +132,12 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         field.active = (step / 2000 + 1).min(14);
         let patches = dataset.random_patches(args.batch, &mut rng);
         let step_size = 10f32.powf(-2. - step as f32 / args.end_iter as f32);
-        let samples = render::visible(
-            &field,
-            &patches,
-            render::march(&patches, &occ, step_size, &mut rng),
-            args.query,
-        )?;
+        let march_started = std::time::Instant::now();
+        let marched = render::march(&patches, &occ, step_size, &mut rng);
+        let march_seconds = march_started.elapsed().as_secs_f64();
+        let visible_started = std::time::Instant::now();
+        let samples = render::visible(&field, &patches, marched, args.query)?;
+        let visibility_seconds = visible_started.elapsed().as_secs_f64();
         if samples.is_empty() {
             anyhow::bail!(
                 "empty occupancy batch at step {step}; checkpoint/config requires investigation"
@@ -206,7 +206,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             ((progress * std::f64::consts::PI).cos() + 1.) * 0.5 * 0.95 + 0.05
         };
         let t_adam_start = std::time::Instant::now();
-        let gradients = gradients.into_tensors(&field.device);
+        let gradients = gradients.into_tensors(&field);
         field.apply_gradients(gradients, 5e-4 * factor);
         field.trim_memory();
         let t_adam = t_adam_start.elapsed().as_secs_f64();
@@ -226,7 +226,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             samples.len()
         );
         println!(
-            "  occupancy={occupancy_seconds:.2}s sampling={sampling_seconds:.2}s eval={t_eval:.2}s composite={t_comp:.2}s bwd={t_bwd:.2}s adam={t_adam:.2}s",
+            "  occupancy={occupancy_seconds:.2}s sampling={sampling_seconds:.2}s (march={march_seconds:.2}s visible={visibility_seconds:.2}s) eval={t_eval:.2}s composite={t_comp:.2}s bwd={t_bwd:.2}s adam={t_adam:.2}s",
         );
         if field.step == final_step {
             println!(

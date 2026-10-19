@@ -29,3 +29,43 @@ At resolution 96, native and Python extraction of the same imported checkpoint b
 PE import inspection found only Windows system DLLs; no Python, CUDA, LibTorch or Visual C++ runtime DLL import. Graphics drivers and operating-system libraries remain required. Other platforms require their own builds and tests.
 
 Remaining: sustained native convergence testing; performance work on hash-grid backward and CPU/GPU transfers; integrated-GPU validation; and broader configuration support. Current reconstruction covers the supplied DFD/L2 configuration. Normal-image validation, preprocessing and original tiny-cuda-nn checkpoint layouts are outside the implemented scope.
+
+## Progress on 2026-10-20
+
+The 500-step scratch run produced a recognizable horse mesh, then two optimization commits landed: `bbf7894` cached features and parallelized host scatter; `5890b3a` moved hash interpolation and gradient scatter to CubeCL/WGPU. The fused kernels passed the development field and gradient comparisons. The original description above records the earlier implementation, so its performance and memory figures are historical.
+
+A full 30,000-step run was launched with 2,048 patches, microbatch 64, query 65,536, and checkpoint/mesh extraction every 200 steps at mesh resolution 128. At inspection, its log had advanced past step 950 and produced meshes at 200, 400, 600, and 800. Steps 801–900 averaged about 1.64 seconds and 200,216 ray samples per iteration, with an active hash-grid level count of **one**. The code adds a level every 2,000 iterations; this timing is not a measured cost for all 14 levels. This run was subsequently cancelled.
+
+## Checkpoint continuation benchmarks — 2026-10-20
+
+The Gemini training run mentioned above was cancelled. Separate short runs imported the 5k, 10k, and 30k pure-PyTorch checkpoints on the RTX 3060. All used 2,048 patches, microbatch 64, query 65,536, and no periodic mesh extraction. The first step was excluded because it rebuilds occupancy and compiles shaders; imported parameter and available Adam state were restored, but occupancy and RNG were fresh. These are therefore performance samples, not exact trajectory continuations. The 30k schedule was extended eight steps solely for timing.
+
+| Checkpoint | Active levels | Timed steps | Median step | Median ray samples | Range |
+|---|---:|---:|---:|---:|---:|
+| 5k | 3 | 3 | 0.449 s | 14,947 | 0.338–0.486 s |
+| 10k | 6 | 9 | 0.764 s | 19,901 | 0.447–3.725 s |
+| 30k | 14 | 7 | 2.181 s | 86,937 | 1.100–5.753 s |
+
+The 10k repeat and 30k runs have intermittent multi-second stalls in evaluation, sampling, or backward. The timing paths are `experiments/benchmark_resume_{5k,10k_repeat,30k}/metrics.csv`; the 10k first pass is separate. The 30k Burn allocator reported a peak reservation of 6.11 GB before cleanup, not total process VRAM. The old 1.3–1.6 s/step observation was from an early one-level run and cannot represent late training.
+
+Additional 5k and 10k field checks exposed wrong Burn autodiff gradients for the output layer's weight-normalization parameters despite forward values matching PyTorch. Explicit chain-rule derivatives for both `lin1.weight_g` and `lin1.weight_v` now match the exported PyTorch gradients at 5k, 10k, and 30k, with maximum absolute errors below `6e-8` for the output weight vector.
+
+An experimental packed hash-grid implementation combines all active levels into one WGPU forward dispatch and one hash-gradient dispatch per chunk. At 30k, seven timed continuation steps had median `1.227 s` versus `2.181 s` in the earlier per-level build, but mean `2.948 s` versus `3.009 s` because multi-second stalls remained. Fast individual steps improved from `1.100 s` to `0.971 s`. This is a small noisy sample, not a reliable 2× throughput gain. The packed implementation still keeps ray traversal, visibility, compositing, and MLP backpropagation outside these hash kernels; it is not a fully fused training step.
+
+The final build explicitly compared packed GPU forward and chunked packed gradients with the 5k, 10k, and 30k PyTorch field references; all passed. In a repeated eight-step 30k sample, normal steps took `1.00–1.27 s`, while intermittent stalls reached `4.87–5.57 s`. The new timer split showed ray traversal itself took only `0.01–0.02 s`; visibility SDF evaluation took `0.18–0.22 s` on normal steps, and training field evaluation took `0.62–0.99 s`. Normal backward was `0.05–0.09 s`. This evidence makes field evaluation, GPU readbacks, and stall elimination higher priorities than porting the ray loop or fusing backward at any cost. The repeat log is `experiments/benchmark_resume_30k_packed_timed.log`.
+
+The 5k packed forward/backward reference check also passed through explicit DX12 selection on the RTX 3060, although the first DX12 verification took several minutes. No integrated adapter is present on this host (`--integrated doctor` returns `AdapterUnavailable`), so Intel UHD correctness, memory use, and speed remain unverified.
+
+Visibility and occupancy inference were then switched from CPU-built hash indices to the already-validated packed GPU hash kernel, and normalized inference weights were cached for each optimizer step. In a final eight-step 30k continuation, visibility fell from about `0.18–0.22 s` to `0.04 s` on normal steps; the fastest complete step fell from `1.00 s` to `0.77 s`. Seven timed steps had median `1.076 s` and mean `2.867 s`; the mean remains distorted by multi-second stalls. Peak Burn allocator reservation fell from `6.03 GB` to `3.75 GB`. This is measured on the RTX 3060 and does not establish performance on Intel integrated graphics. See `experiments/benchmark_resume_30k_gpu_infer.log`.
+
+A longer 25-step 30k continuation found that the final 13 steps settled at median `0.943 s`, mean `0.947 s`, and range `0.763–1.113 s`. Earlier steps still had occasional 3–4 s spikes attributed in the log to whichever GPU-synchronized stage was active; their cause is not yet isolated. This stable late sample is about 1 iteration/s, still far from the original CUDA baseline near 25 iterations/s reported by the user. See `experiments/benchmark_resume_30k_gpu_infer_long.log`.
+
+For a like-for-like final-build comparison, each pure-PyTorch checkpoint was run for 25 additional steps, then the last 13 timed steps were summarized. The first-step occupancy rebuild/shader initialization is excluded. These are still model-only imports, not exact RNG/occupancy resumes.
+
+| Checkpoint | Active hash levels | Median ray samples | Median step | Mean step | Range |
+|---|---:|---:|---:|---:|---:|
+| 5k | 3 | 15,376 | 0.290 s | 0.584 s | 0.257–2.053 s |
+| 10k | 6 | 19,966 | 0.304 s | 0.418 s | 0.280–1.543 s |
+| 30k | 14 | 86,725 | 0.943 s | 0.947 s | 0.763–1.113 s |
+
+Logs: `experiments/benchmark_resume_5k_final_long.log`, `experiments/benchmark_resume_10k_final_long.log`, and `experiments/benchmark_resume_30k_gpu_infer_long.log`.
