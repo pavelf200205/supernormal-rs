@@ -1,0 +1,25 @@
+[package]
+name = "supernormal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+burn = { version = "=0.22.0", default-features = false, features = ["std", "wgpu", "flex", "optim", "extension", "cubecl"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+rand_chacha = { version = "0.9", features = ["serde"] }
+image = { version = "0.25", default-features = false, features = ["png", "exr"] }
+ndarray = "0.16"
+ndarray-npy = "0.9"
+nalgebra = "0.34"
+safetensors = "0.6"
+bytemuck = "1"
+half = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

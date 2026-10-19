@@ -1,0 +1,23 @@
+# Datasets and reference clones
+/data/
+/original_supernormal_exp_horse_960/
+/pure_pytorch_exp/
+/tiny-cuda-nn-reference/
+/SuperNormal_memory_optimized/
+
+# Rust build artifacts and test runs
+supernormal-rs/target/
+supernormal-rs/experiments/
+supernormal-rs/runs/
+supernormal-rs/dist/
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large binary checkpoints and meshes
+*.pth
+*.bin
+*.ply
