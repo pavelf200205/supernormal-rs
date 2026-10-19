@@ -170,7 +170,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             let t0 = std::time::Instant::now();
             let points = render::sample_points(pp, &local);
             let (unique, indices) = render::unique_points(&points);
-            let unique_sdf = field.evaluate(&unique, args.query)?;
+            let (unique_sdf, cache) = field.evaluate_and_cache(&unique, args.query)?;
             let sdf: Vec<_> = indices.iter().map(|&i| unique_sdf[i]).collect();
             t_eval += t0.elapsed().as_secs_f64();
             let t1 = std::time::Instant::now();
@@ -188,7 +188,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 adjoints[i] += g;
             }
             let t2 = std::time::Instant::now();
-            field.accumulate_gradients(&unique, &adjoints, args.query, &mut gradients);
+            field.accumulate_gradients_cached(cache, &adjoints, &mut gradients);
             t_bwd += t2.elapsed().as_secs_f64();
         }
         gradients.insert(

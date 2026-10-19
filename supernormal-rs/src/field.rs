@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use burn::tensor::{Device, Int, Tensor, TensorData};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
@@ -54,7 +55,7 @@ pub fn write_f32(path: &Path, data: &[f32]) -> Result<()> {
 #[derive(Default)]
 pub struct Gradients {
     pub params: BTreeMap<String, Tensor<2>>,
-    pub host_tables: BTreeMap<String, Vec<f32>>,
+    pub host_tables: Vec<Vec<f32>>,
 }
 
 impl Gradients {
@@ -62,7 +63,11 @@ impl Gradients {
         self.params.insert(name, tensor);
     }
     pub fn into_tensors(mut self, device: &Device) -> BTreeMap<String, Tensor<2>> {
-        for (name, data) in self.host_tables {
+        for (level, data) in self.host_tables.into_iter().enumerate() {
+            if data.is_empty() {
+                continue;
+            }
+            let name = format!("encoding.embeddings.{level}");
             let entries = data.len() / 2;
             let g = tensor(data, [entries, 2], device);
             self.params
@@ -72,6 +77,13 @@ impl Gradients {
         }
         self.params
     }
+}
+
+pub struct FeatureChunk {
+    pub feat: Tensor<2>,
+    pub all_indices: Vec<Vec<i32>>,
+    pub all_weights: Vec<Vec<f32>>,
+    pub point_count: usize,
 }
 
 impl Field {
@@ -266,6 +278,7 @@ impl Field {
         points: &[[f32; 3]],
         training: bool,
     ) -> (Tensor<2>, Vec<Vec<i32>>, Vec<Vec<f32>>) {
+        use rayon::prelude::*;
         let n = points.len();
         assert!(n > 0);
         let xyz = tensor(
@@ -273,47 +286,53 @@ impl Field {
             [n, 3],
             &self.device,
         );
+        let active_levels = self.active.min(14);
+        let (all_indices, all_weights): (Vec<Vec<i32>>, Vec<Vec<f32>>) = (0..active_levels)
+            .into_par_iter()
+            .map(|level| {
+                let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as u32;
+                let dense = (res as usize + 1).pow(3) <= 524288;
+                let mut indices = Vec::with_capacity(n * 8);
+                let mut weights = Vec::with_capacity(n * 8);
+                for point in points {
+                    let pos = point.map(|p| ((p + 1.) * 0.5).clamp(0., 1. - 1e-7) * res as f32);
+                    let base = pos.map(|x| x.floor() as u32);
+                    let w = [
+                        pos[0] - base[0] as f32,
+                        pos[1] - base[1] as f32,
+                        pos[2] - base[2] as f32,
+                    ];
+                    for corner in 0..8 {
+                        let mut v = [0u32; 3];
+                        let mut weight = 1.;
+                        for d in 0..3 {
+                            let b = (corner >> d) & 1;
+                            v[d] = base[d] + b;
+                            weight *= if b == 0 { 1. - w[d] } else { w[d] };
+                        }
+                        let idx = if dense {
+                            v[0] + v[1] * (res + 1) + v[2] * (res + 1) * (res + 1)
+                        } else {
+                            (v[0] ^ v[1].wrapping_mul(2654435761) ^ v[2].wrapping_mul(805459861))
+                                & 524287
+                        };
+                        indices.push(idx as i32);
+                        weights.push(weight);
+                    }
+                }
+                (indices, weights)
+            })
+            .unzip();
+
         let mut features = vec![xyz];
-        let mut all_indices = Vec::with_capacity(14);
-        let mut all_weights = Vec::with_capacity(14);
-        for level in 0..self.active.min(14) {
-            let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as u32;
+        for level in 0..active_levels {
             let table = if training {
                 self.p(&format!("encoding.embeddings.{level}"))
             } else {
                 self.p(&format!("encoding.embeddings.{level}")).detach()
             };
-            let entries = table.dims()[0];
-            let dense = (res as usize + 1).pow(3) <= 524288;
-            let mut indices = Vec::with_capacity(n * 8);
-            let mut weights = Vec::with_capacity(n * 8);
-            for point in points {
-                let pos = point.map(|p| ((p + 1.) * 0.5).clamp(0., 1. - 1e-7) * res as f32);
-                let base = pos.map(|x| x.floor() as u32);
-                let w = [
-                    pos[0] - base[0] as f32,
-                    pos[1] - base[1] as f32,
-                    pos[2] - base[2] as f32,
-                ];
-                for corner in 0..8 {
-                    let mut v = [0u32; 3];
-                    let mut weight = 1.;
-                    for d in 0..3 {
-                        let b = (corner >> d) & 1;
-                        v[d] = base[d] + b;
-                        weight *= if b == 0 { 1. - w[d] } else { w[d] };
-                    }
-                    let idx = if dense {
-                        v[0] + v[1] * (res + 1) + v[2] * (res + 1) * (res + 1)
-                    } else {
-                        (v[0] ^ v[1].wrapping_mul(2654435761) ^ v[2].wrapping_mul(805459861))
-                            & 524287
-                    };
-                    assert!((idx as usize) < entries);
-                    indices.push(idx as i32);
-                    weights.push(weight);
-                }
-            }
+            let indices = &all_indices[level];
+            let weights = &all_weights[level];
             let selected = table
                 .select(0, ints(indices.clone(), &self.device))
                 .reshape([n, 8, 2]);
@@ -322,8 +341,6 @@ impl Field {
                     .sum_dim(1)
                     .reshape([n, 2]),
             );
-            all_indices.push(indices);
-            all_weights.push(weights);
         }
         if self.active < 14 {
             features.push(Tensor::zeros([n, (14 - self.active) * 2], &self.device));
@@ -356,6 +373,27 @@ impl Field {
         self.mlp_forward(feat, training)
     }
 
+    pub fn evaluate_and_cache(
+        &self,
+        points: &[[f32; 3]],
+        chunk: usize,
+    ) -> Result<(Vec<f32>, Vec<FeatureChunk>)> {
+        let mut values = Vec::with_capacity(points.len());
+        let mut chunks = Vec::with_capacity(points.len().div_ceil(chunk));
+        for pts in points.chunks(chunk) {
+            let (feat, all_indices, all_weights) = self.compute_features_impl(pts, false);
+            let y = self.mlp_forward(feat.clone(), false);
+            values.extend(y.try_into_vec_as::<f32>()?);
+            chunks.push(FeatureChunk {
+                feat,
+                all_indices,
+                all_weights,
+                point_count: pts.len(),
+            });
+        }
+        Ok((values, chunks))
+    }
+
     pub fn inv_s(&self) -> Tensor<2> {
         (self.p("variance") * 10.).exp().clamp(1e-6, 1e6)
     }
@@ -366,10 +404,6 @@ impl Field {
         let _ = self.device.sync();
         if let Some(usage) = self.device.memory_pool_usage() {
             if usage.bytes_reserved > self.peak_reserved_bytes.get() {
-                eprintln!(
-                    "[MEMORY PEAK] bytes_reserved={} bytes_in_use={}",
-                    usage.bytes_reserved, usage.bytes_in_use
-                );
                 self.peak_reserved_bytes.set(usage.bytes_reserved);
             }
             if usage.bytes_reserved > 256 * 1024 * 1024 {
@@ -378,19 +412,33 @@ impl Field {
         }
     }
 
-    pub fn accumulate_gradients(
+    pub fn accumulate_gradients_cached(
         &self,
-        points: &[[f32; 3]],
+        cached: Vec<FeatureChunk>,
         adjoints: &[f32],
-        chunk: usize,
         accumulated: &mut Gradients,
     ) {
-        assert_eq!(points.len(), adjoints.len());
-        for (pts, ds) in points.chunks(chunk).zip(adjoints.chunks(chunk)) {
-            let (feat, all_indices, all_weights) = self.compute_features_impl(pts, false);
-            let feat = feat.detach().require_grad();
+        let active_levels = self.active.min(14);
+        if accumulated.host_tables.len() < 14 {
+            accumulated.host_tables.resize_with(14, Vec::new);
+        }
+        for level in 0..active_levels {
+            if accumulated.host_tables[level].is_empty() {
+                let table_name = format!("encoding.embeddings.{level}");
+                let entries = self.params.get(&table_name).unwrap().value.dims()[0];
+                accumulated.host_tables[level].resize(entries * 2, 0f32);
+            }
+        }
+
+        let mut offset = 0;
+        for chunk in cached {
+            let n = chunk.point_count;
+            let ds = &adjoints[offset..offset + n];
+            offset += n;
+
+            let feat = chunk.feat.detach().require_grad();
             let output = self.mlp_forward(feat.clone(), true);
-            let loss = (output * tensor(ds.to_vec(), [pts.len(), 1], &self.device)).sum();
+            let loss = (output * tensor(ds.to_vec(), [n, 1], &self.device)).sum();
             let grads = loss.backward();
 
             // 1. MLP parameters
@@ -412,35 +460,42 @@ impl Field {
                 }
             }
 
-            // 2. Hash table embeddings on host
+            // 2. Hash table embeddings on host in parallel across levels
             if let Some(d_feat_tensor) = feat.grad(&grads) {
                 let d_feat: Vec<f32> = d_feat_tensor.try_into_vec_as::<f32>().unwrap();
-                let n = pts.len();
-                let active_levels = self.active.min(14);
-                for level in 0..active_levels {
-                    let table_name = format!("encoding.embeddings.{level}");
-                    let entries = self.params.get(&table_name).unwrap().value.dims()[0];
-                    let host_table = accumulated
-                        .host_tables
-                        .entry(table_name)
-                        .or_insert_with(|| vec![0f32; entries * 2]);
-                    let indices = &all_indices[level];
-                    let weights = &all_weights[level];
-                    for i in 0..n {
-                        let g0 = d_feat[i * 31 + 3 + level * 2];
-                        let g1 = d_feat[i * 31 + 3 + level * 2 + 1];
-                        for corner in 0..8 {
-                            let idx = indices[i * 8 + corner] as usize;
-                            let w = weights[i * 8 + corner];
-                            host_table[idx * 2] += w * g0;
-                            host_table[idx * 2 + 1] += w * g1;
+                accumulated.host_tables[0..active_levels]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(level, host_table)| {
+                        let indices = &chunk.all_indices[level];
+                        let weights = &chunk.all_weights[level];
+                        for i in 0..n {
+                            let g0 = d_feat[i * 31 + 3 + level * 2];
+                            let g1 = d_feat[i * 31 + 3 + level * 2 + 1];
+                            let base = i * 8;
+                            for corner in 0..8 {
+                                let idx = indices[base + corner] as usize;
+                                let w = weights[base + corner];
+                                host_table[idx * 2] += w * g0;
+                                host_table[idx * 2 + 1] += w * g1;
+                            }
                         }
-                    }
-                }
+                    });
             }
             drop(grads);
-            self.trim_memory();
         }
+    }
+
+    pub fn accumulate_gradients(
+        &self,
+        points: &[[f32; 3]],
+        adjoints: &[f32],
+        chunk: usize,
+        accumulated: &mut Gradients,
+    ) {
+        assert_eq!(points.len(), adjoints.len());
+        let (_, cached) = self.evaluate_and_cache(points, chunk).unwrap();
+        self.accumulate_gradients_cached(cached, adjoints, accumulated);
     }
     pub fn apply_gradients(&mut self, gradients: BTreeMap<String, Tensor<2>>, lr: f64) {
         for (name, grad) in gradients {

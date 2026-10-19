@@ -176,7 +176,7 @@ pub fn sample_points(patches: &[Patch], samples: &[Sample]) -> Vec<[f32; 3]> {
 }
 /// Share exactly equal endpoints; never quantize coordinates or change gradients.
 pub fn unique_points(points: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<usize>) {
-    let mut lookup = std::collections::HashMap::with_capacity(points.len());
+    let mut lookup = ahash::AHashMap::with_capacity(points.len());
     let mut unique = Vec::with_capacity(points.len());
     let indices = points
         .iter()

@@ -18,6 +18,8 @@ nalgebra = "0.34"
 safetensors = "0.6"
 bytemuck = "1"
 half = "2"
+rayon = "1.12"
+ahash = "0.8"
 
 [profile.release]
 lto = "thin"

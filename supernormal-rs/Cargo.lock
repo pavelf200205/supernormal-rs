@@ -69,6 +69,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
+ "getrandom 0.3.4",
  "once_cell",
  "version_check",
  "zerocopy",
@@ -5788,6 +5789,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "supernormal"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "burn",
  "bytemuck",
@@ -5799,6 +5801,7 @@ dependencies = [
  "ndarray-npy",
  "rand 0.9.5",
  "rand_chacha 0.9.0",
+ "rayon",
  "safetensors 0.6.2",
  "serde",
  "serde_json",
