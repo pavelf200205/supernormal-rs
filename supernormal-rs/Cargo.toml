@@ -20,6 +20,11 @@ bytemuck = "1"
 half = "2"
 rayon = "1.12"
 ahash = "0.8"
+cubecl = "0.11"
+burn-cubecl = "=0.22.0"
+burn-fusion = "=0.22.0"
+burn-ir = "=0.22.0"
+burn-backend = "=0.22.0"
 
 [profile.release]
 lto = "thin"
