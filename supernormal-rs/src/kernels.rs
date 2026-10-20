@@ -273,54 +273,62 @@ pub fn hash_grid_packed_backward_kernel(
     if point_idx >= points.shape(0) {
         terminate!();
     }
+
     let p0 = points[point_idx * 3];
     let p1 = points[point_idx * 3 + 1];
     let p2 = points[point_idx * 3 + 2];
     let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
     let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
     let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
+
     for level in 0..active {
-        let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
-        let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
-        let c0 = norm0 * f32::cast_from(res);
-        let c1 = norm1 * f32::cast_from(res);
-        let c2 = norm2 * f32::cast_from(res);
-        let b0 = f32::floor(c0);
-        let b1 = f32::floor(c1);
-        let b2 = f32::floor(c2);
-        let w0 = c0 - b0;
-        let w1 = c1 - b1;
-        let w2 = c2 - b2;
-        let base0 = u32::cast_from(b0);
-        let base1 = u32::cast_from(b1);
-        let base2 = u32::cast_from(b2);
-        let r1 = res + 1;
-        let dense = r1 * r1 * r1 <= 524288;
         let col = point_idx * 31 + 3 + usize::cast_from(level) * 2;
         let g0 = d_features[col];
         let g1 = d_features[col + 1];
-        for corner in 0..8u32 {
-            let bit0 = corner & 1;
-            let bit1 = (corner >> 1) & 1;
-            let bit2 = (corner >> 2) & 1;
-            let v0 = base0 + bit0;
-            let v1 = base1 + bit1;
-            let v2 = base2 + bit2;
-            let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
-            let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
-            let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
-            let weight = kw0 * kw1 * kw2;
-            let idx = if dense {
-                v0 + v1 * r1 + v2 * r1 * r1
-            } else {
-                (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
-            };
-            let entry = usize::cast_from(offset + idx) * 2;
-            if weight * g0 != 0. {
-                atomic_add_f32(table_grad, entry, weight * g0);
-            }
-            if weight * g1 != 0. {
-                atomic_add_f32(table_grad, entry + 1, weight * g1);
+
+        if g0 != 0.0 || g1 != 0.0 {
+            let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+            let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+            let c0 = norm0 * f32::cast_from(res);
+            let c1 = norm1 * f32::cast_from(res);
+            let c2 = norm2 * f32::cast_from(res);
+            let b0 = f32::floor(c0);
+            let b1 = f32::floor(c1);
+            let b2 = f32::floor(c2);
+            let w0 = c0 - b0;
+            let w1 = c1 - b1;
+            let w2 = c2 - b2;
+            let base0 = u32::cast_from(b0);
+            let base1 = u32::cast_from(b1);
+            let base2 = u32::cast_from(b2);
+            let r1 = res + 1;
+            let dense = r1 * r1 * r1 <= 524288;
+
+            for corner in 0..8u32 {
+                let bit0 = corner & 1;
+                let bit1 = (corner >> 1) & 1;
+                let bit2 = (corner >> 2) & 1;
+                let v0 = base0 + bit0;
+                let v1 = base1 + bit1;
+                let v2 = base2 + bit2;
+                let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
+                let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
+                let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
+                let weight = kw0 * kw1 * kw2;
+                let idx = if dense {
+                    v0 + v1 * r1 + v2 * r1 * r1
+                } else {
+                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                };
+                let entry = usize::cast_from(offset + idx) * 2;
+                let wg0 = weight * g0;
+                let wg1 = weight * g1;
+                if wg0 != 0. {
+                    atomic_add_f32(table_grad, entry, wg0);
+                }
+                if wg1 != 0. {
+                    atomic_add_f32(table_grad, entry + 1, wg1);
+                }
             }
         }
     }

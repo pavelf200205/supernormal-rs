@@ -18,7 +18,6 @@ pub struct TrainArgs {
     pub out: PathBuf,
     #[arg(long)]
     pub model: Option<PathBuf>,
-    /// Additional updates to execute; defaults to the full configured schedule.
     #[arg(long, default_value_t = 30000)]
     pub steps: usize,
     #[arg(long, default_value_t = 30000)]
@@ -39,7 +38,6 @@ pub struct TrainArgs {
     pub mesh_resolution: usize,
     #[arg(long, default_value_t = 42)]
     pub seed: u64,
-    /// Synchronize backward work for accurate stage timings (adds profiling overhead).
     #[arg(long)]
     #[serde(default)]
     pub profile_stages: bool,
@@ -158,7 +156,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
 
         let mut gradients = crate::field::Gradients::default();
         let mut total = Loss::default();
-        let variance: f32 = field.p("variance").into_scalar();
+        let variance: f32 = field.variance_host;
         let mut variance_grad = 0f32;
         let mut sdf_bias_grad = 0f64;
         let mut t_eval = 0.0;
@@ -191,7 +189,10 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
 
             let t0 = std::time::Instant::now();
             let (unique_sdf, cache) = field.evaluate_and_cache(&unique, args.query)?;
-            let sdf: Vec<_> = indices.iter().map(|&i| unique_sdf[i]).collect();
+            let sdf: Vec<f32> = indices
+                .iter()
+                .map(|&i| unsafe { *unique_sdf.get_unchecked(i) })
+                .collect();
             t_eval += t0.elapsed().as_secs_f64();
 
             let t1 = std::time::Instant::now();
@@ -206,9 +207,11 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             variance_grad += result.variance_grad;
             sdf_bias_grad += f64::from(result.sdf_bias_grad);
 
-            let mut adjoints = vec![0.; unique.len()];
+            let mut adjoints = vec![0f32; unique.len()];
             for (&i, &g) in indices.iter().zip(&result.sdf_grad) {
-                adjoints[i] += g;
+                unsafe {
+                    *adjoints.get_unchecked_mut(i) += g;
+                }
             }
             let t2 = std::time::Instant::now();
             field.accumulate_gradients_cached(cache, &adjoints, &mut gradients);
@@ -236,9 +239,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             ((progress * std::f64::consts::PI).cos() + 1.) * 0.5 * 0.95 + 0.05
         };
         let t_adam_start = std::time::Instant::now();
-        let gradients = gradients.into_tensors(&field);
-        field.apply_gradients(gradients, 5e-4 * factor);
-        let t_adam = t_adam_start.elapsed().as_secs_f64();
+        field.apply_gradients_packed(gradients, 5e-4 * factor);
         field.step += 1;
 
         if field.step % 200 == 0 {
@@ -249,6 +250,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 .sync()
                 .map_err(|e| anyhow::anyhow!("GPU synchronization failed: {e:?}"))?;
         }
+        let t_adam = t_adam_start.elapsed().as_secs_f64();
 
         let secs = started.elapsed().as_secs_f64();
         println!(

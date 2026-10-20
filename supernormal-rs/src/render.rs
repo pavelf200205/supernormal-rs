@@ -61,20 +61,20 @@ impl Occupancy {
             ids
         };
         let r = self.resolution;
-        let previous = self.values.clone();
-        for chunk in ids.chunks(query) {
-            let points: Vec<[f32; 3]> = chunk
-                .iter()
-                .map(|&i| {
-                    let c = [i / (r * r), (i / r) % r, i % r];
-                    c.map(|v| ((v as f32 + rng.random::<f32>()) / r as f32) * 2. - 1.)
-                })
-                .collect();
-            let sdf = field.evaluate(&points, query)?;
-            for (&i, &s) in chunk.iter().zip(&sdf) {
-                self.values[i] = (previous[i] * 0.95).max(sigmoid(-80. * s));
-            }
+
+        let points: Vec<[f32; 3]> = ids
+            .iter()
+            .map(|&i| {
+                let c = [i / (r * r), (i / r) % r, i % r];
+                c.map(|v| ((v as f32 + rng.random::<f32>()) / r as f32) * 2. - 1.)
+            })
+            .collect();
+
+        let sdf = field.evaluate(&points, query)?;
+        for (&i, &s) in ids.iter().zip(&sdf) {
+            self.values[i] = (self.values[i] * 0.95).max(sigmoid(-80. * s));
         }
+
         let threshold =
             (self.values.iter().map(|&x| x as f64).sum::<f64>() / n as f64).min(0.1) as f32;
         for (flag, &value) in self.flags.iter_mut().zip(&self.values) {
@@ -118,6 +118,10 @@ pub fn march(
             (disc > 0.).then(|| rng.random::<f32>())
         })
         .collect();
+
+    let r = occ.resolution as f32;
+    let half_r = r * 0.5;
+
     let by_patch: Vec<Vec<Sample>> = patches
         .par_iter()
         .enumerate()
@@ -135,16 +139,42 @@ pub fn march(
             let near = (-b - disc.sqrt()) / (2. * a) + jitter[p].unwrap() * step_size;
             let far = (-b + disc.sqrt()) / (2. * a);
             let steps = ((far - near) / step_size).ceil().max(0.) as usize;
-            for s in 0..steps {
+            let inv_d = d.map(|v| 1.0 / if v.abs() < 1e-10 { 1e-10 } else { v });
+
+            let mut s = 0usize;
+            while s < steps {
                 let t = near + s as f32 * step_size;
                 let end = t + step_size;
                 let mid = (t + end) * 0.5;
-                if mid < far && occ.occupied(point(o, d, mid)) {
+                if mid >= far {
+                    break;
+                }
+                let pt = point(o, d, mid);
+                if occ.occupied(pt) {
                     samples.push(Sample {
                         patch: p,
                         start: t,
                         end,
                     });
+                    s += 1;
+                } else if pt.iter().any(|&x| x < -1. || x > 1.) {
+                    s += 1;
+                } else {
+                    let mut dt_voxel = f32::MAX;
+                    for axis in 0..3 {
+                        let grid_pos = (pt[axis] + 1.0) * half_r;
+                        let next_plane = if d[axis] >= 0.0 {
+                            grid_pos.floor() + 1.0
+                        } else {
+                            grid_pos.ceil() - 1.0
+                        };
+                        let dt_axis = (next_plane - grid_pos) * inv_d[axis] / half_r;
+                        if dt_axis < dt_voxel {
+                            dt_voxel = dt_axis;
+                        }
+                    }
+                    let skip = ((dt_voxel / step_size).ceil() as usize).max(1);
+                    s += skip;
                 }
             }
             samples
@@ -163,7 +193,6 @@ pub fn visible(
         return Ok(samples);
     }
 
-    // Deduplicate contiguous ray endpoints in O(1) to halve visibility SDF evaluations
     let n = samples.len();
     let mut unique_pts = Vec::with_capacity(n + patches.len());
     let mut start_idx = Vec::with_capacity(n);
@@ -187,7 +216,7 @@ pub fn visible(
     }
 
     let sdf = field.evaluate(&unique_pts, query)?;
-    let inv = field.inv_s().into_scalar();
+    let inv = field.inv_s_host();
     let mut trans = vec![1f32; patches.len()];
     let mut out = Vec::with_capacity(n);
     for (i, s) in samples.into_iter().enumerate() {
@@ -215,9 +244,6 @@ pub fn sample_points(patches: &[Patch], samples: &[Sample]) -> Vec<[f32; 3]> {
     points
 }
 
-/// Fast O(N) point generation + contiguous endpoint deduplication (replaces O(N) AHashMap).
-/// Matches PyTorch `diff_mask` by sharing the 9 end-points of sample `s-1` with the 9 start-points
-/// of sample `s` whenever consecutive samples belong to the same patch and share `end == start`.
 pub fn sample_and_dedup_points(
     patches: &[Patch],
     samples: &[Sample],
@@ -263,7 +289,6 @@ pub fn sample_and_dedup_points(
     (points, unique, indices)
 }
 
-/// Share exactly equal endpoints; never quantize coordinates or change gradients.
 pub fn unique_points(points: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<usize>) {
     let mut lookup = ahash::AHashMap::with_capacity(points.len());
     let mut unique = Vec::with_capacity(points.len());
@@ -315,7 +340,6 @@ pub fn composite(
     let count = samples.len();
     let inv = (variance * 10.).exp().clamp(1e-6, 1e6);
 
-    // Check if samples are monotonically ordered by patch index (always true in march/visible)
     let is_monotonic = samples.windows(2).all(|w| w[0].patch <= w[1].patch);
 
     if !is_monotonic {
@@ -324,7 +348,6 @@ pub fn composite(
         );
     }
 
-    // Build per-patch sample range table `(start_sample, end_sample)`
     let mut patch_ranges = vec![(0usize, 0usize); patches.len()];
     let mut s_idx = 0;
     while s_idx < count {
@@ -340,7 +363,6 @@ pub fn composite(
     let mut normals = vec![[0f32; 3]; patches.len() * 9];
     let mut masks = vec![0f32; patches.len() * 9];
 
-    // Process patches in parallel chunks on Rayon
     let chunk_patches = 64usize;
     let num_patch_chunks = patches.len().div_ceil(chunk_patches);
 
@@ -349,7 +371,6 @@ pub fn composite(
     let mut ds_rest = ds.as_mut_slice();
 
     struct PatchChunkTask<'a> {
-        p_start: usize,
         patches: &'a [Patch],
         ranges: &'a [(usize, usize)],
         normals_out: &'a mut [[f32; 3]],
@@ -368,7 +389,7 @@ pub fn composite(
 
         let mut s_start = prev_s_end;
         let mut s_end = prev_s_end;
-        for &( a, b ) in &patch_ranges[p_start..p_end] {
+        for &(a, b) in &patch_ranges[p_start..p_end] {
             if b > a {
                 if s_start == prev_s_end && s_end == prev_s_end {
                     s_start = a;
@@ -388,7 +409,6 @@ pub fn composite(
         ds_rest = ds_tail;
 
         tasks.push(PatchChunkTask {
-            p_start,
             patches: &patches[p_start..p_end],
             ranges: &patch_ranges[p_start..p_end],
             normals_out: n_head,
@@ -440,7 +460,6 @@ pub fn composite(
                 gw.clear();
                 gw.resize(s_count * 9, 0f32);
 
-                // 1. Forward pass per patch
                 for ls in 0..s_count {
                     let s = s_start + ls;
                     let sample = &samples[s];
@@ -500,7 +519,6 @@ pub fn composite(
                     }
                 }
 
-                // 2. Pixel loss & adjoints
                 let mut dn = [[0f32; 3]; 9];
                 let mut dm = [0f32; 9];
                 for i in 0..9 {
@@ -518,7 +536,6 @@ pub fn composite(
                     }
                 }
 
-                // 3. Eikonal & DFD backward pass (reusing cached 1/dt, 1/dx, 1/dy)
                 for ls in 0..s_count {
                     let s = s_start + ls;
                     let ds_base = (s - task.s_offset) * 18;
@@ -559,7 +576,6 @@ pub fn composite(
                     }
                 }
 
-                // 4. Reverse transmittance backward pass
                 let mut future = [0f32; 9];
                 for ls in (0..s_count).rev() {
                     let s = s_start + ls;
@@ -836,7 +852,6 @@ struct RenderFixture {
     masks: Vec<f32>,
 }
 
-/// Tests the complete field -> renderer -> adjoint -> field -> Adam chain.
 pub fn verify_step(
     model: &std::path::Path,
     path: &std::path::Path,
@@ -854,7 +869,7 @@ pub fn verify_step(
         &f.samples,
         &f.points,
         &sdf,
-        field.p("variance").into_scalar(),
+        field.variance_host,
         f.normal_den,
         f.pixel_den,
         f.sample_den,

@@ -31,7 +31,11 @@ pub struct Field {
     pub step: usize,
     pub device: Device,
     pub peak_reserved_bytes: std::cell::Cell<u64>,
-    packed_tables: std::cell::RefCell<Option<(usize, Tensor<2>, Tensor<2>)>>,
+    pub packed_embedding: Option<Parameter>,
+    pub packed_metadata: Option<Tensor<2>>,
+    pub level_offsets: Vec<usize>,
+    pub level_u32_updates: Vec<usize>,
+    pub variance_host: f32,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
 }
 
@@ -100,13 +104,71 @@ impl Gradients {
 pub struct FeatureChunk {
     pub feat: Tensor<2>,
     pub preactivation: Tensor<2>,
-    pub hidden: Tensor<2>,
     pub pts_tensor: Tensor<2>,
     pub point_count: usize,
     pub padded_count: usize,
 }
 
 impl Field {
+    fn build_packed_embedding(
+        params: &BTreeMap<String, Parameter>,
+        device: &Device,
+    ) -> (Parameter, Tensor<2>, Vec<usize>, Vec<usize>) {
+        let mut values = Vec::with_capacity(14);
+        let mut ms = Vec::with_capacity(14);
+        let mut vs = Vec::with_capacity(14);
+        let mut metadata = Vec::with_capacity(28);
+        let mut offsets = Vec::with_capacity(15);
+        let mut updates = Vec::with_capacity(14);
+        let mut offset = 0usize;
+        offsets.push(0);
+
+        for level in 0..14 {
+            let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as usize;
+            let name = format!("encoding.embeddings.{level}");
+            let p = &params[&name];
+            let rows = p.value.dims()[0];
+            metadata.extend([res as f32, offset as f32]);
+            offset += rows;
+            offsets.push(offset);
+            updates.push(p.updates);
+            values.push(p.value.clone().without_autodiff());
+            ms.push(p.m.clone().without_autodiff());
+            vs.push(p.v.clone().without_autodiff());
+        }
+
+        let packed_param = Parameter {
+            value: Tensor::cat(values, 0),
+            m: Tensor::cat(ms, 0),
+            v: Tensor::cat(vs, 0),
+            updates: updates[0],
+        };
+        let meta_tensor = tensor(metadata, [14, 2], device);
+        (packed_param, meta_tensor, offsets, updates)
+    }
+
+    pub fn sync_packed_to_params(&mut self) {
+        if let Some(packed) = &self.packed_embedding {
+            for level in 0..14 {
+                let start = self.level_offsets[level];
+                let end = self.level_offsets[level + 1];
+                let name = format!("encoding.embeddings.{level}");
+                if let Some(p) = self.params.get_mut(&name) {
+                    p.value = packed
+                        .value
+                        .clone()
+                        .without_autodiff()
+                        .slice([start..end, 0..2])
+                        .autodiff()
+                        .require_grad();
+                    p.m = packed.m.clone().without_autodiff().slice([start..end, 0..2]);
+                    p.v = packed.v.clone().without_autodiff().slice([start..end, 0..2]);
+                    p.updates = self.level_u32_updates[level];
+                }
+            }
+        }
+    }
+
     pub fn new(device: Device, seed: u64) -> Self {
         use rand::{Rng, SeedableRng};
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
@@ -165,6 +227,10 @@ impl Field {
             );
         }
         add("variance".into(), vec![0.5], [1, 1]);
+
+        let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
+            Self::build_packed_embedding(&params, &device);
+
         let _ = device.sync();
         device.memory_cleanup();
         let peak = device
@@ -177,7 +243,11 @@ impl Field {
             step: 0,
             device,
             peak_reserved_bytes: std::cell::Cell::new(peak),
-            packed_tables: std::cell::RefCell::new(None),
+            packed_embedding: Some(packed_embedding),
+            packed_metadata: Some(packed_metadata),
+            level_offsets,
+            level_u32_updates,
+            variance_host: 0.5,
             inference_weights: std::cell::RefCell::new(None),
         }
     }
@@ -225,6 +295,15 @@ impl Field {
                 },
             );
         }
+
+        let variance_host: f32 = params["variance"]
+            .value
+            .clone()
+            .without_autodiff()
+            .into_scalar();
+        let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
+            Self::build_packed_embedding(&params, &device);
+
         let _ = device.sync();
         device.memory_cleanup();
         let peak = device
@@ -237,12 +316,17 @@ impl Field {
             step: m.step,
             device,
             peak_reserved_bytes: std::cell::Cell::new(peak),
-            packed_tables: std::cell::RefCell::new(None),
+            packed_embedding: Some(packed_embedding),
+            packed_metadata: Some(packed_metadata),
+            level_offsets,
+            level_u32_updates,
+            variance_host,
             inference_weights: std::cell::RefCell::new(None),
         })
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.sync_packed_to_params();
         std::fs::create_dir_all(path)?;
         let mut manifest = Manifest {
             format_version: 1,
@@ -293,9 +377,6 @@ impl Field {
         self.forward_impl(points, true)
     }
 
-    /// Pad chunk sizes to static power-of-two buckets (up to `chunk`) so WGPU/CubeCL
-    /// never recompiles shaders for arbitrary remainder lengths, and pipeline all chunks
-    /// before reading back from GPU.
     #[inline]
     fn static_bucket_size(n: usize, chunk: usize) -> usize {
         if n == chunk || chunk < 1024 {
@@ -468,7 +549,6 @@ impl Field {
         self.weight_gradients(1, adjoints.transpose().matmul(hidden))
     }
 
-    /// Chain rule for row-wise weight normalization, shared by both MLP layers.
     fn weight_gradients(&self, layer: usize, dw: Tensor<2>) -> (Tensor<2>, Tensor<2>) {
         let v = self.p(&format!("lin{layer}.weight_v")).without_autodiff();
         let g = self.p(&format!("lin{layer}.weight_g")).without_autodiff();
@@ -481,28 +561,9 @@ impl Field {
     }
 
     fn packed_tables(&self) -> (Tensor<2>, Tensor<2>) {
-        let active = self.active.min(14);
-        if let Some((cached_active, tables, metadata)) = self.packed_tables.borrow().as_ref() {
-            if *cached_active == active {
-                return (tables.clone(), metadata.clone());
-            }
-        }
-        let mut tables = Vec::with_capacity(active);
-        let mut metadata = Vec::with_capacity(active * 2);
-        let mut offset = 0usize;
-        for level in 0..active {
-            let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as usize;
-            let table = self
-                .p(&format!("encoding.embeddings.{level}"))
-                .without_autodiff();
-            metadata.extend([res as f32, offset as f32]);
-            offset += table.dims()[0];
-            tables.push(table);
-        }
-        let packed = Tensor::cat(tables, 0);
-        let metadata = tensor(metadata, [active, 2], &self.device);
-        *self.packed_tables.borrow_mut() = Some((active, packed.clone(), metadata.clone()));
-        (packed, metadata)
+        let tables = self.packed_embedding.as_ref().unwrap().value.clone();
+        let metadata = self.packed_metadata.as_ref().unwrap().clone();
+        (tables, metadata)
     }
 
     pub fn compute_features_gpu(&self, xyz: Tensor<2>) -> Tensor<2> {
@@ -533,7 +594,6 @@ impl Field {
         let w0_t = self.effective_weight(0, false).transpose();
         let b0 = self.p("lin0.bias").without_autodiff();
 
-        // Queue all chunks onto the GPU command stream with static bucket shapes
         for pts in points.chunks(chunk) {
             let n = pts.len();
             let padded_n = Self::static_bucket_size(n, chunk);
@@ -545,20 +605,18 @@ impl Field {
             let feat = self.compute_features_gpu(pts_tensor.clone());
             let preactivation = feat.clone().matmul(w0_t.clone()) + b0.clone();
             let hidden = Self::softplus(preactivation.clone());
-            let y = self.mlp_output(hidden.clone(), false);
+            let y = self.mlp_output(hidden, false);
 
             pending_outputs.push((n, y));
             chunks.push(FeatureChunk {
                 feat,
                 preactivation,
-                hidden,
                 pts_tensor,
                 point_count: n,
                 padded_count: padded_n,
             });
         }
 
-        // Read back after all forward GPU work has been dispatched
         let mut values = Vec::with_capacity(points.len());
         for (n, y) in pending_outputs {
             let v = y.try_into_vec_as::<f32>()?;
@@ -568,13 +626,17 @@ impl Field {
         Ok((values, chunks))
     }
 
+    #[inline]
+    pub fn inv_s_host(&self) -> f32 {
+        (self.variance_host * 10.).exp().clamp(1e-6, 1e6)
+    }
+
     pub fn inv_s(&self) -> Tensor<2> {
         (self.p("variance").without_autodiff() * 10.)
             .exp()
             .clamp(1e-6, 1e6)
     }
 
-    /// Flush lazy work before measuring, then release unused cached pages.
     pub fn trim_memory(&self) {
         let _ = self.device.sync();
         if let Some(usage) = self.device.memory_pool_usage() {
@@ -595,13 +657,7 @@ impl Field {
         let active_levels = self.active.min(14);
         let (_, metadata) = self.packed_tables();
         if !accumulated.params.contains_key("encoding.packed") {
-            let entries: usize = (0..active_levels)
-                .map(|level| {
-                    self.params[&format!("encoding.embeddings.{level}")]
-                        .value
-                        .dims()[0]
-                })
-                .sum();
+            let entries = self.level_offsets[active_levels];
             accumulated.params.insert(
                 "encoding.packed".into(),
                 Tensor::zeros([entries, 2], &self.device),
@@ -623,14 +679,18 @@ impl Field {
             let ds = &adjoints[offset..offset + n];
             offset += n;
 
-            // Pad adjoints with zeros so tail elements contribute 0 gradient
-            // while keeping tensor shapes static across steps.
+            // Skip chunk completely if all adjoints in this chunk are zero
+            if ds.iter().all(|&x| x == 0.0) {
+                continue;
+            }
+
             let mut ds_padded = Vec::with_capacity(padded_n);
             ds_padded.extend_from_slice(ds);
             ds_padded.resize(padded_n, 0.0);
 
             let ds_tensor = tensor(ds_padded, [padded_n, 1], &self.device);
-            let dw1_chunk = ds_tensor.clone().transpose().matmul(chunk.hidden);
+            let hidden = Self::softplus(chunk.preactivation.clone());
+            let dw1_chunk = ds_tensor.clone().transpose().matmul(hidden);
 
             let scaled = chunk.preactivation * 100.;
             let sigmoid = ((-scaled.clone()).exp() + 1.).recip();
@@ -672,7 +732,6 @@ impl Field {
             }
         }
 
-        // Compute weight-normalization chain rule once per microbatch instead of per chunk
         if let (Some(dw0), Some(dw1), Some(db0), Some(db1)) =
             (dw0_total, dw1_total, db0_total, db1_total)
         {
@@ -708,8 +767,109 @@ impl Field {
         self.accumulate_gradients_cached(cached, adjoints, accumulated);
     }
 
+    pub fn apply_gradients_packed(&mut self, mut gradients: Gradients, lr: f64) {
+        self.inference_weights.get_mut().take();
+
+        if let Some(packed_grad) = gradients.params.remove("encoding.packed") {
+            let active = self.active.min(14);
+            let active_rows = self.level_offsets[active];
+            let total_rows = self.level_offsets[14];
+            let packed = self.packed_embedding.as_mut().unwrap();
+
+            let first_u = self.level_u32_updates[0] + 1;
+            let uniform_updates = (0..active).all(|l| self.level_u32_updates[l] + 1 == first_u);
+
+            let grad = packed_grad.without_autodiff();
+            let cur_val = packed
+                .value
+                .clone()
+                .without_autodiff()
+                .slice([0..active_rows, 0..2]);
+            let cur_m = packed
+                .m
+                .clone()
+                .without_autodiff()
+                .slice([0..active_rows, 0..2]);
+            let cur_v = packed
+                .v
+                .clone()
+                .without_autodiff()
+                .slice([0..active_rows, 0..2]);
+
+            // Fused elementwise update for m and v across all active rows at once
+            let new_m = (cur_m * 0.9 + grad.clone() * 0.1).without_autodiff();
+            let new_v = (cur_v * 0.999 + grad.clone() * grad * 0.001).without_autodiff();
+
+            let new_val = if uniform_updates {
+                for l in 0..active {
+                    self.level_u32_updates[l] = first_u;
+                }
+                let bc1 = 1.0 - 0.9f64.powi(first_u as i32);
+                let bc2_sqrt = (1.0 - 0.999f64.powi(first_u as i32)).sqrt();
+                let step_size = lr / bc1;
+                (cur_val - new_m.clone() * step_size / (new_v.clone().sqrt() / bc2_sqrt + 1e-8))
+                    .without_autodiff()
+            } else {
+                // Build 1D column vectors [active_rows, 1] for step_size and inv_bc2_sqrt
+                // so the entire active table updates in ONE fused Burn expression without slicing cur_val/new_m/new_v!
+                let mut scale1_parts = Vec::with_capacity(active);
+                let mut scale2_parts = Vec::with_capacity(active);
+                for l in 0..active {
+                    self.level_u32_updates[l] += 1;
+                    let u = self.level_u32_updates[l] as i32;
+                    let rows = self.level_offsets[l + 1] - self.level_offsets[l];
+                    let step_scale = (lr / (1.0 - 0.9f64.powi(u))) as f32;
+                    let inv_bc2_sqrt = (1.0 / (1.0 - 0.999f64.powi(u)).sqrt()) as f32;
+                    scale1_parts.push(Tensor::<2>::full([rows, 1], step_scale, &self.device));
+                    scale2_parts.push(Tensor::<2>::full([rows, 1], inv_bc2_sqrt, &self.device));
+                }
+                let scale1 = Tensor::cat(scale1_parts, 0);
+                let scale2 = Tensor::cat(scale2_parts, 0);
+                (cur_val - (new_m.clone() * scale1) / (new_v.clone().sqrt() * scale2 + 1e-8))
+                    .without_autodiff()
+            };
+
+            if active_rows < total_rows {
+                packed.value = packed
+                    .value
+                    .clone()
+                    .without_autodiff()
+                    .slice_assign([0..active_rows, 0..2], new_val);
+                packed.m = packed
+                    .m
+                    .clone()
+                    .without_autodiff()
+                    .slice_assign([0..active_rows, 0..2], new_m);
+                packed.v = packed
+                    .v
+                    .clone()
+                    .without_autodiff()
+                    .slice_assign([0..active_rows, 0..2], new_v);
+            } else {
+                packed.value = new_val;
+                packed.m = new_m;
+                packed.v = new_v;
+            }
+        }
+
+        for (name, grad) in gradients.params {
+            let p = self.params.get_mut(&name).unwrap();
+            p.updates += 1;
+            let grad = grad.without_autodiff();
+            p.m = (p.m.clone() * 0.9 + grad.clone() * 0.1).without_autodiff();
+            p.v = (p.v.clone() * 0.999 + grad.clone() * grad * 0.001).without_autodiff();
+            let m = p.m.clone() / (1. - 0.9f64.powi(p.updates as i32));
+            let v = p.v.clone() / (1. - 0.999f64.powi(p.updates as i32));
+            let updated = (p.value.clone().without_autodiff() - m / (v.sqrt() + 1e-8) * lr)
+                .without_autodiff();
+            if name == "variance" {
+                self.variance_host = updated.clone().into_scalar();
+            }
+            p.value = updated.autodiff().require_grad();
+        }
+    }
+
     pub fn apply_gradients(&mut self, gradients: BTreeMap<String, Tensor<2>>, lr: f64) {
-        self.packed_tables.get_mut().take();
         self.inference_weights.get_mut().take();
         for (name, grad) in gradients {
             let p = self.params.get_mut(&name).unwrap();
@@ -719,11 +879,19 @@ impl Field {
             p.v = (p.v.clone() * 0.999 + grad.clone() * grad * 0.001).without_autodiff();
             let m = p.m.clone() / (1. - 0.9f64.powi(p.updates as i32));
             let v = p.v.clone() / (1. - 0.999f64.powi(p.updates as i32));
-            p.value = (p.value.clone().without_autodiff() - m / (v.sqrt() + 1e-8) * lr)
-                .without_autodiff()
-                .autodiff()
-                .require_grad();
+            let updated = (p.value.clone().without_autodiff() - m / (v.sqrt() + 1e-8) * lr)
+                .without_autodiff();
+            if name == "variance" {
+                self.variance_host = updated.clone().into_scalar();
+            }
+            p.value = updated.autodiff().require_grad();
         }
+        let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
+            Self::build_packed_embedding(&self.params, &self.device);
+        self.packed_embedding = Some(packed_embedding);
+        self.packed_metadata = Some(packed_metadata);
+        self.level_offsets = level_offsets;
+        self.level_u32_updates = level_u32_updates;
     }
 }
 
@@ -742,9 +910,9 @@ pub fn verify(path: &Path, device: Device) -> Result<()> {
     let values = y.clone().try_into_vec_as::<f32>()?;
     let (gpu_values, gpu_cache) = field.evaluate_and_cache(&r.points, 8192)?;
     ensure!(
-        gpu_cache.iter().all(|c| !c.hidden.is_require_grad()
-            && !c.preactivation.is_require_grad()
-            && !c.feat.is_require_grad()),
+        gpu_cache
+            .iter()
+            .all(|c| !c.preactivation.is_require_grad() && !c.feat.is_require_grad()),
         "cached inference unexpectedly tracks gradients"
     );
     drop(gpu_cache);
