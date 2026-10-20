@@ -9,6 +9,7 @@ pub struct ParameterMeta {
     pub shape: [usize; 2],
     pub file: String,
 }
+
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
     pub format_version: u32,
@@ -16,12 +17,14 @@ pub struct Manifest {
     pub active_levels: usize,
     pub parameters: Vec<ParameterMeta>,
 }
+
 pub struct Parameter {
     pub value: Tensor<2>,
     pub m: Tensor<2>,
     pub v: Tensor<2>,
     pub updates: usize,
 }
+
 pub struct Field {
     pub params: BTreeMap<String, Parameter>,
     pub active: usize,
@@ -35,10 +38,12 @@ pub struct Field {
 pub fn tensor<const D: usize>(data: Vec<f32>, shape: [usize; D], device: &Device) -> Tensor<D> {
     Tensor::from_data(TensorData::new(data, shape), device)
 }
+
 pub fn ints(data: Vec<i32>, device: &Device) -> Tensor<1, Int> {
     let n = data.len();
     Tensor::from_data(TensorData::new(data, [n]), device)
 }
+
 pub fn read_f32(path: &Path) -> Result<Vec<f32>> {
     let bytes = std::fs::read(path)?;
     ensure!(bytes.len() % 4 == 0, "invalid float file");
@@ -47,6 +52,7 @@ pub fn read_f32(path: &Path) -> Result<Vec<f32>> {
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect())
 }
+
 pub fn write_f32(path: &Path, data: &[f32]) -> Result<()> {
     let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
     std::fs::write(path, bytes)?;
@@ -63,6 +69,7 @@ impl Gradients {
     pub fn insert(&mut self, name: String, tensor: Tensor<2>) {
         self.params.insert(name, tensor);
     }
+
     pub fn into_tensors(mut self, field: &Field) -> BTreeMap<String, Tensor<2>> {
         if let Some(packed) = self.params.remove("encoding.packed") {
             let mut offset = 0;
@@ -96,6 +103,7 @@ pub struct FeatureChunk {
     pub hidden: Tensor<2>,
     pub pts_tensor: Tensor<2>,
     pub point_count: usize,
+    pub padded_count: usize,
 }
 
 impl Field {
@@ -173,6 +181,7 @@ impl Field {
             inference_weights: std::cell::RefCell::new(None),
         }
     }
+
     pub fn load(path: &Path, device: Device) -> Result<Self> {
         let m: Manifest = serde_json::from_slice(&std::fs::read(path.join("model.json"))?)?;
         ensure!(m.format_version == 1, "unsupported model version");
@@ -232,6 +241,7 @@ impl Field {
             inference_weights: std::cell::RefCell::new(None),
         })
     }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         std::fs::create_dir_all(path)?;
         let mut manifest = Manifest {
@@ -270,6 +280,7 @@ impl Field {
         )?;
         Ok(())
     }
+
     pub fn p(&self, name: &str) -> Tensor<2> {
         self.params
             .get(name)
@@ -277,21 +288,44 @@ impl Field {
             .value
             .clone()
     }
+
     pub fn forward(&self, points: &[[f32; 3]]) -> Tensor<2> {
         self.forward_impl(points, true)
     }
+
+    /// Pad chunk sizes to static power-of-two buckets (up to `chunk`) so WGPU/CubeCL
+    /// never recompiles shaders for arbitrary remainder lengths, and pipeline all chunks
+    /// before reading back from GPU.
+    #[inline]
+    fn static_bucket_size(n: usize, chunk: usize) -> usize {
+        if n == chunk || chunk < 1024 {
+            return n;
+        }
+        n.next_power_of_two().max(1024).min(chunk)
+    }
+
     pub fn evaluate(&self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
-        let mut values = Vec::with_capacity(points.len());
+        if points.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut pending = Vec::with_capacity(points.len().div_ceil(chunk));
         for pts in points.chunks(chunk) {
             let n = pts.len();
-            let xyz = tensor(
-                pts.iter().flatten().copied().collect(),
-                [n, 3],
-                &self.device,
-            );
+            let padded_n = Self::static_bucket_size(n, chunk);
+            let mut flat = Vec::with_capacity(padded_n * 3);
+            flat.extend(pts.iter().flatten().copied());
+            flat.resize(padded_n * 3, 0.0);
+
+            let xyz = tensor(flat, [padded_n, 3], &self.device);
             let features = self.compute_features_gpu(xyz);
-            values.extend(self.mlp_forward(features, false).try_into_vec_as::<f32>()?);
-            self.trim_memory();
+            let y = self.mlp_forward(features, false);
+            pending.push((n, y));
+        }
+
+        let mut values = Vec::with_capacity(points.len());
+        for (n, y) in pending {
+            let v = y.try_into_vec_as::<f32>()?;
+            values.extend_from_slice(&v[..n]);
         }
         Ok(values)
     }
@@ -346,7 +380,6 @@ impl Field {
                 (indices, weights)
             })
             .unzip();
-
         let mut features = vec![xyz];
         for level in 0..active_levels {
             let table = if training {
@@ -384,9 +417,6 @@ impl Field {
             return v.clone() * g / (v.clone() * v).sum_dim(1).sqrt();
         }
         if self.inference_weights.borrow().is_none() {
-            // Burn detach() preserves requires_grad. Inference and explicit
-            // backward must leave autodiff entirely, otherwise unconsumed
-            // graphs retain every chunk's activations across training steps.
             let build = |layer| {
                 let v = self.p(&format!("lin{layer}.weight_v")).without_autodiff();
                 let g = self.p(&format!("lin{layer}.weight_g")).without_autodiff();
@@ -496,31 +526,45 @@ impl Field {
         points: &[[f32; 3]],
         chunk: usize,
     ) -> Result<(Vec<f32>, Vec<FeatureChunk>)> {
-        let mut values = Vec::with_capacity(points.len());
-        let mut chunks = Vec::with_capacity(points.len().div_ceil(chunk));
+        let num_chunks = points.len().div_ceil(chunk);
+        let mut chunks = Vec::with_capacity(num_chunks);
+        let mut pending_outputs = Vec::with_capacity(num_chunks);
+
+        let w0_t = self.effective_weight(0, false).transpose();
+        let b0 = self.p("lin0.bias").without_autodiff();
+
+        // Queue all chunks onto the GPU command stream with static bucket shapes
         for pts in points.chunks(chunk) {
             let n = pts.len();
-            let pts_tensor = tensor(
-                pts.iter().flatten().copied().collect(),
-                [n, 3],
-                &self.device,
-            );
+            let padded_n = Self::static_bucket_size(n, chunk);
+            let mut flat = Vec::with_capacity(padded_n * 3);
+            flat.extend(pts.iter().flatten().copied());
+            flat.resize(padded_n * 3, 0.0);
+
+            let pts_tensor = tensor(flat, [padded_n, 3], &self.device);
             let feat = self.compute_features_gpu(pts_tensor.clone());
-            let preactivation = feat
-                .clone()
-                .matmul(self.effective_weight(0, false).transpose())
-                + self.p("lin0.bias").without_autodiff();
+            let preactivation = feat.clone().matmul(w0_t.clone()) + b0.clone();
             let hidden = Self::softplus(preactivation.clone());
             let y = self.mlp_output(hidden.clone(), false);
-            values.extend(y.try_into_vec_as::<f32>()?);
+
+            pending_outputs.push((n, y));
             chunks.push(FeatureChunk {
                 feat,
                 preactivation,
                 hidden,
                 pts_tensor,
                 point_count: n,
+                padded_count: padded_n,
             });
         }
+
+        // Read back after all forward GPU work has been dispatched
+        let mut values = Vec::with_capacity(points.len());
+        for (n, y) in pending_outputs {
+            let v = y.try_into_vec_as::<f32>()?;
+            values.extend_from_slice(&v[..n]);
+        }
+
         Ok((values, chunks))
     }
 
@@ -530,14 +574,13 @@ impl Field {
             .clamp(1e-6, 1e6)
     }
 
-    /// Flush lazy work before measuring, then release unused cached pages. This
-    /// is a cache target, not a hard cap on live tensors or driver allocations.
+    /// Flush lazy work before measuring, then release unused cached pages.
     pub fn trim_memory(&self) {
         let _ = self.device.sync();
         if let Some(usage) = self.device.memory_pool_usage() {
             self.peak_reserved_bytes
                 .set(self.peak_reserved_bytes.get().max(usage.bytes_reserved));
-            if usage.bytes_reserved > 256 * 1024 * 1024 {
+            if usage.bytes_reserved > 1024 * 1024 * 1024 {
                 self.device.memory_cleanup();
             }
         }
@@ -565,48 +608,90 @@ impl Field {
             );
         }
 
+        let w0 = self.effective_weight(0, false);
+        let w1 = self.effective_weight(1, false);
+
         let mut offset = 0;
+        let mut dw0_total: Option<Tensor<2>> = None;
+        let mut dw1_total: Option<Tensor<2>> = None;
+        let mut db0_total: Option<Tensor<2>> = None;
+        let mut db1_total: Option<Tensor<2>> = None;
+
         for chunk in cached {
             let n = chunk.point_count;
+            let padded_n = chunk.padded_count;
             let ds = &adjoints[offset..offset + n];
             offset += n;
 
-            let ds_tensor = tensor(ds.to_vec(), [n, 1], &self.device);
-            let (dv1, dg1) = self.output_weight_gradients(chunk.hidden, ds_tensor.clone());
-            // Explicit softplus derivative avoids rebuilding an autodiff graph and
-            // repeating the forward matmuls. Match PyTorch's beta=100, threshold=20.
+            // Pad adjoints with zeros so tail elements contribute 0 gradient
+            // while keeping tensor shapes static across steps.
+            let mut ds_padded = Vec::with_capacity(padded_n);
+            ds_padded.extend_from_slice(ds);
+            ds_padded.resize(padded_n, 0.0);
+
+            let ds_tensor = tensor(ds_padded, [padded_n, 1], &self.device);
+            let dw1_chunk = ds_tensor.clone().transpose().matmul(chunk.hidden);
+
             let scaled = chunk.preactivation * 100.;
             let sigmoid = ((-scaled.clone()).exp() + 1.).recip();
             let derivative = sigmoid.mask_fill(scaled.greater_elem(20.), 1.);
-            let dh = ds_tensor.clone() * self.effective_weight(1, false) * derivative;
-            let dw0 = dh.clone().transpose().matmul(chunk.feat);
-            let (dv0, dg0) = self.weight_gradients(0, dw0);
-            let d_feat_tensor = dh.clone().matmul(self.effective_weight(0, false));
-            for (name, grad) in [
-                ("lin0.weight_v", dv0),
-                ("lin0.weight_g", dg0),
-                ("lin0.bias", dh.sum_dim(0)),
-                ("lin1.weight_v", dv1),
-                ("lin1.weight_g", dg1),
-                ("lin1.bias", ds_tensor.sum_dim(0)),
-            ] {
-                accumulated
-                    .params
-                    .entry(name.to_string())
-                    .and_modify(|v| *v = (v.clone() + grad.clone()).without_autodiff())
-                    .or_insert(grad);
-            }
-            // 2. Hash table embeddings on GPU
-            {
+            let dh = ds_tensor.clone() * w1.clone() * derivative;
+            let dw0_chunk = dh.clone().transpose().matmul(chunk.feat);
+            let d_feat_tensor = dh.clone().matmul(w0.clone());
+
+            let db0_chunk = dh.sum_dim(0);
+            let db1_chunk = ds_tensor.sum_dim(0);
+
+            dw0_total = Some(match dw0_total {
+                Some(acc) => (acc + dw0_chunk).without_autodiff(),
+                None => dw0_chunk,
+            });
+            dw1_total = Some(match dw1_total {
+                Some(acc) => (acc + dw1_chunk).without_autodiff(),
+                None => dw1_chunk,
+            });
+            db0_total = Some(match db0_total {
+                Some(acc) => (acc + db0_chunk).without_autodiff(),
+                None => db0_chunk,
+            });
+            db1_total = Some(match db1_total {
+                Some(acc) => (acc + db1_chunk).without_autodiff(),
+                None => db1_chunk,
+            });
+
+            if active_levels > 0 {
                 let table_grad = accumulated.params.remove("encoding.packed").unwrap();
                 let updated = crate::kernels::backward_packed(
-                    chunk.pts_tensor.clone(),
+                    chunk.pts_tensor,
                     d_feat_tensor,
                     metadata.clone(),
                     table_grad,
                     active_levels,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
+            }
+        }
+
+        // Compute weight-normalization chain rule once per microbatch instead of per chunk
+        if let (Some(dw0), Some(dw1), Some(db0), Some(db1)) =
+            (dw0_total, dw1_total, db0_total, db1_total)
+        {
+            let (dv0, dg0) = self.weight_gradients(0, dw0);
+            let (dv1, dg1) = self.weight_gradients(1, dw1);
+
+            for (name, grad) in [
+                ("lin0.weight_v", dv0),
+                ("lin0.weight_g", dg0),
+                ("lin0.bias", db0),
+                ("lin1.weight_v", dv1),
+                ("lin1.weight_g", dg1),
+                ("lin1.bias", db1),
+            ] {
+                accumulated
+                    .params
+                    .entry(name.to_string())
+                    .and_modify(|v| *v = (v.clone() + grad.clone()).without_autodiff())
+                    .or_insert(grad);
             }
         }
     }
@@ -622,6 +707,7 @@ impl Field {
         let (_, cached) = self.evaluate_and_cache(points, chunk).unwrap();
         self.accumulate_gradients_cached(cached, adjoints, accumulated);
     }
+
     pub fn apply_gradients(&mut self, gradients: BTreeMap<String, Tensor<2>>, lr: f64) {
         self.packed_tables.get_mut().take();
         self.inference_weights.get_mut().take();
@@ -648,6 +734,7 @@ struct Reference {
     loss: f32,
     grad_norms: BTreeMap<String, f32>,
 }
+
 pub fn verify(path: &Path, device: Device) -> Result<()> {
     let field = Field::load(path, device)?;
     let r: Reference = serde_json::from_slice(&std::fs::read(path.join("reference.json"))?)?;

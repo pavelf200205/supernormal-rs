@@ -1,5 +1,6 @@
 //! Packed CPU reference compositor with analytical derivatives. Field execution is on Burn.
 //! This also serves as the oracle for portable GPU compositor kernels.
+
 use crate::{
     data::{Patch, distance, dot, point},
     field::Field,
@@ -15,6 +16,7 @@ pub struct Occupancy {
     pub values: Vec<f32>,
     pub flags: Vec<bool>,
 }
+
 impl Occupancy {
     pub fn new(resolution: usize) -> Self {
         Self {
@@ -23,6 +25,7 @@ impl Occupancy {
             flags: vec![false; resolution.pow(3)],
         }
     }
+
     pub fn occupied(&self, p: [f32; 3]) -> bool {
         if p.iter().any(|x| *x < -1. || *x > 1.) {
             return false;
@@ -31,6 +34,7 @@ impl Occupancy {
         let c = p.map(|x| (((x + 1.) * 0.5 * r as f32) as usize).min(r - 1));
         self.flags[(c[0] * r + c[1]) * r + c[2]]
     }
+
     pub fn update(
         &mut self,
         field: &Field,
@@ -57,8 +61,6 @@ impl Occupancy {
             ids
         };
         let r = self.resolution;
-        // Advanced indexed assignment in Torch reads the previous occupancy once,
-        // even when an index occurs more than once in the sampled list.
         let previous = self.values.clone();
         for chunk in ids.chunks(query) {
             let points: Vec<[f32; 3]> = chunk
@@ -81,26 +83,29 @@ impl Occupancy {
         Ok(())
     }
 }
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Sample {
     pub patch: usize,
     pub start: f32,
     pub end: f32,
 }
+
 pub fn sigmoid(x: f32) -> f32 {
     1. / (1. + (-x).exp())
 }
+
 pub fn alpha(a: f32, b: f32, inv: f32) -> f32 {
     let c = sigmoid(a * inv);
     ((c - sigmoid(b * inv) + 1e-5) / (c + 1e-5)).clamp(0., 1.)
 }
+
 pub fn march(
     patches: &[Patch],
     occ: &Occupancy,
     step_size: f32,
     rng: &mut impl Rng,
 ) -> Vec<Sample> {
-    // Draw in the original serial order; each ray can then march independently.
     let jitter: Vec<_> = patches
         .iter()
         .map(|patch| {
@@ -147,6 +152,7 @@ pub fn march(
         .collect();
     by_patch.into_iter().flatten().collect()
 }
+
 pub fn visible(
     field: &Field,
     patches: &[Patch],
@@ -156,22 +162,36 @@ pub fn visible(
     if samples.is_empty() {
         return Ok(samples);
     }
-    let pts: Vec<_> = samples
-        .iter()
-        .flat_map(|s| {
-            let p = &patches[s.patch];
-            [
-                point(p.origin, p.dirs[4], s.start),
-                point(p.origin, p.dirs[4], s.end),
-            ]
-        })
-        .collect();
-    let sdf = field.evaluate(&pts, query)?;
+
+    // Deduplicate contiguous ray endpoints in O(1) to halve visibility SDF evaluations
+    let n = samples.len();
+    let mut unique_pts = Vec::with_capacity(n + patches.len());
+    let mut start_idx = Vec::with_capacity(n);
+    let mut end_idx = Vec::with_capacity(n);
+
+    for (i, s) in samples.iter().enumerate() {
+        let p = &patches[s.patch];
+        let reuse = i > 0
+            && samples[i - 1].patch == s.patch
+            && s.start.to_bits() == samples[i - 1].end.to_bits();
+        if reuse {
+            start_idx.push(end_idx[i - 1]);
+        } else {
+            let idx = unique_pts.len();
+            unique_pts.push(point(p.origin, p.dirs[4], s.start));
+            start_idx.push(idx);
+        }
+        let idx = unique_pts.len();
+        unique_pts.push(point(p.origin, p.dirs[4], s.end));
+        end_idx.push(idx);
+    }
+
+    let sdf = field.evaluate(&unique_pts, query)?;
     let inv = field.inv_s().into_scalar();
     let mut trans = vec![1f32; patches.len()];
-    let mut out = vec![];
+    let mut out = Vec::with_capacity(n);
     for (i, s) in samples.into_iter().enumerate() {
-        let a = alpha(sdf[2 * i], sdf[2 * i + 1], inv);
+        let a = alpha(sdf[start_idx[i]], sdf[end_idx[i]], inv);
         let t = &mut trans[s.patch];
         if *t >= 1e-8 {
             out.push(s);
@@ -180,6 +200,7 @@ pub fn visible(
     }
     Ok(out)
 }
+
 pub fn sample_points(patches: &[Patch], samples: &[Sample]) -> Vec<[f32; 3]> {
     let mut points = Vec::with_capacity(samples.len() * 18);
     for s in samples {
@@ -193,6 +214,55 @@ pub fn sample_points(patches: &[Patch], samples: &[Sample]) -> Vec<[f32; 3]> {
     }
     points
 }
+
+/// Fast O(N) point generation + contiguous endpoint deduplication (replaces O(N) AHashMap).
+/// Matches PyTorch `diff_mask` by sharing the 9 end-points of sample `s-1` with the 9 start-points
+/// of sample `s` whenever consecutive samples belong to the same patch and share `end == start`.
+pub fn sample_and_dedup_points(
+    patches: &[Patch],
+    samples: &[Sample],
+) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<usize>) {
+    let n = samples.len();
+    let mut points = Vec::with_capacity(n * 18);
+    let mut unique = Vec::with_capacity(n * 10);
+    let mut indices = Vec::with_capacity(n * 18);
+
+    for (s, sample) in samples.iter().enumerate() {
+        let p = &patches[sample.patch];
+        let center = dot(p.dirs[4], p.plane);
+        let ratios: [f32; 9] = std::array::from_fn(|i| center / dot(p.dirs[i], p.plane));
+
+        let reuse_start = s > 0
+            && samples[s - 1].patch == sample.patch
+            && sample.start.to_bits() == samples[s - 1].end.to_bits();
+
+        if reuse_start {
+            let prev_end_base = (s - 1) * 18 + 9;
+            for i in 0..9 {
+                points.push(points[prev_end_base + i]);
+                indices.push(indices[prev_end_base + i]);
+            }
+        } else {
+            for i in 0..9 {
+                let pt = point(p.origin, p.dirs[i], sample.start * ratios[i]);
+                let idx = unique.len();
+                unique.push(pt);
+                points.push(pt);
+                indices.push(idx);
+            }
+        }
+
+        for i in 0..9 {
+            let pt = point(p.origin, p.dirs[i], sample.end * ratios[i]);
+            let idx = unique.len();
+            unique.push(pt);
+            points.push(pt);
+            indices.push(idx);
+        }
+    }
+    (points, unique, indices)
+}
+
 /// Share exactly equal endpoints; never quantize coordinates or change gradients.
 pub fn unique_points(points: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<usize>) {
     let mut lookup = ahash::AHashMap::with_capacity(points.len());
@@ -209,17 +279,20 @@ pub fn unique_points(points: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<usize>) {
         .collect();
     (unique, indices)
 }
+
 #[derive(Default, Serialize, Deserialize, Debug)]
 pub struct Loss {
     pub normal: f64,
     pub mask: f64,
     pub eikonal: f64,
 }
+
 impl Loss {
     pub fn total(&self) -> f64 {
         self.normal + self.mask + self.eikonal
     }
 }
+
 pub struct Composite {
     pub loss: Loss,
     pub sdf_grad: Vec<f32>,
@@ -228,7 +301,335 @@ pub struct Composite {
     pub normals: Vec<[f32; 3]>,
     pub masks: Vec<f32>,
 }
+
 pub fn composite(
+    patches: &[Patch],
+    samples: &[Sample],
+    points: &[[f32; 3]],
+    sdf: &[f32],
+    variance: f32,
+    normal_den: f32,
+    pixel_den: f32,
+    sample_den: f32,
+) -> Composite {
+    let count = samples.len();
+    let inv = (variance * 10.).exp().clamp(1e-6, 1e6);
+
+    // Check if samples are monotonically ordered by patch index (always true in march/visible)
+    let is_monotonic = samples.windows(2).all(|w| w[0].patch <= w[1].patch);
+
+    if !is_monotonic {
+        return composite_fallback(
+            patches, samples, points, sdf, variance, normal_den, pixel_den, sample_den,
+        );
+    }
+
+    // Build per-patch sample range table `(start_sample, end_sample)`
+    let mut patch_ranges = vec![(0usize, 0usize); patches.len()];
+    let mut s_idx = 0;
+    while s_idx < count {
+        let p = samples[s_idx].patch;
+        let start = s_idx;
+        while s_idx < count && samples[s_idx].patch == p {
+            s_idx += 1;
+        }
+        patch_ranges[p] = (start, s_idx);
+    }
+
+    let mut ds = vec![0f32; sdf.len()];
+    let mut normals = vec![[0f32; 3]; patches.len() * 9];
+    let mut masks = vec![0f32; patches.len() * 9];
+
+    // Process patches in parallel chunks on Rayon
+    let chunk_patches = 64usize;
+    let num_patch_chunks = patches.len().div_ceil(chunk_patches);
+
+    let mut normals_rest = normals.as_mut_slice();
+    let mut masks_rest = masks.as_mut_slice();
+    let mut ds_rest = ds.as_mut_slice();
+
+    struct PatchChunkTask<'a> {
+        p_start: usize,
+        patches: &'a [Patch],
+        ranges: &'a [(usize, usize)],
+        normals_out: &'a mut [[f32; 3]],
+        masks_out: &'a mut [f32],
+        ds_slice: &'a mut [f32],
+        s_offset: usize,
+    }
+
+    let mut tasks = Vec::with_capacity(num_patch_chunks);
+    let mut prev_s_end = 0usize;
+
+    for c in 0..num_patch_chunks {
+        let p_start = c * chunk_patches;
+        let p_end = (p_start + chunk_patches).min(patches.len());
+        let p_len = p_end - p_start;
+
+        let mut s_start = prev_s_end;
+        let mut s_end = prev_s_end;
+        for &( a, b ) in &patch_ranges[p_start..p_end] {
+            if b > a {
+                if s_start == prev_s_end && s_end == prev_s_end {
+                    s_start = a;
+                }
+                s_end = b;
+            }
+        }
+        let ds_len = (s_end - prev_s_end) * 18;
+        let s_offset = prev_s_end;
+        prev_s_end = s_end;
+
+        let (n_head, n_tail) = normals_rest.split_at_mut(p_len * 9);
+        normals_rest = n_tail;
+        let (m_head, m_tail) = masks_rest.split_at_mut(p_len * 9);
+        masks_rest = m_tail;
+        let (ds_head, ds_tail) = ds_rest.split_at_mut(ds_len);
+        ds_rest = ds_tail;
+
+        tasks.push(PatchChunkTask {
+            p_start,
+            patches: &patches[p_start..p_end],
+            ranges: &patch_ranges[p_start..p_end],
+            normals_out: n_head,
+            masks_out: m_head,
+            ds_slice: ds_head,
+            s_offset,
+        });
+    }
+
+    let partials: Vec<(f64, f64, f64, f64, f64)> = tasks
+        .into_par_iter()
+        .map(|task| {
+            let mut local_normal_loss = 0f64;
+            let mut local_mask_loss = 0f64;
+            let mut local_eikonal_loss = 0f64;
+            let mut local_dinv = 0f64;
+            let mut local_bias_grad = 0f64;
+
+            let mut gradients = Vec::new();
+            let mut steps_cache = Vec::new();
+            let mut alpha_values = Vec::new();
+            let mut weights = Vec::new();
+            let mut ts = Vec::new();
+            let mut gw = Vec::new();
+
+            for (local_p, patch) in task.patches.iter().enumerate() {
+                let (s_start, s_end) = task.ranges[local_p];
+                let s_count = s_end - s_start;
+
+                let norm_out = &mut task.normals_out[local_p * 9..(local_p + 1) * 9];
+                let mask_out = &mut task.masks_out[local_p * 9..(local_p + 1) * 9];
+
+                let dir4_plane = dot(patch.dirs[4], patch.plane);
+                let dt_ratios: [f32; 9] =
+                    std::array::from_fn(|i| dir4_plane / dot(patch.dirs[i], patch.plane));
+
+                let mut trans = [1f32; 9];
+
+                gradients.clear();
+                gradients.resize(s_count * 9, [0f32; 3]);
+                steps_cache.clear();
+                steps_cache.resize(s_count * 9, [0f32; 3]);
+                alpha_values.clear();
+                alpha_values.resize(s_count * 9, 0f32);
+                weights.clear();
+                weights.resize(s_count * 9, 0f32);
+                ts.clear();
+                ts.resize(s_count * 9, 0f32);
+                gw.clear();
+                gw.resize(s_count * 9, 0f32);
+
+                // 1. Forward pass per patch
+                for ls in 0..s_count {
+                    let s = s_start + ls;
+                    let sample = &samples[s];
+                    let base = s * 18;
+                    let sample_dt = sample.end - sample.start;
+
+                    for i in 0..9 {
+                        let row = i / 3;
+                        let col = i % 3;
+                        let (left, right) = match col {
+                            0 => (i, i + 1),
+                            1 => (i - 1, i + 1),
+                            _ => (i - 1, i),
+                        };
+                        let (up, down) = match row {
+                            0 => (i, i + 3),
+                            1 => (i - 3, i + 3),
+                            _ => (i - 3, i),
+                        };
+                        let dx = if col == 1 {
+                            distance(points[base + i - 1], points[base + i])
+                                + distance(points[base + i], points[base + i + 1])
+                        } else {
+                            distance(points[base + left], points[base + right])
+                        };
+                        let dy = if row == 1 {
+                            distance(points[base + i - 3], points[base + i])
+                                + distance(points[base + i], points[base + i + 3])
+                        } else {
+                            distance(points[base + up], points[base + down])
+                        };
+                        let dt = sample_dt * dt_ratios[i];
+                        let inv_dt = 1. / dt;
+                        let inv_dx = 1. / dx;
+                        let inv_dy = 1. / dy;
+
+                        let proj = [
+                            (sdf[base + 9 + i] - sdf[base + i]) * inv_dt,
+                            (sdf[base + right] - sdf[base + left]) * inv_dx,
+                            (sdf[base + down] - sdf[base + up]) * inv_dy,
+                        ];
+                        let g = patch.inverse[i].map(|r| dot(r, proj));
+                        let idx = ls * 9 + i;
+                        gradients[idx] = g;
+                        steps_cache[idx] = [inv_dt, inv_dx, inv_dy];
+
+                        let a = alpha(sdf[base + i], sdf[base + 9 + i], inv);
+                        alpha_values[idx] = a;
+                        ts[idx] = trans[i];
+                        let w = trans[i] * a;
+                        weights[idx] = w;
+                        trans[i] *= (1. - a).max(1e-10);
+                        mask_out[i] += w;
+                        for d in 0..3 {
+                            norm_out[i][d] += w * g[d];
+                        }
+                    }
+                }
+
+                // 2. Pixel loss & adjoints
+                let mut dn = [[0f32; 3]; 9];
+                let mut dm = [0f32; 9];
+                for i in 0..9 {
+                    let mask = patch.mask[i];
+                    for d in 0..3 {
+                        let err = (norm_out[i][d] - patch.normals[i][d]) * mask;
+                        local_normal_loss += (err * err / normal_den) as f64;
+                        dn[i][d] = 2. * err * mask / normal_den;
+                    }
+                    let m = mask_out[i].clamp(1e-5, 1. - 1e-5);
+                    local_mask_loss +=
+                        (-(mask * m.ln() + (1. - mask) * (1. - m).ln()) / pixel_den) as f64;
+                    if mask_out[i] >= 1e-5 && mask_out[i] <= 1. - 1e-5 {
+                        dm[i] = (m - mask) / (m * (1. - m) * pixel_den);
+                    }
+                }
+
+                // 3. Eikonal & DFD backward pass (reusing cached 1/dt, 1/dx, 1/dy)
+                for ls in 0..s_count {
+                    let s = s_start + ls;
+                    let ds_base = (s - task.s_offset) * 18;
+                    for i in 0..9 {
+                        let idx = ls * 9 + i;
+                        let g = gradients[idx];
+                        let norm = dot(g, g).sqrt();
+                        local_eikonal_loss += ((norm - 1.).powi(2) / sample_den) as f64;
+                        let dg: [f32; 3] = std::array::from_fn(|d| {
+                            weights[idx] * dn[i][d]
+                                + 2. * (norm - 1.) / sample_den * g[d] / norm.max(1e-12)
+                        });
+                        let v = patch.inverse[i];
+                        let dp: [f32; 3] = std::array::from_fn(|d| {
+                            v[0][d] * dg[0] + v[1][d] * dg[1] + v[2][d] * dg[2]
+                        });
+                        gw[idx] = dot(dn[i], g) + dm[i];
+
+                        let row = i / 3;
+                        let col = i % 3;
+                        let (l, r) = match col {
+                            0 => (i, i + 1),
+                            1 => (i - 1, i + 1),
+                            _ => (i - 1, i),
+                        };
+                        let (u, d) = match row {
+                            0 => (i, i + 3),
+                            1 => (i - 3, i + 3),
+                            _ => (i - 3, i),
+                        };
+                        let [inv_dt, inv_dx, inv_dy] = steps_cache[idx];
+                        task.ds_slice[ds_base + i] -= dp[0] * inv_dt;
+                        task.ds_slice[ds_base + 9 + i] += dp[0] * inv_dt;
+                        task.ds_slice[ds_base + l] -= dp[1] * inv_dx;
+                        task.ds_slice[ds_base + r] += dp[1] * inv_dx;
+                        task.ds_slice[ds_base + u] -= dp[2] * inv_dy;
+                        task.ds_slice[ds_base + d] += dp[2] * inv_dy;
+                    }
+                }
+
+                // 4. Reverse transmittance backward pass
+                let mut future = [0f32; 9];
+                for ls in (0..s_count).rev() {
+                    let s = s_start + ls;
+                    let base = s * 18;
+                    let ds_base = (s - task.s_offset) * 18;
+                    for i in 0..9 {
+                        let idx = ls * 9 + i;
+                        let a = alpha_values[idx];
+                        let q = (1. - a).max(1e-10);
+                        let da = ts[idx] * (gw[idx] - if 1. - a >= 1e-10 { future[i] } else { 0. });
+                        future[i] = gw[idx] * a + q * future[i];
+
+                        let s0 = sdf[base + i];
+                        let s1 = sdf[base + 9 + i];
+                        let c0 = sigmoid(s0 * inv);
+                        let c1 = sigmoid(s1 * inv);
+                        let denom = c0 + 1e-5;
+                        let raw = (c0 - c1 + 1e-5) / denom;
+                        if (0. ..=1.).contains(&raw) {
+                            let dc0 = da * c1 / (denom * denom);
+                            let dc1 = -da / denom;
+                            let z0 = dc0 * c0 * (1. - c0);
+                            let z1 = dc1 * c1 * (1. - c1);
+                            task.ds_slice[ds_base + i] += z0 * inv;
+                            task.ds_slice[ds_base + 9 + i] += z1 * inv;
+                            local_bias_grad += f64::from(z0 * inv) + f64::from(z1 * inv);
+                            local_dinv += f64::from(z0 * s0 + z1 * s1);
+                        }
+                    }
+                }
+            }
+
+            (
+                local_normal_loss,
+                local_mask_loss,
+                local_eikonal_loss,
+                local_dinv,
+                local_bias_grad,
+            )
+        })
+        .collect();
+
+    let mut loss = Loss::default();
+    let mut dinv = 0f64;
+    let mut sdf_bias_grad = 0f64;
+    for (nl, ml, el, di, bg) in partials {
+        loss.normal += nl;
+        loss.mask += ml;
+        loss.eikonal += el;
+        dinv += di;
+        sdf_bias_grad += bg;
+    }
+
+    let variance_grad = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
+        (dinv as f32) * 10. * inv
+    } else {
+        0.
+    };
+
+    Composite {
+        loss,
+        sdf_grad: ds,
+        variance_grad,
+        sdf_bias_grad: sdf_bias_grad as f32,
+        normals,
+        masks,
+    }
+}
+
+fn composite_fallback(
     patches: &[Patch],
     samples: &[Sample],
     points: &[[f32; 3]],
@@ -298,6 +699,7 @@ pub fn composite(
             }
         }
     }
+
     let mut loss = Loss::default();
     let mut dn = vec![[0.; 3]; normals.len()];
     let mut dm = vec![0.; masks.len()];
@@ -317,6 +719,7 @@ pub fn composite(
             }
         }
     }
+
     let mut ds = vec![0f32; sdf.len()];
     let mut gw = vec![0.; count * 9];
     for (s, sample) in samples.iter().enumerate() {
@@ -369,6 +772,7 @@ pub fn composite(
             ds[base + d] += dp[2] / dy;
         }
     }
+
     let mut future = vec![0.; patches.len() * 9];
     let mut dinv = 0.;
     let mut sdf_bias_grad = 0f64;
@@ -395,9 +799,6 @@ pub fn composite(
                 let z1 = dc1 * c1 * (1. - c1);
                 ds[base + i] += z0 * inv;
                 ds[base + 9 + i] += z1 * inv;
-                // DFD terms are exactly invariant under a constant SDF shift.
-                // Sum only opacity derivatives to avoid cancellation noise being
-                // amplified by Adam into a spurious output-bias update.
                 sdf_bias_grad += f64::from(z0 * inv) + f64::from(z1 * inv);
                 dinv += z0 * s0 + z1 * s1;
             }
@@ -434,6 +835,7 @@ struct RenderFixture {
     normals: Vec<[f32; 3]>,
     masks: Vec<f32>,
 }
+
 /// Tests the complete field -> renderer -> adjoint -> field -> Adam chain.
 pub fn verify_step(
     model: &std::path::Path,
@@ -472,7 +874,6 @@ pub fn verify_step(
     for (&i, &g) in indices.iter().zip(&c.sdf_grad) {
         adjoints[i] += g;
     }
-    // Force several chunks to test accumulation, rather than just a single backward.
     field.accumulate_gradients(&unique, &adjoints, 31, &mut gradients);
     gradients.insert(
         "lin1.bias".into(),
@@ -504,8 +905,7 @@ pub fn verify_step(
         );
         oracle_gradients.insert(name.clone(), tensor(expected, g.dims(), &field.device));
     }
-    // Separate optimizer arithmetic from first-step sensitivity to tiny gradient
-    // differences in finite differences / reductions across different GPU backends.
+
     let mut oracle_adam = Field::load(model, field.device.clone())?;
     oracle_adam.apply_gradients(oracle_gradients, 5e-4);
     field.apply_gradients(gradients, 5e-4);
@@ -545,6 +945,7 @@ pub fn verify_step(
     println!("Complete reconstruction optimizer step passed.");
     Ok(())
 }
+
 pub fn verify(path: &std::path::Path, data: Option<&std::path::Path>) -> Result<()> {
     let f: RenderFixture = serde_json::from_slice(&std::fs::read(path.join("render.json"))?)?;
     let c = composite(
@@ -610,6 +1011,7 @@ pub fn verify(path: &std::path::Path, data: Option<&std::path::Path>) -> Result<
         1e-4,
     )?;
     check("masks", &c.masks, &f.masks, 1e-5, 1e-4)?;
+
     if let Some(path_data) = data {
         let ds = crate::data::Dataset::load(path_data)?;
         let v = &ds.views[0];
@@ -643,7 +1045,7 @@ pub fn verify(path: &std::path::Path, data: Option<&std::path::Path>) -> Result<
             1e-6,
         )?;
     }
-    // Numerical derivatives supplement the independent Torch oracle.
+
     let eps = 1e-4;
     let shifted_loss = |shift: f32| {
         let shifted: Vec<_> = f.sdf.iter().map(|v| v + shift).collect();

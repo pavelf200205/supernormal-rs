@@ -3,6 +3,7 @@ use nalgebra::{Matrix3, Vector3};
 use ndarray::Array2;
 use ndarray_npy::NpzReader;
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, path::Path};
 
@@ -15,6 +16,7 @@ pub struct Patch {
     pub normals: [[f32; 3]; 9],
     pub mask: [f32; 9],
 }
+
 pub struct View {
     pub width: usize,
     pub height: usize,
@@ -24,11 +26,13 @@ pub struct View {
     pub rotation: Matrix3<f32>,
     pub inv_k: Matrix3<f32>,
 }
+
 pub struct Dataset {
     pub views: Vec<View>,
     pub scale: f32,
     pub offset: [f32; 3],
 }
+
 fn read_matrix(npz: &mut NpzReader<File>, name: &str) -> Result<Array2<f64>> {
     if let Ok(a) = npz.by_name::<ndarray::OwnedRepr<f64>, ndarray::Ix2>(name) {
         return Ok(a);
@@ -36,6 +40,7 @@ fn read_matrix(npz: &mut NpzReader<File>, name: &str) -> Result<Array2<f64>> {
     let a: Array2<f32> = npz.by_name(name)?;
     Ok(a.mapv(|x| x as f64))
 }
+
 impl Dataset {
     pub fn load(path: &Path) -> Result<Self> {
         let mut npz = NpzReader::new(File::open(path.join("cameras_sphere.npz"))?)?;
@@ -45,6 +50,7 @@ impl Dataset {
             .collect();
         files.sort();
         ensure!(!files.is_empty(), "no normal maps");
+
         let mut views = vec![];
         let mut scale = 1.;
         let mut offset = [0.; 3];
@@ -85,6 +91,7 @@ impl Dataset {
             let r1 = temp / k11;
             let rotation = Matrix3::from_columns(&[r1, r2, r3]);
             let k = Matrix3::new(k11, k12, k13, 0., k22, k23, 0., 0., k33) / k33;
+
             let normal = image::open(&file)?.to_rgb32f();
             let (w, h) = normal.dimensions();
             let mask = image::open(path.join("mask").join(format!(
@@ -121,18 +128,27 @@ impl Dataset {
             offset,
         })
     }
+
     pub fn random_patches(&self, count: usize, rng: &mut impl Rng) -> Vec<Patch> {
-        (0..count)
+        // Draw random coordinates sequentially to preserve exact deterministic RNG state,
+        // then compute patch ray bases and 3x3 inversions in parallel across CPU cores.
+        let coords: Vec<(usize, usize, usize)> = (0..count)
             .map(|_| {
-                let view = &self.views[rng.random_range(0..self.views.len())];
-                view.patch(
-                    rng.random_range(1..view.width - 2),
-                    rng.random_range(1..view.height - 2),
-                )
+                let v = rng.random_range(0..self.views.len());
+                let view = &self.views[v];
+                let x = rng.random_range(1..view.width - 2);
+                let y = rng.random_range(1..view.height - 2);
+                (v, x, y)
             })
+            .collect();
+
+        coords
+            .into_par_iter()
+            .map(|(v, x, y)| self.views[v].patch(x, y))
             .collect()
     }
 }
+
 impl View {
     pub fn patch(&self, x: usize, y: usize) -> Patch {
         let origin = self.origin.into();
@@ -171,12 +187,15 @@ impl View {
         patch
     }
 }
+
 pub fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
+
 pub fn point(o: [f32; 3], d: [f32; 3], t: f32) -> [f32; 3] {
     std::array::from_fn(|i| o[i] + d[i] * t)
 }
+
 pub fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
     dot(
         std::array::from_fn(|i| a[i] - b[i]),

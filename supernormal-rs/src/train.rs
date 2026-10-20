@@ -25,9 +25,9 @@ pub struct TrainArgs {
     pub end_iter: usize,
     #[arg(long, default_value_t = 2048)]
     pub batch: usize,
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 2048)]
     pub microbatch: usize,
-    #[arg(long, default_value_t = 8192)]
+    #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
     pub occupancy_resolution: usize,
@@ -44,12 +44,14 @@ pub struct TrainArgs {
     #[serde(default)]
     pub profile_stages: bool,
 }
+
 #[derive(Serialize, Deserialize)]
 struct State {
     rng: ChaCha8Rng,
     occupancy: Occupancy,
     args: TrainArgs,
 }
+
 pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     ensure!(
         args.batch > 0
@@ -105,6 +107,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         args.out.join("config.json"),
         serde_json::to_vec_pretty(&args)?,
     )?;
+
     if args.mesh_freq > 0 && field.step == 0 {
         crate::mesh::extract(
             &field,
@@ -115,6 +118,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             dataset.offset,
         )?;
     }
+
     let mut first = true;
     while field.step < final_step {
         let started = std::time::Instant::now();
@@ -151,6 +155,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let sampling_seconds = started.elapsed().as_secs_f64() - occupancy_seconds;
         let pixel_den = (patches.len() * 9) as f32;
         let sample_den = (samples.len() * 9) as f32;
+
         let mut gradients = crate::field::Gradients::default();
         let mut total = Loss::default();
         let variance: f32 = field.p("variance").into_scalar();
@@ -160,36 +165,47 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let mut t_points = 0.0;
         let mut t_comp = 0.0;
         let mut t_bwd = 0.0;
+
         for start in (0..patches.len()).step_by(args.microbatch) {
             let end = (start + args.microbatch).min(patches.len());
-            let local: Vec<_> = samples
-                .iter()
-                .filter(|s| s.patch >= start && s.patch < end)
-                .map(|s| render::Sample {
-                    patch: s.patch - start,
-                    start: s.start,
-                    end: s.end,
-                })
-                .collect();
+            let local_storage: Vec<render::Sample>;
+            let local: &[render::Sample] = if start == 0 && end == patches.len() {
+                &samples
+            } else {
+                local_storage = samples
+                    .iter()
+                    .filter(|s| s.patch >= start && s.patch < end)
+                    .map(|s| render::Sample {
+                        patch: s.patch - start,
+                        start: s.start,
+                        end: s.end,
+                    })
+                    .collect();
+                &local_storage
+            };
             let pp = &patches[start..end];
+
             let t0 = std::time::Instant::now();
-            let points = render::sample_points(pp, &local);
-            let (unique, indices) = render::unique_points(&points);
+            let (points, unique, indices) = render::sample_and_dedup_points(pp, local);
             t_points += t0.elapsed().as_secs_f64();
+
             let t0 = std::time::Instant::now();
             let (unique_sdf, cache) = field.evaluate_and_cache(&unique, args.query)?;
             let sdf: Vec<_> = indices.iter().map(|&i| unique_sdf[i]).collect();
             t_eval += t0.elapsed().as_secs_f64();
+
             let t1 = std::time::Instant::now();
             let result = render::composite(
-                pp, &local, &points, &sdf, variance, normal_den, pixel_den, sample_den,
+                pp, local, &points, &sdf, variance, normal_den, pixel_den, sample_den,
             );
             t_comp += t1.elapsed().as_secs_f64();
+
             total.normal += result.loss.normal;
             total.mask += result.loss.mask;
             total.eikonal += result.loss.eikonal;
             variance_grad += result.variance_grad;
             sdf_bias_grad += f64::from(result.sdf_bias_grad);
+
             let mut adjoints = vec![0.; unique.len()];
             for (&i, &g) in indices.iter().zip(&result.sdf_grad) {
                 adjoints[i] += g;
@@ -202,12 +218,9 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     .sync()
                     .map_err(|e| anyhow::anyhow!("profiling sync failed: {e:?}"))?;
             }
-            // Cached activations increase the per-chunk working set. Release
-            // completed temporary buffers before the next microbatch instead
-            // of retaining every query shape until the optimizer step.
-            field.trim_memory();
             t_bwd += t2.elapsed().as_secs_f64();
         }
+
         gradients.insert(
             "variance".into(),
             tensor(vec![variance_grad], [1, 1], &field.device),
@@ -225,13 +238,18 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let t_adam_start = std::time::Instant::now();
         let gradients = gradients.into_tensors(&field);
         field.apply_gradients(gradients, 5e-4 * factor);
-        field.trim_memory();
         let t_adam = t_adam_start.elapsed().as_secs_f64();
         field.step += 1;
-        field
-            .device
-            .sync()
-            .map_err(|e| anyhow::anyhow!("GPU synchronization failed: {e:?}"))?;
+
+        if field.step % 200 == 0 {
+            field.trim_memory();
+        } else {
+            field
+                .device
+                .sync()
+                .map_err(|e| anyhow::anyhow!("GPU synchronization failed: {e:?}"))?;
+        }
+
         let secs = started.elapsed().as_secs_f64();
         println!(
             "step={} loss={:.7} normal={:.7} mask={:.7} eikonal={:.7} samples={} time={secs:.2}s",
