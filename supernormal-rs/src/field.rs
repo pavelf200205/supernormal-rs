@@ -83,7 +83,7 @@ impl Gradients {
             let g = tensor(data, [entries, 2], &field.device);
             self.params
                 .entry(name)
-                .and_modify(|v| *v = (v.clone() + g.clone()).detach())
+                .and_modify(|v| *v = (v.clone() + g.clone()).without_autodiff())
                 .or_insert(g);
         }
         self.params
@@ -92,6 +92,8 @@ impl Gradients {
 
 pub struct FeatureChunk {
     pub feat: Tensor<2>,
+    pub preactivation: Tensor<2>,
+    pub hidden: Tensor<2>,
     pub pts_tensor: Tensor<2>,
     pub point_count: usize,
 }
@@ -350,7 +352,8 @@ impl Field {
             let table = if training {
                 self.p(&format!("encoding.embeddings.{level}"))
             } else {
-                self.p(&format!("encoding.embeddings.{level}")).detach()
+                self.p(&format!("encoding.embeddings.{level}"))
+                    .without_autodiff()
             };
             let indices = &all_indices[level];
             let weights = &all_weights[level];
@@ -381,10 +384,13 @@ impl Field {
             return v.clone() * g / (v.clone() * v).sum_dim(1).sqrt();
         }
         if self.inference_weights.borrow().is_none() {
+            // Burn detach() preserves requires_grad. Inference and explicit
+            // backward must leave autodiff entirely, otherwise unconsumed
+            // graphs retain every chunk's activations across training steps.
             let build = |layer| {
-                let v = self.p(&format!("lin{layer}.weight_v")).detach();
-                let g = self.p(&format!("lin{layer}.weight_g")).detach();
-                (v.clone() * g / (v.clone() * v).sum_dim(1).sqrt()).detach()
+                let v = self.p(&format!("lin{layer}.weight_v")).without_autodiff();
+                let g = self.p(&format!("lin{layer}.weight_g")).without_autodiff();
+                (v.clone() * g / (v.clone() * v).sum_dim(1).sqrt()).without_autodiff()
             };
             *self.inference_weights.borrow_mut() = Some((build(0), build(1)));
         }
@@ -400,10 +406,14 @@ impl Field {
     fn mlp_hidden(&self, x: Tensor<2>, training: bool) -> Tensor<2> {
         let param = |name: &str| {
             let p = self.p(name);
-            if training { p } else { p.detach() }
+            if training { p } else { p.without_autodiff() }
         };
         let w = self.effective_weight(0, training);
         let h = x.matmul(w.transpose()) + param("lin0.bias");
+        Self::softplus(h)
+    }
+
+    fn softplus(h: Tensor<2>) -> Tensor<2> {
         let scaled = h.clone() * 100.;
         let soft = (scaled.clone().clamp_max(20.).exp() + 1.).log() / 100.;
         soft.mask_where(scaled.greater_elem(20.), h)
@@ -411,7 +421,11 @@ impl Field {
 
     fn mlp_output(&self, h: Tensor<2>, training: bool) -> Tensor<2> {
         let bias = self.p("lin1.bias");
-        let bias = if training { bias } else { bias.detach() };
+        let bias = if training {
+            bias
+        } else {
+            bias.without_autodiff()
+        };
         let w = self.effective_weight(1, training);
         h.matmul(w.transpose()) + bias
     }
@@ -421,15 +435,19 @@ impl Field {
         hidden: Tensor<2>,
         adjoints: Tensor<2>,
     ) -> (Tensor<2>, Tensor<2>) {
-        let v = self.p("lin1.weight_v").detach();
-        let g = self.p("lin1.weight_g").detach();
+        self.weight_gradients(1, adjoints.transpose().matmul(hidden))
+    }
+
+    /// Chain rule for row-wise weight normalization, shared by both MLP layers.
+    fn weight_gradients(&self, layer: usize, dw: Tensor<2>) -> (Tensor<2>, Tensor<2>) {
+        let v = self.p(&format!("lin{layer}.weight_v")).without_autodiff();
+        let g = self.p(&format!("lin{layer}.weight_g")).without_autodiff();
         let norm_squared = (v.clone() * v.clone()).sum_dim(1);
         let norm = norm_squared.clone().sqrt();
-        let dw = adjoints.transpose().matmul(hidden);
         let dot = (dw.clone() * v.clone()).sum_dim(1);
         let dg = dot.clone() / norm.clone();
         let dv = (dw - v * (dot / norm_squared)) * (g / norm);
-        (dv.detach(), dg.detach())
+        (dv.without_autodiff(), dg.without_autodiff())
     }
 
     fn packed_tables(&self) -> (Tensor<2>, Tensor<2>) {
@@ -444,7 +462,9 @@ impl Field {
         let mut offset = 0usize;
         for level in 0..active {
             let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as usize;
-            let table = self.p(&format!("encoding.embeddings.{level}")).detach();
+            let table = self
+                .p(&format!("encoding.embeddings.{level}"))
+                .without_autodiff();
             metadata.extend([res as f32, offset as f32]);
             offset += table.dims()[0];
             tables.push(table);
@@ -486,10 +506,17 @@ impl Field {
                 &self.device,
             );
             let feat = self.compute_features_gpu(pts_tensor.clone());
-            let y = self.mlp_forward(feat.clone(), false);
+            let preactivation = feat
+                .clone()
+                .matmul(self.effective_weight(0, false).transpose())
+                + self.p("lin0.bias").without_autodiff();
+            let hidden = Self::softplus(preactivation.clone());
+            let y = self.mlp_output(hidden.clone(), false);
             values.extend(y.try_into_vec_as::<f32>()?);
             chunks.push(FeatureChunk {
                 feat,
+                preactivation,
+                hidden,
                 pts_tensor,
                 point_count: n,
             });
@@ -498,7 +525,9 @@ impl Field {
     }
 
     pub fn inv_s(&self) -> Tensor<2> {
-        (self.p("variance") * 10.).exp().clamp(1e-6, 1e6)
+        (self.p("variance").without_autodiff() * 10.)
+            .exp()
+            .clamp(1e-6, 1e6)
     }
 
     /// Flush lazy work before measuring, then release unused cached pages. This
@@ -506,9 +535,8 @@ impl Field {
     pub fn trim_memory(&self) {
         let _ = self.device.sync();
         if let Some(usage) = self.device.memory_pool_usage() {
-            if usage.bytes_reserved > self.peak_reserved_bytes.get() {
-                self.peak_reserved_bytes.set(usage.bytes_reserved);
-            }
+            self.peak_reserved_bytes
+                .set(self.peak_reserved_bytes.get().max(usage.bytes_reserved));
             if usage.bytes_reserved > 256 * 1024 * 1024 {
                 self.device.memory_cleanup();
             }
@@ -543,35 +571,33 @@ impl Field {
             let ds = &adjoints[offset..offset + n];
             offset += n;
 
-            let feat = chunk.feat.detach().autodiff().require_grad();
-            let hidden = self.mlp_hidden(feat.clone(), true);
-            let output = self.mlp_output(hidden.clone(), true);
             let ds_tensor = tensor(ds.to_vec(), [n, 1], &self.device);
-            let (dv, dg) = self.output_weight_gradients(hidden.detach(), ds_tensor.clone());
-            for (name, grad) in [("lin1.weight_v", dv), ("lin1.weight_g", dg)] {
+            let (dv1, dg1) = self.output_weight_gradients(chunk.hidden, ds_tensor.clone());
+            // Explicit softplus derivative avoids rebuilding an autodiff graph and
+            // repeating the forward matmuls. Match PyTorch's beta=100, threshold=20.
+            let scaled = chunk.preactivation * 100.;
+            let sigmoid = ((-scaled.clone()).exp() + 1.).recip();
+            let derivative = sigmoid.mask_fill(scaled.greater_elem(20.), 1.);
+            let dh = ds_tensor.clone() * self.effective_weight(1, false) * derivative;
+            let dw0 = dh.clone().transpose().matmul(chunk.feat);
+            let (dv0, dg0) = self.weight_gradients(0, dw0);
+            let d_feat_tensor = dh.clone().matmul(self.effective_weight(0, false));
+            for (name, grad) in [
+                ("lin0.weight_v", dv0),
+                ("lin0.weight_g", dg0),
+                ("lin0.bias", dh.sum_dim(0)),
+                ("lin1.weight_v", dv1),
+                ("lin1.weight_g", dg1),
+                ("lin1.bias", ds_tensor.sum_dim(0)),
+            ] {
                 accumulated
                     .params
                     .entry(name.to_string())
-                    .and_modify(|v| *v = (v.clone() + grad.clone()).detach())
+                    .and_modify(|v| *v = (v.clone() + grad.clone()).without_autodiff())
                     .or_insert(grad);
             }
-            let loss = (output * ds_tensor).sum();
-            let grads = loss.backward();
-
-            // 1. MLP parameters
-            for name in ["lin0.weight_v", "lin0.weight_g", "lin0.bias", "lin1.bias"] {
-                let p = self.params.get(name).unwrap();
-                if let Some(g) = p.value.grad(&grads) {
-                    accumulated
-                        .params
-                        .entry(name.to_string())
-                        .and_modify(|v| *v = (v.clone() + g.clone()).detach())
-                        .or_insert(g);
-                }
-            }
-
             // 2. Hash table embeddings on GPU
-            if let Some(d_feat_tensor) = feat.grad(&grads) {
+            {
                 let table_grad = accumulated.params.remove("encoding.packed").unwrap();
                 let updated = crate::kernels::backward_packed(
                     chunk.pts_tensor.clone(),
@@ -582,7 +608,6 @@ impl Field {
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
             }
-            drop(grads);
         }
     }
 
@@ -603,13 +628,14 @@ impl Field {
         for (name, grad) in gradients {
             let p = self.params.get_mut(&name).unwrap();
             p.updates += 1;
-            let grad = grad.detach();
-            p.m = (p.m.clone() * 0.9 + grad.clone() * 0.1).detach();
-            p.v = (p.v.clone() * 0.999 + grad.clone() * grad * 0.001).detach();
+            let grad = grad.without_autodiff();
+            p.m = (p.m.clone() * 0.9 + grad.clone() * 0.1).without_autodiff();
+            p.v = (p.v.clone() * 0.999 + grad.clone() * grad * 0.001).without_autodiff();
             let m = p.m.clone() / (1. - 0.9f64.powi(p.updates as i32));
             let v = p.v.clone() / (1. - 0.999f64.powi(p.updates as i32));
-            p.value = (p.value.clone().detach() - m / (v.sqrt() + 1e-8) * lr)
-                .detach()
+            p.value = (p.value.clone().without_autodiff() - m / (v.sqrt() + 1e-8) * lr)
+                .without_autodiff()
+                .autodiff()
                 .require_grad();
         }
     }
@@ -627,7 +653,14 @@ pub fn verify(path: &Path, device: Device) -> Result<()> {
     let r: Reference = serde_json::from_slice(&std::fs::read(path.join("reference.json"))?)?;
     let y = field.forward(&r.points);
     let values = y.clone().try_into_vec_as::<f32>()?;
-    let (gpu_values, _) = field.evaluate_and_cache(&r.points, 8192)?;
+    let (gpu_values, gpu_cache) = field.evaluate_and_cache(&r.points, 8192)?;
+    ensure!(
+        gpu_cache.iter().all(|c| !c.hidden.is_require_grad()
+            && !c.preactivation.is_require_grad()
+            && !c.feat.is_require_grad()),
+        "cached inference unexpectedly tracks gradients"
+    );
+    drop(gpu_cache);
     let gpu_error = gpu_values
         .iter()
         .zip(&r.sdf)

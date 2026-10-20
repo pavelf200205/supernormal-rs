@@ -69,3 +69,11 @@ For a like-for-like final-build comparison, each pure-PyTorch checkpoint was run
 | 30k | 14 | 86,725 | 0.943 s | 0.947 s | 0.763–1.113 s |
 
 Logs: `experiments/benchmark_resume_5k_final_long.log`, `experiments/benchmark_resume_10k_final_long.log`, and `experiments/benchmark_resume_30k_gpu_infer_long.log`.
+
+## Cached MLP backward and inference graph lifetime
+
+Commit `71aa60e` preserves the preceding validated implementation. The next change caches hidden preactivations and activations, then computes softplus, both weight-normalization derivatives, biases, and feature adjoints explicitly. It reuses normalized weights and avoids repeating the forward MLP during backward. Matrix products still use Burn; this is not a fully fused MLP kernel.
+
+Synchronized profiling exposed an attribution error in earlier timings: backward work queued on the GPU was charged to the next forward readback. One diagnostic update measured roughly 0.12 s forward and 0.62 s backward. CPU point generation/deduplication is now timed separately. Those diagnostic runs failed after two updates and are not valid throughput benchmarks.
+
+The first cached-backward candidate passed the 5k, 10k, and 30k field/gradient fixtures but leaked live GPU allocations during training. Burn 0.22's `detach()` preserves `requires_grad`, unlike the PyTorch behavior assumed by the earlier code. Removing automatic backward left unintended inference/optimizer graphs unconsumed; live pool allocation exceeded 7 GB. Microbatch cleanup alone did not fix it. Inference, analytical gradient calculations, and Adam now use `without_autodiff()`, and parameter leaves explicitly regain autodiff after each update. The field verification also asserts that cached activations do not require gradients.

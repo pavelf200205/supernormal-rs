@@ -21,3 +21,6 @@ __pycache__/
 *.pth
 *.bin
 *.ply
+
+# Agent logs and conversation dumps
+Gemini-conversation/

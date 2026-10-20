@@ -39,6 +39,10 @@ pub struct TrainArgs {
     pub mesh_resolution: usize,
     #[arg(long, default_value_t = 42)]
     pub seed: u64,
+    /// Synchronize backward work for accurate stage timings (adds profiling overhead).
+    #[arg(long)]
+    #[serde(default)]
+    pub profile_stages: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -153,6 +157,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let mut variance_grad = 0f32;
         let mut sdf_bias_grad = 0f64;
         let mut t_eval = 0.0;
+        let mut t_points = 0.0;
         let mut t_comp = 0.0;
         let mut t_bwd = 0.0;
         for start in (0..patches.len()).step_by(args.microbatch) {
@@ -170,6 +175,8 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             let t0 = std::time::Instant::now();
             let points = render::sample_points(pp, &local);
             let (unique, indices) = render::unique_points(&points);
+            t_points += t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             let (unique_sdf, cache) = field.evaluate_and_cache(&unique, args.query)?;
             let sdf: Vec<_> = indices.iter().map(|&i| unique_sdf[i]).collect();
             t_eval += t0.elapsed().as_secs_f64();
@@ -189,6 +196,16 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             }
             let t2 = std::time::Instant::now();
             field.accumulate_gradients_cached(cache, &adjoints, &mut gradients);
+            if args.profile_stages {
+                field
+                    .device
+                    .sync()
+                    .map_err(|e| anyhow::anyhow!("profiling sync failed: {e:?}"))?;
+            }
+            // Cached activations increase the per-chunk working set. Release
+            // completed temporary buffers before the next microbatch instead
+            // of retaining every query shape until the optimizer step.
+            field.trim_memory();
             t_bwd += t2.elapsed().as_secs_f64();
         }
         gradients.insert(
@@ -226,9 +243,9 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             samples.len()
         );
         println!(
-            "  occupancy={occupancy_seconds:.2}s sampling={sampling_seconds:.2}s (march={march_seconds:.2}s visible={visibility_seconds:.2}s) eval={t_eval:.2}s composite={t_comp:.2}s bwd={t_bwd:.2}s adam={t_adam:.2}s",
+            "  occupancy={occupancy_seconds:.2}s sampling={sampling_seconds:.2}s (march={march_seconds:.2}s visible={visibility_seconds:.2}s) points={t_points:.2}s eval={t_eval:.2}s composite={t_comp:.2}s bwd={t_bwd:.2}s adam={t_adam:.2}s",
         );
-        if field.step == final_step {
+        if field.step == final_step || args.profile_stages {
             println!(
                 "Burn memory pool (not total driver/process usage): {:?}",
                 field.device.memory_pool_usage()
