@@ -147,3 +147,35 @@ accumulation may change rounding and denormal behavior.
 These changes have not been built or tested. GPU marching, GPU occupancy-grid
 maintenance, fully device-side compaction, and tiled matrix/parameter-gradient
 execution are still outstanding; this is not completion of all performance work.
+
+
+## GPU sampling, occupancy and parameter reductions (unvalidated)
+
+The default training path now marches rays on the GPU using the existing voxel
+boundary skipping rule. Host sphere intersections and jitter preserve the RNG
+consumption order. Each ray writes into bounded storage, followed by a device
+prefix sum and stable device compaction. One total-count scalar is read for
+allocation, then the compact samples are read for the existing CPU geometry
+preparation. Thus compaction is GPU-side, but the complete sampling-to-field
+pipeline is not yet device-resident. Initial temporary sample storage can be
+larger than the CPU marcher's packed output.
+
+Occupancy EMA updates and thresholding run on the GPU. Ordered per-cell lists
+preserve repeated decay when random cell IDs repeat. Occupied-cell selection and
+jitter remain on the host; flags are mirrored for that selection policy. Values
+stay on the device until checkpoint serialization, which explicitly refreshes
+the host copy. The mean threshold now uses an FP32 device reduction rather than
+a CPU FP64 sum; cells very near the threshold can differ.
+
+First-layer weight and bias gradients use 8x8 parameter tiles with 32 samples
+staged in shared memory, accumulating 256-sample partials without atomics. Burn
+reduces the partials. Output-layer reductions, weight-normalization derivatives
+and Adam remain separate operations.
+
+Comparison switches (independent): `--cpu-march`, `--cpu-occupancy`, and
+`--untiled-gradients`. Combine all three to disable this set of changes. Existing
+`--cpu-visibility`, `--cpu-composite`, and `--unfused-field` switches remain.
+Checkpoint format and training schedules are preserved. No compilation, runtime
+parity checks or timing measurements were performed for this set. Early-training
+speedup is a hypothesis, not a measured result; compare the same checkpoints and
+watch memory use before committing to a full reconstruction.

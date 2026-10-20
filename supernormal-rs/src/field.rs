@@ -38,6 +38,7 @@ pub struct Field {
     pub variance_host: f32,
     pub fused_field: bool,
     pub cpu_visibility: bool,
+    pub tiled_gradients: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
 }
@@ -288,6 +289,7 @@ impl Field {
             variance_host: 0.5,
             fused_field: true,
             cpu_visibility: false,
+            tiled_gradients: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         }
@@ -364,6 +366,7 @@ impl Field {
             variance_host,
             fused_field: true,
             cpu_visibility: false,
+            tiled_gradients: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         })
@@ -469,6 +472,21 @@ impl Field {
         }
 
         pending
+    }
+
+    pub fn evaluate_device(&self, points: &[[f32; 3]], chunk: usize) -> Tensor<2> {
+        let outputs = self
+            .enqueue_evaluation(points, chunk)
+            .into_iter()
+            .map(|(n, y)| {
+                if y.dims()[0] == n {
+                    y
+                } else {
+                    y.slice([0..n, 0..1])
+                }
+            })
+            .collect();
+        Tensor::cat(outputs, 0)
     }
 
     pub fn evaluate(&self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
@@ -854,9 +872,11 @@ impl Field {
                 let df = dh.clone().matmul(w0.clone());
                 (dh, Some(df), dw1)
             };
-            let dw0_chunk = dh.clone().transpose().matmul(chunk.feat);
-
-            let db0_chunk = dh.sum_dim(0);
+            let (dw0_chunk, db0_chunk) = if self.tiled_gradients {
+                crate::sampling_gpu::parameter_gradients(dh, chunk.feat)
+            } else {
+                (dh.clone().transpose().matmul(chunk.feat), dh.sum_dim(0))
+            };
             let db1_chunk = ds_tensor.sum_dim(0);
 
             dw0_total = Some(match dw0_total {

@@ -15,6 +15,12 @@ pub struct Occupancy {
     pub resolution: usize,
     pub values: Vec<f32>,
     pub flags: Vec<bool>,
+    #[serde(skip)]
+    pub device_values: Option<burn::tensor::Tensor<2>>,
+    #[serde(skip)]
+    pub device_flags: Option<burn::tensor::Tensor<2>>,
+    #[serde(skip)]
+    pub cpu_update: bool,
 }
 
 impl Occupancy {
@@ -23,7 +29,17 @@ impl Occupancy {
             resolution,
             values: vec![0.; resolution.pow(3)],
             flags: vec![false; resolution.pow(3)],
+            device_values: None,
+            device_flags: None,
+            cpu_update: false,
         }
+    }
+
+    pub fn sync_values(&mut self) -> Result<()> {
+        if let Some(values) = self.device_values.take() {
+            self.values = values.try_into_vec_as::<f32>()?;
+        }
+        Ok(())
     }
 
     pub fn occupied(&self, p: [f32; 3]) -> bool {
@@ -70,6 +86,47 @@ impl Occupancy {
             })
             .collect();
 
+        if !self.cpu_update {
+            use crate::field::tensor;
+            use burn::tensor::Tensor;
+            anyhow::ensure!(
+                ids.len() < (1 << 24),
+                "occupancy update exceeds exact index range"
+            );
+            let sdf = field.evaluate_device(&points, query);
+            let old = self
+                .device_values
+                .take()
+                .unwrap_or_else(|| tensor(self.values.clone(), [n, 1], &field.device));
+            let mut heads = vec![-1.0_f32; n];
+            let mut next = vec![-1.0_f32; ids.len()];
+            for (index, &id) in ids.iter().enumerate().rev() {
+                next[index] = heads[id];
+                heads[id] = index as f32;
+            }
+            let [values] = crate::sampling_gpu::occupancy([
+                sdf,
+                tensor(heads, [n, 1], &field.device),
+                tensor(next, [ids.len(), 1], &field.device),
+                old,
+                Tensor::zeros([n, 1], &field.device),
+            ]);
+            let threshold = values.clone().mean().clamp_max(0.1).reshape([1, 1]);
+            let flags = values.clone().greater(threshold).float();
+            // Keep the occupied-ID sampling policy and RNG identical. Only the
+            // flags are mirrored; values are downloaded when saving a checkpoint.
+            self.flags = flags
+                .clone()
+                .try_into_vec_as::<f32>()?
+                .into_iter()
+                .map(|v| v != 0.)
+                .collect();
+            self.device_values = Some(values);
+            self.device_flags = Some(flags);
+            return Ok(());
+        }
+        self.sync_values()?;
+        self.device_flags = None;
         let sdf = field.evaluate(&points, query)?;
         for (&i, &s) in ids.iter().zip(&sdf) {
             self.values[i] = (self.values[i] * 0.95).max(sigmoid(-80. * s));
@@ -1257,4 +1314,96 @@ pub fn composite_device(
     };
     let stats = stats * tensor(vec![1., 1., 1., vscale, 1.], [1, 5], &device);
     (adjoints, stats)
+}
+
+/// March into bounded per-ray storage, then compact in stable order on the GPU.
+/// A scalar total determines the final allocation; existing geometry preparation
+/// still consumes the compact samples on the host.
+pub fn march_device(
+    patches: &[Patch],
+    occ: &mut Occupancy,
+    step_size: f32,
+    rng: &mut impl Rng,
+    device: &burn::tensor::Device,
+) -> Result<Vec<Sample>> {
+    use crate::field::tensor;
+    use burn::tensor::Tensor;
+    let mut rays = Vec::with_capacity(patches.len() * 12);
+    let mut capacity = 0usize;
+    for patch in patches {
+        let d = patch.dirs[4];
+        let o = patch.origin;
+        let a = dot(d, d);
+        let b = 2. * dot(o, d);
+        let c = dot(o, o) - 1.;
+        let disc = b * b - 4. * a * c;
+        let (near, far, count) = if disc > 0. {
+            let near = (-b - disc.sqrt()) / (2. * a) + rng.random::<f32>() * step_size;
+            let far = (-b + disc.sqrt()) / (2. * a);
+            (
+                near,
+                far,
+                ((far - near) / step_size).ceil().max(0.) as usize,
+            )
+        } else {
+            (0., 0., 0)
+        };
+        rays.extend(o);
+        rays.extend(d);
+        rays.extend([
+            near,
+            far,
+            step_size,
+            capacity as f32,
+            count as f32,
+            occ.resolution as f32,
+        ]);
+        capacity = capacity
+            .checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
+    }
+    anyhow::ensure!(
+        capacity < (1 << 24),
+        "march batch exceeds exact index range; reduce batch size"
+    );
+    if capacity == 0 {
+        return Ok(Vec::new());
+    }
+    let flags = occ
+        .device_flags
+        .get_or_insert_with(|| {
+            tensor(
+                occ.flags.iter().map(|&v| if v { 1. } else { 0. }).collect(),
+                [occ.flags.len(), 1],
+                device,
+            )
+        })
+        .clone();
+    let rays = tensor(rays, [patches.len(), 12], device);
+    let [samples, counts] = crate::sampling_gpu::march([
+        rays.clone(),
+        flags,
+        Tensor::zeros([capacity, 2], device),
+        Tensor::zeros([patches.len(), 1], device),
+    ]);
+    let prefix = counts.cumsum(0);
+    let total = prefix
+        .clone()
+        .slice([patches.len() - 1..patches.len(), 0..1])
+        .try_into_vec_as::<f32>()?[0] as usize;
+    anyhow::ensure!(total <= capacity, "invalid compacted sample count");
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let [packed] =
+        crate::sampling_gpu::compact([rays, samples, prefix, Tensor::zeros([total, 3], device)]);
+    let packed = packed.try_into_vec_as::<f32>()?;
+    Ok(packed
+        .chunks_exact(3)
+        .map(|s| Sample {
+            patch: s[0] as usize,
+            start: s[1],
+            end: s[2],
+        })
+        .collect())
 }

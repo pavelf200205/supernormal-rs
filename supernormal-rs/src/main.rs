@@ -9,6 +9,7 @@ mod mc_table;
 mod mesh;
 mod progress;
 mod render;
+mod sampling_gpu;
 mod train;
 
 #[derive(Parser)]

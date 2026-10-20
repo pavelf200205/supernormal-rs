@@ -42,6 +42,18 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub cpu_visibility: bool,
+    /// Use the reference CPU ray marcher.
+    #[arg(long)]
+    #[serde(default)]
+    pub cpu_march: bool,
+    /// Update occupancy values on the CPU.
+    #[arg(long)]
+    #[serde(default)]
+    pub cpu_occupancy: bool,
+    /// Use Burn matmul and reductions for first-layer parameter gradients.
+    #[arg(long)]
+    #[serde(default)]
+    pub untiled_gradients: bool,
     #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
@@ -149,6 +161,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     };
     field.fused_field = !args.unfused_field;
     field.cpu_visibility = args.cpu_visibility;
+    field.tiled_gradients = !args.untiled_gradients;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
     let mut restored_state = false;
@@ -168,6 +181,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             );
         }
     }
+    occ.cpu_update = args.cpu_occupancy;
     let final_step = (field.step + args.steps).min(args.end_iter);
     let mut metrics = std::io::BufWriter::new(std::fs::File::create(args.out.join("metrics.csv"))?);
     writeln!(
@@ -213,7 +227,11 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let patches = dataset.random_patches(args.batch, &mut rng);
         let step_size = 10f32.powf(-2. - step as f32 / args.end_iter as f32);
         let march_started = std::time::Instant::now();
-        let marched = render::march(&patches, &occ, step_size, &mut rng);
+        let marched = if args.cpu_march {
+            render::march(&patches, &occ, step_size, &mut rng)
+        } else {
+            render::march_device(&patches, &mut occ, step_size, &mut rng, &field.device)?
+        };
         let march_seconds = march_started.elapsed().as_secs_f64();
         let visible_started = std::time::Instant::now();
         // Previous backward/Adam kernels run while we prepare patches and rays.
@@ -433,12 +451,16 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 .out
                 .join(format!("checkpoint_{:06}.partial", field.step));
             field.save(&temp)?;
+            occ.sync_values()?;
             let state = State {
                 rng: rng.clone(),
                 occupancy: Occupancy {
                     resolution: occ.resolution,
                     values: occ.values.clone(),
                     flags: occ.flags.clone(),
+                    device_values: None,
+                    device_flags: None,
+                    cpu_update: false,
                 },
                 args: args.clone(),
             };
