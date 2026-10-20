@@ -101,10 +101,10 @@ The original reconstruction implementation is MIT licensed; see `LICENSE`. The m
 
 ## GPU compositor and fused backward (unvalidated)
 
-Training now keeps field SDFs and unique-point adjoints on the GPU. One invocation
-owns a patch and performs ordered volume compositing, normal/mask/eikonal losses,
-reverse transmittance differentiation, and accumulation into that patch's unique
-SDF entries. Patch-local ownership avoids float atomics in this stage. It relies
+Training now keeps field SDFs and unique-point adjoints on the GPU. One invocation owns a pixel ray and performs ordered volume compositing,
+normal/mask/eikonal losses and reverse transmittance differentiation. A second
+GPU gather combines spatial stencil derivatives and reused endpoint adjoints.
+The nine pixels now run independently, without float atomics in this stage. It relies
 on `sample_and_dedup_points`, which never shares indices between patches. Geometry
 preparation, marching and visibility filtering still involve the CPU. Five loss
 and scalar-gradient totals are read back per optimizer batch; large SDF/adjoint
@@ -123,3 +123,27 @@ flags to compare with the earlier implementation. No builds, numerical checks,
 or speed measurements were run for these changes. GPU loss accumulation uses
 FP32 rather than the CPU's mixed FP32/FP64 accumulation, and derivative summation
 order differs. Check short resumed runs and loss/mesh parity before a long run.
+
+
+## Visibility and parallel compositor changes (source only)
+
+Visibility transmittance scanning and early termination now run on the GPU.
+Only one retained-prefix count per patch plus variance is read back. The CPU
+still compacts the existing ordered sample list and prepares field points.
+`--cpu-visibility` selects the previous implementation for comparison.
+
+The compositor uses one invocation per pixel, with scalar ray state and only
+three-element normal arrays, followed by an atomics-free stencil gather.
+Its scratch storage increases from 45 to 90 floats per sample. Reverse endpoint
+mapping requires each unique point to have at most two occurrences, as guaranteed
+by `sample_and_dedup_points`; this is explicitly checked on the host.
+
+Fused MLP forward and backward cooperatively load packed weights into shared
+memory once per workgroup, reusing them across four points. The fused hash
+backward selects native FP32 atomic addition when CubeCL advertises that exact
+capability, and otherwise uses the portable CAS implementation. Native atomic
+accumulation may change rounding and denormal behavior.
+
+These changes have not been built or tested. GPU marching, GPU occupancy-grid
+maintenance, fully device-side compaction, and tiled matrix/parameter-gradient
+execution are still outstanding; this is not completion of all performance work.

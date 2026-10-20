@@ -38,6 +38,10 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub cpu_composite: bool,
+    /// Use CPU visibility filtering for comparison.
+    #[arg(long)]
+    #[serde(default)]
+    pub cpu_visibility: bool,
     #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
@@ -144,6 +148,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         Field::new(device, args.seed)
     };
     field.fused_field = !args.unfused_field;
+    field.cpu_visibility = args.cpu_visibility;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
     let mut restored_state = false;

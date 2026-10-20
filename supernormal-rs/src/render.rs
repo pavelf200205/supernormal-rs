@@ -215,18 +215,52 @@ pub fn visible(
         end_idx.push(idx);
     }
 
-    let sdf = field.evaluate_visibility(&unique_pts, query)?;
-    let inv = field.inv_s_host();
-    let mut trans = vec![1f32; patches.len()];
-    let mut out = Vec::with_capacity(n);
-    for (i, s) in samples.into_iter().enumerate() {
-        let a = alpha(sdf[start_idx[i]], sdf[end_idx[i]], inv);
-        let t = &mut trans[s.patch];
-        if *t >= 1e-8 {
-            out.push(s);
+    if field.cpu_visibility {
+        let sdf = field.evaluate_visibility(&unique_pts, query)?;
+        let inv = field.inv_s_host();
+        let mut trans = vec![1f32; patches.len()];
+        let mut out = Vec::with_capacity(n);
+        for (i, s) in samples.into_iter().enumerate() {
+            let a = alpha(sdf[start_idx[i]], sdf[end_idx[i]], inv);
+            let t = &mut trans[s.patch];
+            if *t >= 1e-8 {
+                out.push(s);
+            }
+            *t *= (1. - a).max(1e-10);
         }
-        *t *= (1. - a).max(1e-10);
+        return Ok(out);
     }
+    assert!(
+        unique_pts.len() < (1 << 24) && n < (1 << 24),
+        "visibility indices exceed f32 range"
+    );
+    let pairs = start_idx
+        .iter()
+        .zip(&end_idx)
+        .flat_map(|(&a, &b)| [a as f32, b as f32])
+        .collect();
+    let mut ranges = Vec::with_capacity(patches.len() * 2);
+    let mut cursor = 0;
+    for patch in 0..patches.len() {
+        let begin = cursor;
+        while cursor < n && samples[cursor].patch == patch {
+            cursor += 1;
+        }
+        ranges.extend([begin as f32, cursor as f32]);
+    }
+    let mut remaining = field.visibility_counts(&unique_pts, query, pairs, ranges)?;
+    let out = samples
+        .into_iter()
+        .filter(|s| {
+            let count = &mut remaining[s.patch];
+            if *count == 0 {
+                false
+            } else {
+                *count -= 1;
+                true
+            }
+        })
+        .collect();
     Ok(out)
 }
 
@@ -1191,14 +1225,29 @@ pub fn composite_device(
     geometry.resize(count * 27, 0.);
     let mut mapping: Vec<f32> = indices.iter().map(|&i| i as f32).collect();
     mapping.resize(count * 18, 0.);
+    assert!(
+        indices.len() < (1 << 24),
+        "compositor occurrence index exceeds f32 range"
+    );
+    let mut reverse = vec![-1.0_f32; n * 2];
+    for (occurrence, &id) in indices.iter().enumerate() {
+        let slot = if reverse[id * 2] < 0. {
+            id * 2
+        } else {
+            id * 2 + 1
+        };
+        assert!(reverse[slot] < 0., "unexpected cross-patch point sharing");
+        reverse[slot] = occurrence as f32;
+    }
     let [adjoints, stats] = crate::kernels::composite_gpu([
         sdf,
         tensor(geometry, [count, 27], &device),
         tensor(mapping, [count, 18], &device),
         tensor(packed, [patches.len(), 123], &device),
-        Tensor::zeros([count, 45], &device),
+        Tensor::zeros([count, 90], &device),
         Tensor::zeros([n, 1], &device),
-        Tensor::zeros([patches.len(), 5], &device),
+        Tensor::zeros([patches.len() * 9, 5], &device),
+        tensor(reverse, [n, 2], &device),
     ]);
     let stats = stats.sum_dim(0);
     let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {

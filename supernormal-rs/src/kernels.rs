@@ -1041,6 +1041,14 @@ fn fused_field_kernel(
 ) {
     // CubeCL workgroup coordinates are u32; tensor/shared indices are usize.
     let unit = usize::cast_from(UNIT_POS);
+    let mut shared_weights = Shared::new_slice(2113usize);
+    for tile in 0..9usize {
+        let index = unit + tile * 256;
+        if index < 2113 {
+            shared_weights[index] = weights[index];
+        }
+    }
+    sync_cube();
     let lane = unit % 64;
     let slot = unit / 64;
     let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
@@ -1115,9 +1123,9 @@ fn fused_field_kernel(
         let mut h = 0.0_f32;
         // Packed input-major weights give adjacent lanes adjacent reads.
         for k in 0..(3 + usize::cast_from(active) * 2) {
-            h += shared_features[slot * 32 + k] * weights[k * 64 + lane];
+            h += shared_features[slot * 32 + k] * shared_weights[k * 64 + lane];
         }
-        h += weights[1984 + lane];
+        h += shared_weights[1984 + lane];
         if cache {
             preactivation[point_idx * 64 + lane] = h;
             if lane < 31 {
@@ -1127,7 +1135,7 @@ fn fused_field_kernel(
         let scaled = h * 100.;
         let soft = f32::ln(1. + f32::exp(f32::min(scaled, 20.))) / 100.;
         let activated = if scaled > 20. { h } else { soft };
-        contribution = activated * weights[2048 + lane];
+        contribution = activated * shared_weights[2048 + lane];
     }
     partials[unit] = contribution;
     sync_cube();
@@ -1140,7 +1148,7 @@ fn fused_field_kernel(
         sync_cube();
     }
     if valid && lane == 0 {
-        output[point_idx] = partials[slot * 64] + weights[2112];
+        output[point_idx] = partials[slot * 64] + shared_weights[2112];
     }
 }
 
@@ -1222,8 +1230,8 @@ pub fn fused_field(
     result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
-// One invocation owns one patch, including all its unique SDF entries. This
-// preserves ray order and avoids cross-pixel float atomics in the compositor.
+// Each invocation owns one pixel ray. A separate gather combines stencil
+// derivatives, so nine pixels run independently without float atomics.
 #[cube(launch)]
 fn composite_kernel(
     sdf: &Tensor<f32>,
@@ -1231,10 +1239,11 @@ fn composite_kernel(
     ids: &Tensor<f32>,
     patches: &Tensor<f32>,
     scratch: &mut Tensor<f32>,
-    ds: &mut Tensor<f32>,
     stats: &mut Tensor<f32>,
 ) {
-    let p = ABSOLUTE_POS;
+    let ray = ABSOLUTE_POS;
+    let p = ray / 9;
+    let pixel = ray % 9;
     if p >= patches.shape(0) {
         terminate!();
     }
@@ -1245,23 +1254,17 @@ fn composite_kernel(
     let normal_den = patches[pb + 3];
     let pixel_den = patches[pb + 4];
     let sample_den = patches[pb + 5];
-    let mut normals = Array::<f32>::new(27usize);
-    let mut dn = Array::<f32>::new(27usize);
-    let mut masks = Array::<f32>::new(9usize);
-    let mut trans = Array::<f32>::new(9usize);
-    let mut dm = Array::<f32>::new(9usize);
-    let mut future = Array::<f32>::new(9usize);
-    for i in 0..27usize {
+    let mut normals = Array::<f32>::new(3usize);
+    let mut dn = Array::<f32>::new(3usize);
+    let mut masks = 0.0_f32;
+    let mut trans = 1.0_f32;
+    let mut dm = 0.0_f32;
+    let mut future = 0.0_f32;
+    for i in 0..3usize {
         normals[i] = 0.0_f32;
     }
-    for i in 0..9usize {
-        masks[i] = 0.0_f32;
-        trans[i] = 1.0_f32;
-        future[i] = 0.0_f32;
-        dm[i] = 0.0_f32;
-    }
     for s in begin..end {
-        for i in 0..9usize {
+        for i in pixel..pixel + 1 {
             let col = i % 3;
             let row = i / 3;
             let l = if col == 0 { i } else { i - 1 };
@@ -1280,17 +1283,17 @@ fn composite_kernel(
             let c0 = 1.0_f32 / (1.0_f32 + f32::exp(-s0 * inv));
             let c1 = 1.0_f32 / (1.0_f32 + f32::exp(-s1 * inv));
             let a = f32::clamp((c0 - c1 + 1e-5_f32) / (c0 + 1e-5_f32), 0.0_f32, 1.0_f32);
-            let w = trans[i] * a;
-            let sb = (s * 9 + i) * 5;
-            scratch[sb + 3] = trans[i];
+            let w = trans * a;
+            let sb = (s * 9 + i) * 10;
+            scratch[sb + 3] = trans;
             scratch[sb + 4] = a;
-            trans[i] *= f32::max(1.0_f32 - a, 1e-10_f32);
-            masks[i] += w;
+            trans *= f32::max(1.0_f32 - a, 1e-10_f32);
+            masks += w;
             for j in 0..3usize {
                 let vb = pb + 6 + i * 13 + j * 3;
                 let g = patches[vb] * dt + patches[vb + 1] * dx + patches[vb + 2] * dy;
                 scratch[sb + j] = g;
-                normals[i * 3 + j] += w * g;
+                normals[j] += w * g;
             }
         }
     }
@@ -1299,23 +1302,23 @@ fn composite_kernel(
     let mut el = 0.0_f32;
     let mut dinv = 0.0_f32;
     let mut bias = 0.0_f32;
-    for i in 0..9usize {
+    for i in pixel..pixel + 1 {
         let mask = patches[pb + 6 + i * 13 + 12];
         for j in 0..3usize {
-            let err = (normals[i * 3 + j] - patches[pb + 6 + i * 13 + 9 + j]) * mask;
+            let err = (normals[j] - patches[pb + 6 + i * 13 + 9 + j]) * mask;
             nl += err * err / normal_den;
-            dn[i * 3 + j] = 2.0_f32 * err * mask / normal_den;
+            dn[j] = 2.0_f32 * err * mask / normal_den;
         }
-        let m = f32::clamp(masks[i], 1e-5_f32, 1.0_f32 - 1e-5_f32);
+        let m = f32::clamp(masks, 1e-5_f32, 1.0_f32 - 1e-5_f32);
         ml += -(mask * f32::ln(m) + (1.0_f32 - mask) * f32::ln(1.0_f32 - m)) / pixel_den;
-        if masks[i] >= 1e-5_f32 && masks[i] <= 1.0_f32 - 1e-5_f32 {
-            dm[i] = (m - mask) / (m * (1.0_f32 - m) * pixel_den);
+        if masks >= 1e-5_f32 && masks <= 1.0_f32 - 1e-5_f32 {
+            dm = (m - mask) / (m * (1.0_f32 - m) * pixel_den);
         }
     }
     for rev in 0..(end - begin) {
         let s = end - 1 - rev;
-        for i in 0..9usize {
-            let sb = (s * 9 + i) * 5;
+        for i in pixel..pixel + 1 {
+            let sb = (s * 9 + i) * 10;
             let g0 = scratch[sb];
             let g1 = scratch[sb + 1];
             let g2 = scratch[sb + 2];
@@ -1324,9 +1327,9 @@ fn composite_kernel(
             let norm = f32::sqrt(g0 * g0 + g1 * g1 + g2 * g2);
             el += (norm - 1.0_f32) * (norm - 1.0_f32) / sample_den;
             let eg = 2.0_f32 * (norm - 1.0_f32) / sample_den / f32::max(norm, 1e-12_f32);
-            let dg0 = t * a * dn[i * 3] + eg * g0;
-            let dg1 = t * a * dn[i * 3 + 1] + eg * g1;
-            let dg2 = t * a * dn[i * 3 + 2] + eg * g2;
+            let dg0 = t * a * dn[0] + eg * g0;
+            let dg1 = t * a * dn[1] + eg * g1;
+            let dg2 = t * a * dn[2] + eg * g2;
             let vb = pb + 6 + i * 13;
             let dp0 = (patches[vb] * dg0 + patches[vb + 3] * dg1 + patches[vb + 6] * dg2)
                 * geometry[s * 27 + i * 3];
@@ -1334,29 +1337,22 @@ fn composite_kernel(
                 * geometry[s * 27 + i * 3 + 1];
             let dp2 = (patches[vb + 2] * dg0 + patches[vb + 5] * dg1 + patches[vb + 8] * dg2)
                 * geometry[s * 27 + i * 3 + 2];
-            let col = i % 3;
-            let row = i / 3;
-            let l = if col == 0 { i } else { i - 1 };
-            let r = if col == 2 { i } else { i + 1 };
-            let u = if row == 0 { i } else { i - 3 };
-            let d = if row == 2 { i } else { i + 3 };
             let i0 = usize::cast_from(ids[s * 18 + i]);
             let i1 = usize::cast_from(ids[s * 18 + 9 + i]);
-            ds[i0] -= dp0;
-            ds[i1] += dp0;
-            ds[usize::cast_from(ids[s * 18 + l])] -= dp1;
-            ds[usize::cast_from(ids[s * 18 + r])] += dp1;
-            ds[usize::cast_from(ids[s * 18 + u])] -= dp2;
-            ds[usize::cast_from(ids[s * 18 + d])] += dp2;
-            let gw = dn[i * 3] * g0 + dn[i * 3 + 1] * g1 + dn[i * 3 + 2] * g2 + dm[i];
+            scratch[sb + 5] = dp0;
+            scratch[sb + 6] = dp1;
+            scratch[sb + 7] = dp2;
+            scratch[sb + 8] = 0.0_f32;
+            scratch[sb + 9] = 0.0_f32;
+            let gw = dn[0] * g0 + dn[1] * g1 + dn[2] * g2 + dm;
             let q = f32::max(1.0_f32 - a, 1e-10_f32);
             let tail = if 1.0_f32 - a >= 1e-10_f32 {
-                future[i]
+                future
             } else {
                 0.0_f32
             };
             let da = t * (gw - tail);
-            future[i] = gw * a + q * future[i];
+            future = gw * a + q * future;
             let s0 = sdf[i0];
             let s1 = sdf[i1];
             let c0 = 1.0_f32 / (1.0_f32 + f32::exp(-s0 * inv));
@@ -1366,18 +1362,18 @@ fn composite_kernel(
             if raw >= 0.0_f32 && raw <= 1.0_f32 {
                 let z0 = da * c1 / (denom * denom) * c0 * (1.0_f32 - c0);
                 let z1 = -da / denom * c1 * (1.0_f32 - c1);
-                ds[i0] += z0 * inv;
-                ds[i1] += z1 * inv;
+                scratch[sb + 8] = z0 * inv;
+                scratch[sb + 9] = z1 * inv;
                 bias += z0 * inv + z1 * inv;
                 dinv += z0 * s0 + z1 * s1;
             }
         }
     }
-    stats[p * 5] = nl;
-    stats[p * 5 + 1] = ml;
-    stats[p * 5 + 2] = el;
-    stats[p * 5 + 3] = dinv;
-    stats[p * 5 + 4] = bias;
+    stats[ray * 5] = nl;
+    stats[ray * 5 + 1] = ml;
+    stats[ray * 5 + 2] = el;
+    stats[ray * 5 + 3] = dinv;
+    stats[ray * 5 + 4] = bias;
 }
 
 #[derive(Debug)]
@@ -1389,11 +1385,11 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([s, g, i, p, w, d, l], [od, ol]) = self.desc.as_fixed();
-        let [s, g, i, p, w, d, l] =
-            [s, g, i, p, w, d, l].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let ([s, g, i, p, w, d, l, r], [od, ol]) = self.desc.as_fixed();
+        let [s, g, i, p, w, d, l, r] =
+            [s, g, i, p, w, d, l, r].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = s.client.clone();
-        let n = p.meta.shape().dims::<2>()[0];
+        let n = p.meta.shape().dims::<2>()[0] * 9;
         let dim = CubeDim::new(&client, n);
         composite_kernel::launch(
             &client,
@@ -1403,19 +1399,28 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             g.into_tensor_arg(),
             i.into_tensor_arg(),
             p.into_tensor_arg(),
-            w.into_tensor_arg(),
-            d.clone().into_tensor_arg(),
+            w.clone().into_tensor_arg(),
             l.clone().into_tensor_arg(),
+        );
+        let count = d.meta.shape().dims::<2>()[0];
+        let dim = CubeDim::new(&client, count);
+        composite_gather_kernel::launch(
+            &client,
+            cubecl::calculate_cube_count_elemwise(&client, count, dim),
+            dim,
+            w.into_tensor_arg(),
+            r.into_tensor_arg(),
+            d.clone().into_tensor_arg(),
         );
         handles.register_float_tensor::<CubeBackend>(&od.id, d);
         handles.register_float_tensor::<CubeBackend>(&ol.id, l);
         Ok(())
     }
 }
-pub fn composite_gpu(inputs: [burn::tensor::Tensor<2>; 7]) -> [burn::tensor::Tensor<2>; 2] {
+pub fn composite_gpu(inputs: [burn::tensor::Tensor<2>; 8]) -> [burn::tensor::Tensor<2>; 2] {
     let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = inputs[5..]
+    let outputs: Vec<_> = inputs[5..7]
         .iter()
         .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
         .collect();
@@ -1448,6 +1453,14 @@ fn field_backward_kernel(
     active: u32,
 ) {
     let unit = usize::cast_from(UNIT_POS);
+    let mut shared_weights = Shared::new_slice(2113usize);
+    for tile in 0..9usize {
+        let index = unit + tile * 256;
+        if index < 2113 {
+            shared_weights[index] = weights[index];
+        }
+    }
+    sync_cube();
     let lane = unit % 64;
     let slot = unit / 64;
     let point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + slot;
@@ -1461,7 +1474,7 @@ fn field_backward_kernel(
         } else {
             1.0_f32 / (1.0_f32 + f32::exp(-scaled))
         };
-        v = ds[point] * weights[2048 + lane] * derivative;
+        v = ds[point] * shared_weights[2048 + lane] * derivative;
         dh[point * 64 + lane] = v;
         let soft = f32::ln(1.0_f32 + f32::exp(f32::min(scaled, 20.0_f32))) / 100.0_f32;
         let hidden = if scaled > 20.0_f32 { h } else { soft };
@@ -1476,8 +1489,8 @@ fn field_backward_kernel(
         let mut g1 = 0.0_f32;
         for j in 0..64usize {
             let h = shared[slot * 64 + j];
-            g0 += h * weights[col * 64 + j];
-            g1 += h * weights[(col + 1) * 64 + j];
+            g0 += h * shared_weights[col * 64 + j];
+            g1 += h * shared_weights[(col + 1) * 64 + j];
         }
         if g0 != 0.0_f32 || g1 != 0.0_f32 {
             let norm0 = f32::clamp(
@@ -1561,20 +1574,41 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         let client = p.client.clone();
         let groups = p.meta.shape().dims::<2>()[0].div_ceil(4);
         let gx = groups.min(65535).max(1);
-        field_backward_kernel::launch(
-            &client,
-            CubeCount::Static(gx as u32, groups.div_ceil(gx) as u32, 1),
-            CubeDim::new_1d(256),
-            p.into_tensor_arg(),
-            d.into_tensor_arg(),
-            w.into_tensor_arg(),
-            h.clone().into_tensor_arg(),
-            g.clone().into_tensor_arg(),
-            x.into_tensor_arg(),
-            m.into_tensor_arg(),
-            t.clone().into_tensor_arg(),
-            *active as u32,
-        );
+        let native_add = client
+            .properties()
+            .atomic_type_usage(Type::atomic(f32::elem_type_native()))
+            .contains(cubecl::ir::features::AtomicUsage::Add);
+        if native_add {
+            field_backward_native_kernel::launch(
+                &client,
+                CubeCount::Static(gx as u32, groups.div_ceil(gx) as u32, 1),
+                CubeDim::new_1d(256),
+                p.into_tensor_arg(),
+                d.into_tensor_arg(),
+                w.into_tensor_arg(),
+                h.clone().into_tensor_arg(),
+                g.clone().into_tensor_arg(),
+                x.into_tensor_arg(),
+                m.into_tensor_arg(),
+                t.clone().into_tensor_arg(),
+                *active as u32,
+            );
+        } else {
+            field_backward_kernel::launch(
+                &client,
+                CubeCount::Static(gx as u32, groups.div_ceil(gx) as u32, 1),
+                CubeDim::new_1d(256),
+                p.into_tensor_arg(),
+                d.into_tensor_arg(),
+                w.into_tensor_arg(),
+                h.clone().into_tensor_arg(),
+                g.clone().into_tensor_arg(),
+                x.into_tensor_arg(),
+                m.into_tensor_arg(),
+                t.clone().into_tensor_arg(),
+                *active as u32,
+            );
+        }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
         handles.register_float_tensor::<CubeBackend>(&oh.id, h);
         handles.register_float_tensor::<CubeBackend>(&og.id, g);
@@ -1612,4 +1646,253 @@ pub fn field_backward(
         )
         .outputs();
     result.map(BT::<2>::from_primitive::<GpuBackend>)
+}
+
+#[cube(launch)]
+fn composite_gather_kernel(scratch: &Tensor<f32>, reverse: &Tensor<f32>, ds: &mut Tensor<f32>) {
+    let point = ABSOLUTE_POS;
+    if point >= ds.shape(0) {
+        terminate!();
+    }
+    let mut total = 0.0_f32;
+    for occurrence in 0..2usize {
+        let code = reverse[point * 2 + occurrence];
+        if code >= 0.0_f32 {
+            let code = usize::cast_from(code);
+            let sample = code / 18;
+            let corner = code % 18;
+            let pixel = corner % 9;
+            let base = (sample * 9 + pixel) * 10;
+            if corner >= 9 {
+                total += scratch[base + 5] + scratch[base + 9];
+            } else {
+                total += -scratch[base + 5] + scratch[base + 8];
+                for j in 0..9usize {
+                    let col = j % 3;
+                    let row = j / 3;
+                    let l = if col == 0 { j } else { j - 1 };
+                    let r = if col == 2 { j } else { j + 1 };
+                    let u = if row == 0 { j } else { j - 3 };
+                    let d = if row == 2 { j } else { j + 3 };
+                    let other = (sample * 9 + j) * 10;
+                    if pixel == l {
+                        total -= scratch[other + 6];
+                    }
+                    if pixel == r {
+                        total += scratch[other + 6];
+                    }
+                    if pixel == u {
+                        total -= scratch[other + 7];
+                    }
+                    if pixel == d {
+                        total += scratch[other + 7];
+                    }
+                }
+            }
+        }
+    }
+    ds[point] = total;
+}
+
+#[cube(launch)]
+fn visibility_kernel(
+    sdf: &Tensor<f32>,
+    pairs: &Tensor<f32>,
+    ranges: &Tensor<f32>,
+    variance: &Tensor<f32>,
+    out: &mut Tensor<f32>,
+) {
+    let ray = ABSOLUTE_POS;
+    if ray >= ranges.shape(0) {
+        terminate!();
+    }
+    let inv = f32::clamp(f32::exp(variance[0] * 10.0_f32), 1e-6_f32, 1e6_f32);
+    let begin = usize::cast_from(ranges[ray * 2]);
+    let end = usize::cast_from(ranges[ray * 2 + 1]);
+    let mut trans = 1.0_f32;
+    let mut count = 0usize;
+    for sample in begin..end {
+        if trans < 1e-8_f32 {
+            break;
+        }
+        count += 1;
+        let a = sdf[usize::cast_from(pairs[sample * 2])];
+        let b = sdf[usize::cast_from(pairs[sample * 2 + 1])];
+        // sigmoid(a*inv), written with the same sign convention as CPU alpha.
+        let c = 1.0_f32 / (1.0_f32 + f32::exp(-a * inv));
+        let d = 1.0_f32 / (1.0_f32 + f32::exp(-b * inv));
+        let alpha = f32::clamp((c - d + 1e-5_f32) / (c + 1e-5_f32), 0.0_f32, 1.0_f32);
+        trans *= f32::max(1.0_f32 - alpha, 1e-10_f32);
+    }
+    out[ray] = f32::cast_from(count);
+    if ray == 0 {
+        out[ranges.shape(0)] = variance[0];
+    }
+}
+#[derive(Debug)]
+struct VisibilityOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for VisibilityOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([s, p, r, v, o], [out]) = self.desc.as_fixed();
+        let [s, p, r, v, o] = [s, p, r, v, o].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let client = s.client.clone();
+        let n = r.meta.shape().dims::<2>()[0];
+        let dim = CubeDim::new(&client, n);
+        visibility_kernel::launch(
+            &client,
+            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            dim,
+            s.into_tensor_arg(),
+            p.into_tensor_arg(),
+            r.into_tensor_arg(),
+            v.into_tensor_arg(),
+            o.clone().into_tensor_arg(),
+        );
+        handles.register_float_tensor::<CubeBackend>(&out.id, o);
+        Ok(())
+    }
+}
+pub fn visibility(inputs: [burn::tensor::Tensor<2>; 5]) -> burn::tensor::Tensor<2> {
+    let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        inputs[4].shape.clone(),
+        inputs[4].dtype,
+    );
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_visibility",
+        &inputs.map(|t| t.into_ir()),
+        &[out],
+        vec![],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            VisibilityOp { desc },
+        )
+        .outputs();
+    burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)
+}
+
+// Native float add variant; selected only when the runtime advertises support.
+#[cube(launch)]
+fn field_backward_native_kernel(
+    pre: &Tensor<f32>,
+    ds: &Tensor<f32>,
+    weights: &Tensor<f32>,
+    dh: &mut Tensor<f32>,
+    dw1: &mut Tensor<f32>,
+    points: &Tensor<f32>,
+    metadata: &Tensor<f32>,
+    table_grad: &Tensor<Atomic<f32>>,
+    active: u32,
+) {
+    let unit = usize::cast_from(UNIT_POS);
+    let mut shared_weights = Shared::new_slice(2113usize);
+    for tile in 0..9usize {
+        let index = unit + tile * 256;
+        if index < 2113 {
+            shared_weights[index] = weights[index];
+        }
+    }
+    sync_cube();
+    let lane = unit % 64;
+    let slot = unit / 64;
+    let point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + slot;
+    let mut shared = Shared::new_slice(256usize);
+    let mut v = 0.0_f32;
+    if point < pre.shape(0) {
+        let h = pre[point * 64 + lane];
+        let scaled = h * 100.0_f32;
+        let derivative = if scaled > 20.0_f32 {
+            1.0_f32
+        } else {
+            1.0_f32 / (1.0_f32 + f32::exp(-scaled))
+        };
+        v = ds[point] * shared_weights[2048 + lane] * derivative;
+        dh[point * 64 + lane] = v;
+        let soft = f32::ln(1.0_f32 + f32::exp(f32::min(scaled, 20.0_f32))) / 100.0_f32;
+        let hidden = if scaled > 20.0_f32 { h } else { soft };
+        dw1[point * 64 + lane] = ds[point] * hidden;
+    }
+    shared[unit] = v;
+    sync_cube();
+    if point < pre.shape(0) && lane < usize::cast_from(active) {
+        let level = lane;
+        let col = 3 + level * 2;
+        let mut g0 = 0.0_f32;
+        let mut g1 = 0.0_f32;
+        for j in 0..64usize {
+            let h = shared[slot * 64 + j];
+            g0 += h * shared_weights[col * 64 + j];
+            g1 += h * shared_weights[(col + 1) * 64 + j];
+        }
+        if g0 != 0.0_f32 || g1 != 0.0_f32 {
+            let norm0 = f32::clamp(
+                (points[point * 3] + 1.0_f32) * 0.5_f32,
+                0.0_f32,
+                1.0_f32 - 1e-7_f32,
+            );
+            let norm1 = f32::clamp(
+                (points[point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                0.0_f32,
+                1.0_f32 - 1e-7_f32,
+            );
+            let norm2 = f32::clamp(
+                (points[point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                0.0_f32,
+                1.0_f32 - 1e-7_f32,
+            );
+            let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+            let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+            let c0 = norm0 * f32::cast_from(res);
+            let c1 = norm1 * f32::cast_from(res);
+            let c2 = norm2 * f32::cast_from(res);
+            let b0 = f32::floor(c0);
+            let b1 = f32::floor(c1);
+            let b2 = f32::floor(c2);
+            let w0 = c0 - b0;
+            let w1 = c1 - b1;
+            let w2 = c2 - b2;
+            let base0 = u32::cast_from(b0);
+            let base1 = u32::cast_from(b1);
+            let base2 = u32::cast_from(b2);
+            let r1 = res + 1;
+            let dense = r1 * r1 * r1 <= 524288;
+
+            for corner in 0..8u32 {
+                let bit0 = corner & 1;
+                let bit1 = (corner >> 1) & 1;
+                let bit2 = (corner >> 2) & 1;
+                let v0 = base0 + bit0;
+                let v1 = base1 + bit1;
+                let v2 = base2 + bit2;
+                let kw0 = if bit0 == 0 { 1.0_f32 - w0 } else { w0 };
+                let kw1 = if bit1 == 0 { 1.0_f32 - w1 } else { w1 };
+                let kw2 = if bit2 == 0 { 1.0_f32 - w2 } else { w2 };
+                let weight = kw0 * kw1 * kw2;
+                let idx = if dense {
+                    v0 + v1 * r1 + v2 * r1 * r1
+                } else {
+                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                };
+                let entry = usize::cast_from(offset + idx) * 2;
+                let wg0 = weight * g0;
+                let wg1 = weight * g1;
+                if wg0 != 0.0_f32 {
+                    table_grad[entry].fetch_add(wg0);
+                }
+                if wg1 != 0.0_f32 {
+                    table_grad[entry + 1].fetch_add(wg1);
+                }
+            }
+        }
+    }
 }

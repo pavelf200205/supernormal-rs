@@ -37,6 +37,7 @@ pub struct Field {
     pub level_u32_updates: Vec<usize>,
     pub variance_host: f32,
     pub fused_field: bool,
+    pub cpu_visibility: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
 }
@@ -286,6 +287,7 @@ impl Field {
             level_u32_updates,
             variance_host: 0.5,
             fused_field: true,
+            cpu_visibility: false,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         }
@@ -361,6 +363,7 @@ impl Field {
             level_u32_updates,
             variance_host,
             fused_field: true,
+            cpu_visibility: false,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         })
@@ -474,6 +477,38 @@ impl Field {
 
     /// Read variance in the same transfer as visibility SDFs. This is the first
     /// CPU consumer of the previous Adam update, after ray/point preparation.
+    pub fn visibility_counts(
+        &mut self,
+        points: &[[f32; 3]],
+        chunk: usize,
+        pairs: Vec<f32>,
+        ranges: Vec<f32>,
+    ) -> Result<Vec<usize>> {
+        let outputs = self
+            .enqueue_evaluation(points, chunk)
+            .into_iter()
+            .map(|(n, y)| {
+                if y.dims()[0] == n {
+                    y
+                } else {
+                    y.slice([0..n, 0..1])
+                }
+            })
+            .collect();
+        let rays = ranges.len() / 2;
+        let samples = pairs.len() / 2;
+        let result = crate::kernels::visibility([
+            Tensor::cat(outputs, 0),
+            tensor(pairs, [samples, 2], &self.device),
+            tensor(ranges, [rays, 2], &self.device),
+            self.p("variance").without_autodiff(),
+            Tensor::zeros([rays + 1, 1], &self.device),
+        ]);
+        let mut values = result.try_into_vec_as::<f32>()?;
+        self.variance_host = values.pop().expect("visibility variance");
+        Ok(values.into_iter().map(|v| v as usize).collect())
+    }
+
     pub fn evaluate_visibility(&mut self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
         let mut pending = self.enqueue_evaluation(points, chunk);
         pending.push((1, self.p("variance").without_autodiff()));
