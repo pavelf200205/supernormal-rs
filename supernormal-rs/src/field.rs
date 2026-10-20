@@ -36,6 +36,8 @@ pub struct Field {
     pub level_offsets: Vec<usize>,
     pub level_u32_updates: Vec<usize>,
     pub variance_host: f32,
+    pub fused_field: bool,
+    packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
 }
 
@@ -107,6 +109,18 @@ pub struct FeatureChunk {
     pub pts_tensor: Tensor<2>,
     pub point_count: usize,
     pub padded_count: usize,
+}
+
+/// Submitted forward work whose small SDF output has not yet been mapped.
+pub struct PendingEvaluation {
+    outputs: Vec<(usize, Tensor<2>)>,
+    cache: Vec<FeatureChunk>,
+}
+
+impl PendingEvaluation {
+    pub fn finish(self) -> Result<(Vec<f32>, Vec<FeatureChunk>)> {
+        Ok((Field::read_outputs(self.outputs)?, self.cache))
+    }
 }
 
 impl Field {
@@ -256,6 +270,8 @@ impl Field {
             level_offsets,
             level_u32_updates,
             variance_host: 0.5,
+            fused_field: true,
+            packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         }
     }
@@ -329,6 +345,8 @@ impl Field {
             level_offsets,
             level_u32_updates,
             variance_host,
+            fused_field: true,
+            packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         })
     }
@@ -422,8 +440,13 @@ impl Field {
             flat.resize(padded_n * 3, 0.0);
 
             let xyz = tensor(flat, [padded_n, 3], &self.device);
-            let features = self.compute_features_gpu(xyz);
-            let y = self.mlp_forward(features, false);
+            let y = if self.fused_field {
+                let [y, _, _] = self.fused_forward(xyz, false);
+                y
+            } else {
+                let features = self.compute_features_gpu(xyz);
+                self.mlp_forward(features, false)
+            };
             pending.push((n, y));
         }
 
@@ -620,6 +643,30 @@ impl Field {
         points: &[[f32; 3]],
         chunk: usize,
     ) -> Result<(Vec<f32>, Vec<FeatureChunk>)> {
+        self.enqueue_cached(points, chunk).finish()
+    }
+
+    fn fused_forward(&self, xyz: Tensor<2>, cache: bool) -> [Tensor<2>; 3] {
+        if self.packed_mlp.borrow().is_none() {
+            let weights = Tensor::cat(
+                vec![
+                    self.effective_weight(0, false)
+                        .transpose()
+                        .reshape([1, 1984]),
+                    self.p("lin0.bias").without_autodiff().reshape([1, 64]),
+                    self.effective_weight(1, false).reshape([1, 64]),
+                    self.p("lin1.bias").without_autodiff().reshape([1, 1]),
+                ],
+                1,
+            );
+            *self.packed_mlp.borrow_mut() = Some(weights);
+        }
+        let weights = self.packed_mlp.borrow().as_ref().unwrap().clone();
+        let (tables, metadata) = self.packed_tables();
+        crate::kernels::fused_field([xyz, tables, metadata, weights], self.active.min(14), cache)
+    }
+
+    pub fn enqueue_cached(&self, points: &[[f32; 3]], chunk: usize) -> PendingEvaluation {
         let num_chunks = points.len().div_ceil(chunk);
         let mut chunks = Vec::with_capacity(num_chunks);
         let mut pending_outputs = Vec::with_capacity(num_chunks);
@@ -635,10 +682,14 @@ impl Field {
             flat.resize(padded_n * 3, 0.0);
 
             let pts_tensor = tensor(flat, [padded_n, 3], &self.device);
-            let feat = self.compute_features_gpu(pts_tensor.clone());
-            let preactivation = feat.clone().matmul(w0_t.clone()) + b0.clone();
-            let hidden = Self::softplus(preactivation.clone());
-            let y = self.mlp_output(hidden, false);
+            let [y, feat, preactivation] = if self.fused_field {
+                self.fused_forward(pts_tensor.clone(), true)
+            } else {
+                let feat = self.compute_features_gpu(pts_tensor.clone());
+                let preactivation = feat.clone().matmul(w0_t.clone()) + b0.clone();
+                let hidden = Self::softplus(preactivation.clone());
+                [self.mlp_output(hidden, false), feat, preactivation]
+            };
 
             pending_outputs.push((n, y));
             chunks.push(FeatureChunk {
@@ -650,7 +701,10 @@ impl Field {
             });
         }
 
-        Ok((Self::read_outputs(pending_outputs)?, chunks))
+        PendingEvaluation {
+            outputs: pending_outputs,
+            cache: chunks,
+        }
     }
 
     #[inline]
@@ -790,6 +844,7 @@ impl Field {
 
     pub fn apply_gradients_packed(&mut self, mut gradients: Gradients, lr: f64) {
         self.inference_weights.get_mut().take();
+        self.packed_mlp.get_mut().take();
 
         if let Some(packed_grad) = gradients.params.remove("encoding.packed") {
             let active = self.active.min(14);
@@ -840,6 +895,7 @@ impl Field {
 
     pub fn apply_gradients(&mut self, gradients: BTreeMap<String, Tensor<2>>, lr: f64) {
         self.inference_weights.get_mut().take();
+        self.packed_mlp.get_mut().take();
         for (name, grad) in gradients {
             let p = self.params.get_mut(&name).unwrap();
             p.updates += 1;

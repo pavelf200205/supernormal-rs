@@ -26,6 +26,14 @@ pub struct TrainArgs {
     pub batch: usize,
     #[arg(long, default_value_t = 2048)]
     pub microbatch: usize,
+    /// Patches per overlapped forward/compositor group; 0 disables lookahead.
+    #[arg(long, default_value_t = 0)]
+    #[serde(default = "default_pipeline_patches")]
+    pub pipeline_patches: usize,
+    /// Use the separate hash encoder and Burn matmuls for comparison.
+    #[arg(long)]
+    #[serde(default)]
+    pub unfused_field: bool,
     #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
@@ -49,6 +57,52 @@ pub struct TrainArgs {
 
 fn default_log_every() -> usize {
     10
+}
+
+fn default_pipeline_patches() -> usize {
+    0
+}
+
+struct PreparedBatch {
+    start: usize,
+    end: usize,
+    samples: Vec<render::Sample>,
+    points: Vec<[f32; 3]>,
+    indices: Vec<usize>,
+    unique_count: usize,
+    pending: crate::field::PendingEvaluation,
+}
+
+fn prepare_batch(
+    field: &Field,
+    patches: &[crate::data::Patch],
+    samples: &[render::Sample],
+    start: usize,
+    size: usize,
+    query: usize,
+) -> PreparedBatch {
+    let end = (start + size).min(patches.len());
+    let first = samples.partition_point(|s| s.patch < start);
+    let last = samples.partition_point(|s| s.patch < end);
+    let samples: Vec<_> = samples[first..last]
+        .iter()
+        .map(|s| render::Sample {
+            patch: s.patch - start,
+            start: s.start,
+            end: s.end,
+        })
+        .collect();
+    let (points, unique, indices) = render::sample_and_dedup_points(&patches[start..end], &samples);
+    let pending = field.enqueue_cached(&unique, query);
+    PreparedBatch {
+        start,
+        end,
+        samples,
+        points,
+        indices,
+        unique_count: unique.len(),
+        pending,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +139,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     } else {
         Field::new(device, args.seed)
     };
+    field.fused_field = !args.unfused_field;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
     let mut restored_state = false;
@@ -176,34 +231,40 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let mut t_comp = 0.0;
         let mut t_bwd = 0.0;
 
-        for start in (0..patches.len()).step_by(args.microbatch) {
-            let end = (start + args.microbatch).min(patches.len());
-            let local_storage: Vec<render::Sample>;
-            let local: &[render::Sample] = if start == 0 && end == patches.len() {
-                &samples
-            } else {
-                // Marching and visibility preserve patch order. Avoid rescanning
-                // the entire sample array for every smaller microbatch.
-                let first = samples.partition_point(|s| s.patch < start);
-                let last = samples.partition_point(|s| s.patch < end);
-                local_storage = samples[first..last]
-                    .iter()
-                    .map(|s| render::Sample {
-                        patch: s.patch - start,
-                        start: s.start,
-                        end: s.end,
-                    })
-                    .collect();
-                &local_storage
-            };
+        let group_size = if args.pipeline_patches == 0 {
+            args.microbatch
+        } else {
+            args.microbatch.min(args.pipeline_patches)
+        };
+        let t0 = std::time::Instant::now();
+        let mut prepared = Some(prepare_batch(
+            &field, &patches, &samples, 0, group_size, args.query,
+        ));
+        t_points += t0.elapsed().as_secs_f64();
+        while let Some(batch) = prepared.take() {
+            let PreparedBatch {
+                start,
+                end,
+                samples: local,
+                points,
+                indices,
+                unique_count,
+                pending,
+            } = batch;
             let pp = &patches[start..end];
-
             let t0 = std::time::Instant::now();
-            let (points, unique, indices) = render::sample_and_dedup_points(pp, local);
-            t_points += t0.elapsed().as_secs_f64();
-
-            let t0 = std::time::Instant::now();
-            let (unique_sdf, cache) = field.evaluate_and_cache(&unique, args.query)?;
+            let (unique_sdf, cache) = pending.finish()?;
+            // Submit the next forward before CPU compositing. Only two groups'
+            // activations are live, and all groups use the same model weights.
+            if end < patches.len() && args.pipeline_patches > 0 {
+                prepared = Some(prepare_batch(
+                    &field, &patches, &samples, end, group_size, args.query,
+                ));
+                field
+                    .device
+                    .flush()
+                    .map_err(|e| anyhow::anyhow!("forward submission failed: {e:?}"))?;
+            }
             let sdf: Vec<f32> = indices
                 .iter()
                 .map(|&i| unsafe { *unique_sdf.get_unchecked(i) })
@@ -212,7 +273,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
 
             let t1 = std::time::Instant::now();
             let result = render::composite(
-                pp, local, &points, &sdf, variance, normal_den, pixel_den, sample_den,
+                pp, &local, &points, &sdf, variance, normal_den, pixel_den, sample_den,
             );
             t_comp += t1.elapsed().as_secs_f64();
 
@@ -222,7 +283,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             variance_grad += result.variance_grad;
             sdf_bias_grad += f64::from(result.sdf_bias_grad);
 
-            let mut adjoints = vec![0f32; unique.len()];
+            let mut adjoints = vec![0f32; unique_count];
             for (&i, &g) in indices.iter().zip(&result.sdf_grad) {
                 unsafe {
                     *adjoints.get_unchecked_mut(i) += g;
@@ -237,6 +298,11 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("profiling sync failed: {e:?}"))?;
             }
             t_bwd += t2.elapsed().as_secs_f64();
+            if end < patches.len() && prepared.is_none() {
+                prepared = Some(prepare_batch(
+                    &field, &patches, &samples, end, group_size, args.query,
+                ));
+            }
         }
 
         gradients.insert(

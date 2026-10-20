@@ -48,7 +48,42 @@ Mesh export uses normalized coordinates by default. Add `--data` to apply the da
 
 `--save-freq` controls checkpoints; `--mesh-freq` and `--mesh-resolution` enable periodic meshes. Normal-image validation is currently omitted, including the broken Python validation path.
 
+## Fused field forward
+
+The default training path now uses a cooperative CubeCL hash-grid + MLP forward
+kernel for occupancy, visibility SDF queries, and cached training evaluation.
+Four points share a 256-thread workgroup: hash levels evaluate in parallel,
+features stay in shared memory, and 64 lanes evaluate the hidden neurons before
+a tree reduction produces the SDF. Inactive hash features are skipped in the
+first layer. Packed input-major MLP weights are cached until the optimizer updates
+them; the kernel uses seven storage buffers and 1.5 KiB of workgroup scratch.
+Training writes the same features and preactivations required by the existing
+analytical backward; inference does not write those large caches. The backward
+and CPU compositor are unchanged. This is FP32, without CUDA or subgroup-size
+requirements, and is not a tensor-core implementation of tiny-cuda-nn.
+
+Use `--unfused-field` to compare with the previous encoder + Burn matmul path.
+No build or runtime validation has been performed for this kernel. Floating-point
+summation order differs, and speedup is not established. Use a fresh output
+folder for each comparison; no checkpoint format or training schedule changed.
+
 ## Reproduce comparisons
+
+Training now overlaps the next group's field forward pass with the current
+group's CPU loss/compositor. Lookahead is disabled by default (`--pipeline-patches 0`) following a measured
+regression. When enabled, the group size is capped by `--microbatch`. This is lookahead within one optimizer batch,
+not stale-weight or asynchronous optimization: all groups use the same weights,
+global loss denominators, and one Adam update. Only one future group is prepared
+at a time. Smaller groups reduce activation size but add dispatches/readbacks;
+256, 512, and 1024 are useful comparison points. `--pipeline-patches 0` restores
+sequential scheduling with the requested microbatch size.
+
+This source change has not been compiled or benchmarked. Grouping changes
+floating-point reduction order. Compare throughput and losses from the same
+checkpoint in fresh output directories. Stage timings overlap and cannot be
+interpreted as separate GPU kernel timings; evaluation timing also includes
+lookahead preparation/submission. Low board power alone is not proof of CPU
+starvation: memory-bound kernels can also consume relatively little power.
 
 The local `experiments/` directory contains exported fixtures. These are development artifacts, not required for normal use.
 
