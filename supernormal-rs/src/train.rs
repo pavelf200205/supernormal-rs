@@ -34,6 +34,10 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub unfused_field: bool,
+    /// Retain the CPU compositor for numerical/performance comparison.
+    #[arg(long)]
+    #[serde(default)]
+    pub cpu_composite: bool,
     #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
@@ -224,6 +228,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let mut gradients = crate::field::Gradients::default();
         let mut total = Loss::default();
         let variance: f32 = field.variance_host;
+        let mut device_stats: Option<burn::tensor::Tensor<2>> = None;
         let mut variance_grad = 0f32;
         let mut sdf_bias_grad = 0f64;
         let mut t_eval = 0.0;
@@ -253,6 +258,34 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             } = batch;
             let pp = &patches[start..end];
             let t0 = std::time::Instant::now();
+            if !args.cpu_composite && unique_count > 0 {
+                let (sdf, cache) = pending.into_device();
+                t_eval += t0.elapsed().as_secs_f64();
+                let t1 = std::time::Instant::now();
+                let (adjoints, stats) = render::composite_device(
+                    pp, &local, &points, &indices, sdf, variance, normal_den, pixel_den, sample_den,
+                );
+                device_stats = Some(match device_stats {
+                    Some(old) => old + stats,
+                    None => stats,
+                });
+                t_comp += t1.elapsed().as_secs_f64();
+                let t2 = std::time::Instant::now();
+                field.accumulate_gradients_device(cache, adjoints, &mut gradients);
+                if args.profile_stages {
+                    field
+                        .device
+                        .sync()
+                        .map_err(|e| anyhow::anyhow!("profiling sync failed: {e:?}"))?;
+                }
+                t_bwd += t2.elapsed().as_secs_f64();
+                if end < patches.len() {
+                    prepared = Some(prepare_batch(
+                        &field, &patches, &samples, end, group_size, args.query,
+                    ));
+                }
+                continue;
+            }
             let (unique_sdf, cache) = pending.finish()?;
             // Submit the next forward before CPU compositing. Only two groups'
             // activations are live, and all groups use the same model weights.
@@ -305,6 +338,16 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             }
         }
 
+        if let Some(stats) = device_stats {
+            // Only five scalars cross back, after compositor + backward have been
+            // queued. SDFs and per-point derivatives never leave the GPU.
+            let values = stats.try_into_vec_as::<f32>()?;
+            total.normal += values[0] as f64;
+            total.mask += values[1] as f64;
+            total.eikonal += values[2] as f64;
+            variance_grad += values[3];
+            sdf_bias_grad += values[4] as f64;
+        }
         gradients.insert(
             "variance".into(),
             tensor(vec![variance_grad], [1, 1], &field.device),

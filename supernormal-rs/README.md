@@ -58,8 +58,7 @@ a tree reduction produces the SDF. Inactive hash features are skipped in the
 first layer. Packed input-major MLP weights are cached until the optimizer updates
 them; the kernel uses seven storage buffers and 1.5 KiB of workgroup scratch.
 Training writes the same features and preactivations required by the existing
-analytical backward; inference does not write those large caches. The backward
-and CPU compositor are unchanged. This is FP32, without CUDA or subgroup-size
+analytical backward; inference does not write those large caches. The GPU compositor and fused backward described below are now the training defaults. This is FP32, without CUDA or subgroup-size
 requirements, and is not a tensor-core implementation of tiny-cuda-nn.
 
 Use `--unfused-field` to compare with the previous encoder + Burn matmul path.
@@ -98,3 +97,29 @@ The local `experiments/` directory contains exported fixtures. These are develop
 Current scope is the supplied DFD/L2, 14-level hash-grid configuration. Arbitrary HOCON settings, FD/AD training, preprocessing and original tiny-cuda-nn checkpoint layouts are not supported. An imported Python checkpoint proving inference parity does not by itself prove native training convergence or a speedup. See `VALIDATION.md` for measured results and outstanding validation.
 
 The original reconstruction implementation is MIT licensed; see `LICENSE`. The marching-cubes table comes from scikit-image; see `THIRD_PARTY_NOTICES.md`.
+
+
+## GPU compositor and fused backward (unvalidated)
+
+Training now keeps field SDFs and unique-point adjoints on the GPU. One invocation
+owns a patch and performs ordered volume compositing, normal/mask/eikonal losses,
+reverse transmittance differentiation, and accumulation into that patch's unique
+SDF entries. Patch-local ownership avoids float atomics in this stage. It relies
+on `sample_and_dedup_points`, which never shares indices between patches. Geometry
+preparation, marching and visibility filtering still involve the CPU. Five loss
+and scalar-gradient totals are read back per optimizer batch; large SDF/adjoint
+arrays no longer cross the CPU boundary in the default training path.
+
+The fused backward computes softplus derivatives, output-weight gradient
+contributions, feature gradients and hash-table atomic accumulation in one
+workgroup kernel. It removes the intermediate feature-gradient buffer and
+separate hash-backward launch. First-layer weight-gradient matmul, parameter
+reductions, weight-normalization derivatives and Adam remain separate operations.
+This is not a fully fused optimizer or a complete nerfacc replacement.
+
+Use `--cpu-composite` for the previous CPU loss implementation and
+`--unfused-field` for separate field forward/backward operations. Combine both
+flags to compare with the earlier implementation. No builds, numerical checks,
+or speed measurements were run for these changes. GPU loss accumulation uses
+FP32 rather than the CPU's mixed FP32/FP64 accumulation, and derivative summation
+order differs. Check short resumed runs and loss/mesh parity before a long run.

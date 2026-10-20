@@ -118,6 +118,21 @@ pub struct PendingEvaluation {
 }
 
 impl PendingEvaluation {
+    pub fn into_device(self) -> (Tensor<2>, Vec<FeatureChunk>) {
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(|(n, y)| {
+                if y.dims()[0] == n {
+                    y
+                } else {
+                    y.slice([0..n, 0..1])
+                }
+            })
+            .collect();
+        (Tensor::cat(outputs, 0), self.cache)
+    }
+
     pub fn finish(self) -> Result<(Vec<f32>, Vec<FeatureChunk>)> {
         Ok((Field::read_outputs(self.outputs)?, self.cache))
     }
@@ -729,6 +744,19 @@ impl Field {
         adjoints: &[f32],
         accumulated: &mut Gradients,
     ) {
+        if cached.is_empty() {
+            return;
+        }
+        let adjoints = tensor(adjoints.to_vec(), [adjoints.len(), 1], &self.device);
+        self.accumulate_gradients_device(cached, adjoints, accumulated);
+    }
+
+    pub fn accumulate_gradients_device(
+        &self,
+        cached: Vec<FeatureChunk>,
+        adjoints: Tensor<2>,
+        accumulated: &mut Gradients,
+    ) {
         let active_levels = self.active.min(14);
         let (_, metadata) = self.packed_tables();
         if !accumulated.params.contains_key("encoding.packed") {
@@ -751,28 +779,47 @@ impl Field {
         for chunk in cached {
             let n = chunk.point_count;
             let padded_n = chunk.padded_count;
-            let ds = &adjoints[offset..offset + n];
+            let mut ds_tensor = adjoints.clone().slice([offset..offset + n, 0..1]);
             offset += n;
-
-            // Skip chunk completely if all adjoints in this chunk are zero
-            if ds.iter().all(|&x| x == 0.0) {
-                continue;
+            if padded_n != n {
+                ds_tensor = Tensor::cat(
+                    vec![ds_tensor, Tensor::zeros([padded_n - n, 1], &self.device)],
+                    0,
+                );
             }
-
-            let mut ds_padded = Vec::with_capacity(padded_n);
-            ds_padded.extend_from_slice(ds);
-            ds_padded.resize(padded_n, 0.0);
-
-            let ds_tensor = tensor(ds_padded, [padded_n, 1], &self.device);
-            let hidden = Self::softplus(chunk.preactivation.clone());
-            let dw1_chunk = ds_tensor.clone().transpose().matmul(hidden);
-
-            let scaled = chunk.preactivation * 100.;
-            let sigmoid = ((-scaled.clone()).exp() + 1.).recip();
-            let derivative = sigmoid.mask_fill(scaled.greater_elem(20.), 1.);
-            let dh = ds_tensor.clone() * w1.clone() * derivative;
+            let (dh, d_feat_tensor, dw1_chunk) = if self.fused_field {
+                let weights = self
+                    .packed_mlp
+                    .borrow()
+                    .as_ref()
+                    .expect("cached forward packs weights")
+                    .clone();
+                let table_grad = accumulated.params.remove("encoding.packed").unwrap();
+                let [updated, dh, dw1] = crate::kernels::field_backward(
+                    [
+                        chunk.preactivation,
+                        ds_tensor.clone(),
+                        weights,
+                        chunk.pts_tensor.clone(),
+                        metadata.clone(),
+                        table_grad,
+                    ],
+                    active_levels,
+                );
+                accumulated.params.insert("encoding.packed".into(), updated);
+                (dh, None, dw1.sum_dim(0))
+            } else {
+                let hidden = Self::softplus(chunk.preactivation.clone());
+                let dw1 = ds_tensor.clone().transpose().matmul(hidden);
+                let scaled = chunk.preactivation * 100.;
+                let derivative = ((-scaled.clone()).exp() + 1.)
+                    .recip()
+                    .mask_fill(scaled.greater_elem(20.), 1.);
+                let dh = ds_tensor.clone() * w1.clone() * derivative;
+                let df = dh.clone().matmul(w0.clone());
+                (dh, Some(df), dw1)
+            };
             let dw0_chunk = dh.clone().transpose().matmul(chunk.feat);
-            let d_feat_tensor = dh.clone().matmul(w0.clone());
 
             let db0_chunk = dh.sum_dim(0);
             let db1_chunk = ds_tensor.sum_dim(0);
@@ -794,7 +841,7 @@ impl Field {
                 None => db1_chunk,
             });
 
-            if active_levels > 0 {
+            if let Some(d_feat_tensor) = d_feat_tensor.filter(|_| active_levels > 0) {
                 let table_grad = accumulated.params.remove("encoding.packed").unwrap();
                 let updated = crate::kernels::backward_packed(
                     chunk.pts_tensor,

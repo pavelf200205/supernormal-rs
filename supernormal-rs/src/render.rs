@@ -1114,3 +1114,98 @@ pub fn verify(path: &std::path::Path, data: Option<&std::path::Path>) -> Result<
     println!("Packed renderer, gradients and finite differences passed.");
     Ok(())
 }
+
+/// Geometry stays on the CPU for now; SDFs and their adjoints stay on device.
+/// `indices` must come from sample_and_dedup_points (no sharing across patches).
+pub fn composite_device(
+    patches: &[Patch],
+    samples: &[Sample],
+    points: &[[f32; 3]],
+    indices: &[usize],
+    sdf: burn::tensor::Tensor<2>,
+    variance: f32,
+    normal_den: f32,
+    pixel_den: f32,
+    sample_den: f32,
+) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
+    use crate::field::tensor;
+    use burn::tensor::Tensor;
+    let device = sdf.device();
+    let n = sdf.dims()[0];
+    assert!(
+        n < (1 << 24),
+        "compositor index exceeds exact f32 integer range"
+    );
+    let mut geometry = Vec::with_capacity(samples.len() * 27);
+    for (s, sample) in samples.iter().enumerate() {
+        let p = &patches[sample.patch];
+        let base = s * 18;
+        for i in 0..9 {
+            let col = i % 3;
+            let row = i / 3;
+            let l = if col == 0 { i } else { i - 1 };
+            let r = if col == 2 { i } else { i + 1 };
+            let u = if row == 0 { i } else { i - 3 };
+            let d = if row == 2 { i } else { i + 3 };
+            let dx = if col == 1 {
+                distance(points[base + l], points[base + i])
+                    + distance(points[base + i], points[base + r])
+            } else {
+                distance(points[base + l], points[base + r])
+            };
+            let dy = if row == 1 {
+                distance(points[base + u], points[base + i])
+                    + distance(points[base + i], points[base + d])
+            } else {
+                distance(points[base + u], points[base + d])
+            };
+            let dt =
+                (sample.end - sample.start) * (dot(p.dirs[4], p.plane) / dot(p.dirs[i], p.plane));
+            geometry.extend([1. / dt, 1. / dx, 1. / dy]);
+        }
+    }
+    let mut packed = Vec::with_capacity(patches.len() * 123);
+    let mut cursor = 0;
+    let inv = (variance * 10.).exp().clamp(1e-6, 1e6);
+    for (pi, p) in patches.iter().enumerate() {
+        let begin = cursor;
+        while cursor < samples.len() && samples[cursor].patch == pi {
+            cursor += 1;
+        }
+        packed.extend([
+            begin as f32,
+            cursor as f32,
+            inv,
+            normal_den,
+            pixel_den,
+            sample_den,
+        ]);
+        for i in 0..9 {
+            packed.extend(p.inverse[i].iter().flatten().copied());
+            packed.extend(p.normals[i]);
+            packed.push(p.mask[i]);
+        }
+    }
+    assert_eq!(cursor, samples.len());
+    let count = samples.len().max(1);
+    geometry.resize(count * 27, 0.);
+    let mut mapping: Vec<f32> = indices.iter().map(|&i| i as f32).collect();
+    mapping.resize(count * 18, 0.);
+    let [adjoints, stats] = crate::kernels::composite_gpu([
+        sdf,
+        tensor(geometry, [count, 27], &device),
+        tensor(mapping, [count, 18], &device),
+        tensor(packed, [patches.len(), 123], &device),
+        Tensor::zeros([count, 45], &device),
+        Tensor::zeros([n, 1], &device),
+        Tensor::zeros([patches.len(), 5], &device),
+    ]);
+    let stats = stats.sum_dim(0);
+    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
+        10. * inv
+    } else {
+        0.
+    };
+    let stats = stats * tensor(vec![1., 1., 1., vscale, 1.], [1, 5], &device);
+    (adjoints, stats)
+}
