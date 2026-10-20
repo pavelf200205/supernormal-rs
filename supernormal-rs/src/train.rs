@@ -41,6 +41,14 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub profile_stages: bool,
+    /// Plain log/CSV flush interval; interactive progress refreshes at most 4 Hz.
+    #[arg(long, default_value_t = 10)]
+    #[serde(default = "default_log_every")]
+    pub log_every: usize,
+}
+
+fn default_log_every() -> usize {
+    10
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,6 +63,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         args.batch > 0
             && args.microbatch > 0
             && args.query > 0
+            && args.log_every > 0
             && args.end_iter > 500
             && args.occupancy_resolution >= 2,
         "invalid sizes"
@@ -117,6 +126,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         )?;
     }
 
+    let mut progress = crate::progress::TrainingProgress::new(final_step);
     let mut first = true;
     while field.step < final_step {
         let started = std::time::Instant::now();
@@ -142,7 +152,9 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let marched = render::march(&patches, &occ, step_size, &mut rng);
         let march_seconds = march_started.elapsed().as_secs_f64();
         let visible_started = std::time::Instant::now();
-        let samples = render::visible(&field, &patches, marched, args.query)?;
+        // Previous backward/Adam kernels run while we prepare patches and rays.
+        // Visibility reads its SDFs and the updated variance in one transfer.
+        let samples = render::visible(&mut field, &patches, marched, args.query)?;
         let visibility_seconds = visible_started.elapsed().as_secs_f64();
         if samples.is_empty() {
             anyhow::bail!(
@@ -170,9 +182,12 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             let local: &[render::Sample] = if start == 0 && end == patches.len() {
                 &samples
             } else {
-                local_storage = samples
+                // Marching and visibility preserve patch order. Avoid rescanning
+                // the entire sample array for every smaller microbatch.
+                let first = samples.partition_point(|s| s.patch < start);
+                let last = samples.partition_point(|s| s.patch < end);
+                local_storage = samples[first..last]
                     .iter()
-                    .filter(|s| s.patch >= start && s.patch < end)
                     .map(|s| render::Sample {
                         patch: s.patch - start,
                         start: s.start,
@@ -244,28 +259,32 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
 
         if field.step % 200 == 0 {
             field.trim_memory();
-        } else {
+        } else if args.profile_stages || field.step == final_step {
             field
                 .device
                 .sync()
                 .map_err(|e| anyhow::anyhow!("GPU synchronization failed: {e:?}"))?;
+        } else {
+            // Submit lazy work without waiting for the GPU to become idle.
+            // The next visibility/field readback is the required dependency.
+            field
+                .device
+                .flush()
+                .map_err(|e| anyhow::anyhow!("GPU submission failed: {e:?}"))?;
         }
         let t_adam = t_adam_start.elapsed().as_secs_f64();
 
         let secs = started.elapsed().as_secs_f64();
-        println!(
-            "step={} loss={:.7} normal={:.7} mask={:.7} eikonal={:.7} samples={} time={secs:.2}s",
-            field.step,
-            total.total(),
-            total.normal,
-            total.mask,
-            total.eikonal,
-            samples.len()
-        );
-        println!(
-            "  occupancy={occupancy_seconds:.2}s sampling={sampling_seconds:.2}s (march={march_seconds:.2}s visible={visibility_seconds:.2}s) points={t_points:.2}s eval={t_eval:.2}s composite={t_comp:.2}s bwd={t_bwd:.2}s adam={t_adam:.2}s",
-        );
-        if field.step == final_step || args.profile_stages {
+        let report =
+            args.profile_stages || field.step % args.log_every == 0 || field.step == final_step;
+        if args.profile_stages {
+            progress.clear();
+            println!(
+                "step={} occupancy={occupancy_seconds:.3}s sampling={sampling_seconds:.3}s (march={march_seconds:.3}s visible={visibility_seconds:.3}s) points={t_points:.3}s eval={t_eval:.3}s composite={t_comp:.3}s bwd={t_bwd:.3}s adam={t_adam:.3}s",
+                field.step,
+            );
+        }
+        if args.profile_stages {
             println!(
                 "Burn memory pool (not total driver/process usage): {:?}",
                 field.device.memory_pool_usage()
@@ -275,6 +294,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 field.peak_reserved_bytes.get()
             );
         }
+        progress.update(field.step, secs, total.total(), report);
         writeln!(
             metrics,
             "{},{},{},{},{},{},{},{}",
@@ -287,9 +307,14 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             secs,
             field.active
         )?;
-        metrics.flush()?;
+        if report {
+            metrics.flush()?;
+        }
         if args.save_freq > 0 && field.step % args.save_freq == 0 || field.step == final_step {
+            progress.clear();
+            metrics.flush()?;
             let dest = args.out.join(format!("checkpoint_{:06}", field.step));
+            eprintln!("Saving checkpoint {}", dest.display());
             let temp = args
                 .out
                 .join(format!("checkpoint_{:06}.partial", field.step));
@@ -307,6 +332,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             std::fs::rename(temp, dest)?;
         }
         if args.mesh_freq > 0 && field.step % args.mesh_freq == 0 {
+            progress.clear();
             crate::mesh::extract(
                 &field,
                 &args.out.join(format!("mesh_{:06}.ply", field.step)),

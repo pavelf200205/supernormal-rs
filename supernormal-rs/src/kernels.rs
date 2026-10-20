@@ -347,6 +347,119 @@ use burn_fusion::{
 
 type GpuBackend = Fusion<CubeBackend>;
 
+/// One pass over active embedding entries. Inactive levels and their Adam
+/// moments are left untouched; bias corrections are independent per level.
+#[cube(launch)]
+fn packed_adam_kernel(
+    value: &mut Tensor<f32>,
+    first: &mut Tensor<f32>,
+    second: &mut Tensor<f32>,
+    gradient: &Tensor<f32>,
+    corrections: &Tensor<f32>,
+) {
+    let index = ABSOLUTE_POS;
+    if index >= gradient.shape(0) * 2 {
+        terminate!();
+    }
+    let row = index / 2;
+    let mut level = 0usize;
+    // Keep the loop header independent of values assigned inside the loop.
+    // This also avoids short-circuit control flow in CubeCL's shader IR.
+    for candidate in 1..corrections.shape(0) {
+        if row >= usize::cast_from(corrections[(candidate - 1) * 3]) {
+            level = candidate;
+        }
+    }
+    let step_scale = corrections[level * 3 + 1];
+    let inv_bc2_sqrt = corrections[level * 3 + 2];
+    let g = gradient[index];
+    let m = first[index] * 0.9 + g * 0.1;
+    let v = second[index] * 0.999 + g * g * 0.001;
+    value[index] = value[index] - m * step_scale / (f32::sqrt(v) * inv_bc2_sqrt + 1e-8);
+    first[index] = m;
+    second[index] = v;
+}
+
+#[derive(Debug)]
+struct PackedAdamOp {
+    desc: CustomOpIr,
+}
+
+impl Operation<FusionCubeRuntime> for PackedAdamOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([v_ir, m_ir, s_ir, g_ir, c_ir], [ov_ir, om_ir, os_ir]) = self.desc.as_fixed();
+        let value = handles.get_float_tensor::<CubeBackend>(v_ir);
+        let first = handles.get_float_tensor::<CubeBackend>(m_ir);
+        let second = handles.get_float_tensor::<CubeBackend>(s_ir);
+        let gradient = handles.get_float_tensor::<CubeBackend>(g_ir);
+        let corrections = handles.get_float_tensor::<CubeBackend>(c_ir);
+        // Preserve outstanding views (for example checkpoint parameter views).
+        // Normal training transfers sole ownership and updates in place.
+        let value = if value.can_mut() { value } else { value.copy() };
+        let first = if first.can_mut() { first } else { first.copy() };
+        let second = if second.can_mut() {
+            second
+        } else {
+            second.copy()
+        };
+        let client = value.client.clone();
+        let n = gradient.meta.shape().dims::<2>()[0] * 2;
+        let cube_dim = CubeDim::new(&client, n);
+        let cube_count = cubecl::calculate_cube_count_elemwise(&client, n, cube_dim);
+        packed_adam_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            value.clone().into_tensor_arg(),
+            first.clone().into_tensor_arg(),
+            second.clone().into_tensor_arg(),
+            gradient.into_tensor_arg(),
+            corrections.into_tensor_arg(),
+        );
+        handles.register_float_tensor::<CubeBackend>(&ov_ir.id, value);
+        handles.register_float_tensor::<CubeBackend>(&om_ir.id, first);
+        handles.register_float_tensor::<CubeBackend>(&os_ir.id, second);
+        Ok(())
+    }
+}
+
+pub fn adam_packed(
+    value: burn::tensor::Tensor<2>,
+    first: burn::tensor::Tensor<2>,
+    second: burn::tensor::Tensor<2>,
+    gradient: burn::tensor::Tensor<2>,
+    corrections: burn::tensor::Tensor<2>,
+) -> [burn::tensor::Tensor<2>; 3] {
+    let [v, m, s, g, c] = [value, first, second, gradient, corrections]
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = v.client.clone();
+    let outputs = [&v, &m, &s]
+        .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype));
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_packed_adam",
+        &[
+            v.into_ir(),
+            m.into_ir(),
+            s.into_ir(),
+            g.into_ir(),
+            c.into_ir(),
+        ],
+        &outputs,
+        vec![],
+    );
+    let result: [_; 3] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            PackedAdamOp { desc },
+        )
+        .outputs();
+    result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
+}
+
 #[derive(Debug)]
 pub struct HashGridPackedForwardOp {
     pub desc: CustomOpIr,

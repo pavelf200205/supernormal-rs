@@ -7,6 +7,7 @@ mod field;
 mod kernels;
 mod mc_table;
 mod mesh;
+mod progress;
 mod render;
 mod train;
 

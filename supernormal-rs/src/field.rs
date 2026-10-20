@@ -161,8 +161,16 @@ impl Field {
                         .slice([start..end, 0..2])
                         .autodiff()
                         .require_grad();
-                    p.m = packed.m.clone().without_autodiff().slice([start..end, 0..2]);
-                    p.v = packed.v.clone().without_autodiff().slice([start..end, 0..2]);
+                    p.m = packed
+                        .m
+                        .clone()
+                        .without_autodiff()
+                        .slice([start..end, 0..2]);
+                    p.v = packed
+                        .v
+                        .clone()
+                        .without_autodiff()
+                        .slice([start..end, 0..2]);
                     p.updates = self.level_u32_updates[level];
                 }
             }
@@ -385,10 +393,26 @@ impl Field {
         n.next_power_of_two().max(1024).min(chunk)
     }
 
-    pub fn evaluate(&self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
-        if points.is_empty() {
-            return Ok(vec![]);
+    /// One mapping/readback for the entire query, rather than a host wait for
+    /// every chunk. Only the small SDF outputs are concatenated, not features.
+    fn read_outputs(outputs: Vec<(usize, Tensor<2>)>) -> Result<Vec<f32>> {
+        if outputs.is_empty() {
+            return Ok(Vec::new());
         }
+        let outputs = outputs
+            .into_iter()
+            .map(|(n, y)| {
+                if y.dims()[0] == n {
+                    y
+                } else {
+                    y.slice([0..n, 0..1])
+                }
+            })
+            .collect();
+        Ok(Tensor::cat(outputs, 0).try_into_vec_as::<f32>()?)
+    }
+
+    fn enqueue_evaluation(&self, points: &[[f32; 3]], chunk: usize) -> Vec<(usize, Tensor<2>)> {
         let mut pending = Vec::with_capacity(points.len().div_ceil(chunk));
         for pts in points.chunks(chunk) {
             let n = pts.len();
@@ -403,11 +427,20 @@ impl Field {
             pending.push((n, y));
         }
 
-        let mut values = Vec::with_capacity(points.len());
-        for (n, y) in pending {
-            let v = y.try_into_vec_as::<f32>()?;
-            values.extend_from_slice(&v[..n]);
-        }
+        pending
+    }
+
+    pub fn evaluate(&self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
+        Self::read_outputs(self.enqueue_evaluation(points, chunk))
+    }
+
+    /// Read variance in the same transfer as visibility SDFs. This is the first
+    /// CPU consumer of the previous Adam update, after ray/point preparation.
+    pub fn evaluate_visibility(&mut self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
+        let mut pending = self.enqueue_evaluation(points, chunk);
+        pending.push((1, self.p("variance").without_autodiff()));
+        let mut values = Self::read_outputs(pending)?;
+        self.variance_host = values.pop().expect("visibility query includes variance");
         Ok(values)
     }
 
@@ -617,24 +650,12 @@ impl Field {
             });
         }
 
-        let mut values = Vec::with_capacity(points.len());
-        for (n, y) in pending_outputs {
-            let v = y.try_into_vec_as::<f32>()?;
-            values.extend_from_slice(&v[..n]);
-        }
-
-        Ok((values, chunks))
+        Ok((Self::read_outputs(pending_outputs)?, chunks))
     }
 
     #[inline]
     pub fn inv_s_host(&self) -> f32 {
         (self.variance_host * 10.).exp().clamp(1e-6, 1e6)
-    }
-
-    pub fn inv_s(&self) -> Tensor<2> {
-        (self.p("variance").without_autodiff() * 10.)
-            .exp()
-            .clamp(1e-6, 1e6)
     }
 
     pub fn trim_memory(&self) {
@@ -772,86 +793,35 @@ impl Field {
 
         if let Some(packed_grad) = gradients.params.remove("encoding.packed") {
             let active = self.active.min(14);
-            let active_rows = self.level_offsets[active];
-            let total_rows = self.level_offsets[14];
-            let packed = self.packed_embedding.as_mut().unwrap();
-
-            let first_u = self.level_u32_updates[0] + 1;
-            let uniform_updates = (0..active).all(|l| self.level_u32_updates[l] + 1 == first_u);
-
-            let grad = packed_grad.without_autodiff();
-            let cur_val = packed
-                .value
-                .clone()
-                .without_autodiff()
-                .slice([0..active_rows, 0..2]);
-            let cur_m = packed
-                .m
-                .clone()
-                .without_autodiff()
-                .slice([0..active_rows, 0..2]);
-            let cur_v = packed
-                .v
-                .clone()
-                .without_autodiff()
-                .slice([0..active_rows, 0..2]);
-
-            // Fused elementwise update for m and v across all active rows at once
-            let new_m = (cur_m * 0.9 + grad.clone() * 0.1).without_autodiff();
-            let new_v = (cur_v * 0.999 + grad.clone() * grad * 0.001).without_autodiff();
-
-            let new_val = if uniform_updates {
-                for l in 0..active {
-                    self.level_u32_updates[l] = first_u;
+            if active > 0 {
+                // Upload O(levels) scalars, rather than two O(table entries)
+                // correction tensors and full-table slice/copy expressions.
+                let mut corrections = Vec::with_capacity(active * 3);
+                for level in 0..active {
+                    self.level_u32_updates[level] += 1;
+                    let updates = self.level_u32_updates[level] as i32;
+                    corrections.extend([
+                        self.level_offsets[level + 1] as f32,
+                        (lr / (1.0 - 0.9f64.powi(updates))) as f32,
+                        (1.0 / (1.0 - 0.999f64.powi(updates)).sqrt()) as f32,
+                    ]);
                 }
-                let bc1 = 1.0 - 0.9f64.powi(first_u as i32);
-                let bc2_sqrt = (1.0 - 0.999f64.powi(first_u as i32)).sqrt();
-                let step_size = lr / bc1;
-                (cur_val - new_m.clone() * step_size / (new_v.clone().sqrt() / bc2_sqrt + 1e-8))
-                    .without_autodiff()
-            } else {
-                // Build 1D column vectors [active_rows, 1] for step_size and inv_bc2_sqrt
-                // so the entire active table updates in ONE fused Burn expression without slicing cur_val/new_m/new_v!
-                let mut scale1_parts = Vec::with_capacity(active);
-                let mut scale2_parts = Vec::with_capacity(active);
-                for l in 0..active {
-                    self.level_u32_updates[l] += 1;
-                    let u = self.level_u32_updates[l] as i32;
-                    let rows = self.level_offsets[l + 1] - self.level_offsets[l];
-                    let step_scale = (lr / (1.0 - 0.9f64.powi(u))) as f32;
-                    let inv_bc2_sqrt = (1.0 / (1.0 - 0.999f64.powi(u)).sqrt()) as f32;
-                    scale1_parts.push(Tensor::<2>::full([rows, 1], step_scale, &self.device));
-                    scale2_parts.push(Tensor::<2>::full([rows, 1], inv_bc2_sqrt, &self.device));
-                }
-                let scale1 = Tensor::cat(scale1_parts, 0);
-                let scale2 = Tensor::cat(scale2_parts, 0);
-                (cur_val - (new_m.clone() * scale1) / (new_v.clone().sqrt() * scale2 + 1e-8))
-                    .without_autodiff()
-            };
-
-            if active_rows < total_rows {
-                packed.value = packed
-                    .value
-                    .clone()
-                    .without_autodiff()
-                    .slice_assign([0..active_rows, 0..2], new_val);
-                packed.m = packed
-                    .m
-                    .clone()
-                    .without_autodiff()
-                    .slice_assign([0..active_rows, 0..2], new_m);
-                packed.v = packed
-                    .v
-                    .clone()
-                    .without_autodiff()
-                    .slice_assign([0..active_rows, 0..2], new_v);
-            } else {
-                packed.value = new_val;
-                packed.m = new_m;
-                packed.v = new_v;
+                let packed = self.packed_embedding.take().unwrap();
+                let [value, m, v] = crate::kernels::adam_packed(
+                    packed.value,
+                    packed.m,
+                    packed.v,
+                    packed_grad.without_autodiff(),
+                    tensor(corrections, [active, 3], &self.device),
+                );
+                self.packed_embedding = Some(Parameter {
+                    value,
+                    m,
+                    v,
+                    updates: self.level_u32_updates[0],
+                });
             }
         }
-
         for (name, grad) in gradients.params {
             let p = self.params.get_mut(&name).unwrap();
             p.updates += 1;
@@ -862,9 +832,8 @@ impl Field {
             let v = p.v.clone() / (1. - 0.999f64.powi(p.updates as i32));
             let updated = (p.value.clone().without_autodiff() - m / (v.sqrt() + 1e-8) * lr)
                 .without_autodiff();
-            if name == "variance" {
-                self.variance_host = updated.clone().into_scalar();
-            }
+            // Visibility refreshes the variance mirror in its SDF readback.
+            // Do not insert a scalar readback/wait into the optimizer here.
             p.value = updated.autodiff().require_grad();
         }
     }

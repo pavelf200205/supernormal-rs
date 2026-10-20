@@ -28,6 +28,10 @@ Run from this directory. The original dataset layout is consumed directly; there
 
 The defaults preserve the reference's 2,048 patches, 3x3 patch size, 30,000-update schedule, learning-rate warmup, occupancy resolution 128 and progressive bandwidth. `--steps` limits additional updates without compressing that schedule. `--microbatch` and `--query` bound working memory while accumulating the complete batch gradient before one Adam update. Adjacent samples share exactly equal endpoints. Normal maps stay in host FP16 storage; GPU arithmetic uses FP32.
 
+Normal training submits backward/Adam work without an iteration-end GPU wait, overlapping it with the next iteration's CPU preparation. Visibility reads the updated variance together with its SDF values; no stale optimizer values are used. Query chunks share one SDF readback, and packed Adam updates active embedding entries in a single kernel with per-level bias correction. The experimental point/level hash layout was reverted following a runtime shader compiler dominance error; the previously working point-wise kernels are used again.
+
+Interactive terminals show one updating progress line with percentage, step count, smoothed training **it/s**, elapsed time, ETA, and loss, refreshed at most four times per second. Checkpoint/mesh messages appear above it. Redirected output uses plain progress lines every 10 steps (`--log-every` controls this interval and CSV flushing); CSV still records every update. Speed/ETA use a rolling training-time window and exclude checkpoint/mesh export time. Use `--profile-stages` for detailed synchronized diagnostics, which disables iteration overlap. Normal per-step timings can include GPU work submitted by the preceding step; compare throughput over multiple iterations. The shader workaround and progress display have not been compiled or tested.
+
 Resume into a fresh output directory:
 
 ```powershell

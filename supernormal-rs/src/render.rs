@@ -184,7 +184,7 @@ pub fn march(
 }
 
 pub fn visible(
-    field: &Field,
+    field: &mut Field,
     patches: &[Patch],
     samples: Vec<Sample>,
     query: usize,
@@ -215,7 +215,7 @@ pub fn visible(
         end_idx.push(idx);
     }
 
-    let sdf = field.evaluate(&unique_pts, query)?;
+    let sdf = field.evaluate_visibility(&unique_pts, query)?;
     let inv = field.inv_s_host();
     let mut trans = vec![1f32; patches.len()];
     let mut out = Vec::with_capacity(n);
@@ -230,20 +230,6 @@ pub fn visible(
     Ok(out)
 }
 
-pub fn sample_points(patches: &[Patch], samples: &[Sample]) -> Vec<[f32; 3]> {
-    let mut points = Vec::with_capacity(samples.len() * 18);
-    for s in samples {
-        let p = &patches[s.patch];
-        let center = dot(p.dirs[4], p.plane);
-        for t in [s.start, s.end] {
-            for d in p.dirs {
-                points.push(point(p.origin, d, t * center / dot(d, p.plane)));
-            }
-        }
-    }
-    points
-}
-
 pub fn sample_and_dedup_points(
     patches: &[Patch],
     samples: &[Sample],
@@ -252,11 +238,19 @@ pub fn sample_and_dedup_points(
     let mut points = Vec::with_capacity(n * 18);
     let mut unique = Vec::with_capacity(n * 10);
     let mut indices = Vec::with_capacity(n * 18);
+    // A patch's ray-plane projection is invariant across all of its samples.
+    // Keep the original arithmetic order, but do the nine divisions once.
+    let ratios: Vec<[f32; 9]> = patches
+        .iter()
+        .map(|p| {
+            let center = dot(p.dirs[4], p.plane);
+            std::array::from_fn(|i| center / dot(p.dirs[i], p.plane))
+        })
+        .collect();
 
     for (s, sample) in samples.iter().enumerate() {
         let p = &patches[sample.patch];
-        let center = dot(p.dirs[4], p.plane);
-        let ratios: [f32; 9] = std::array::from_fn(|i| center / dot(p.dirs[i], p.plane));
+        let ratios = &ratios[sample.patch];
 
         let reuse_start = s > 0
             && samples[s - 1].patch == sample.patch
