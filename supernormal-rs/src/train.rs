@@ -207,17 +207,6 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         serde_json::to_vec_pretty(&args)?,
     )?;
 
-    if args.mesh_freq > 0 && field.step == 0 {
-        crate::mesh::extract(
-            &field,
-            &args.out.join("mesh_000000.ply"),
-            args.mesh_resolution,
-            args.query,
-            dataset.scale,
-            dataset.offset,
-        )?;
-    }
-
     let mut progress = crate::progress::TrainingProgress::new(final_step);
     let mut first = true;
     while field.step < final_step {
