@@ -17,6 +17,11 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Uni-MS-PS reference checkout, converted weights, build outputs and fixtures
+/Uni-MS-PS-turbo/
+/unimsps-rs/
+unimsps-weights/*.safetensors
+
 # Large binary checkpoints and meshes
 *.pth
 *.bin
