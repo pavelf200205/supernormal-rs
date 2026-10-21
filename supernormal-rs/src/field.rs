@@ -735,21 +735,43 @@ impl Field {
     }
 
     pub fn enqueue_cached(&self, points: &[[f32; 3]], chunk: usize) -> PendingEvaluation {
-        let num_chunks = points.len().div_ceil(chunk);
-        let mut chunks = Vec::with_capacity(num_chunks);
-        let mut pending_outputs = Vec::with_capacity(num_chunks);
+        let inputs = points.chunks(chunk).map(|pts| {
+            let n = pts.len();
+            let padded = Self::static_bucket_size(n, chunk);
+            let mut flat: Vec<_> = pts.iter().flatten().copied().collect();
+            flat.resize(padded * 3, 0.);
+            (n, tensor(flat, [padded, 3], &self.device))
+        });
+        self.enqueue_cached_inputs(inputs)
+    }
 
+    /// Consume generated GPU coordinates without downloading/re-uploading them.
+    pub fn enqueue_cached_device(&self, points: Tensor<2>, chunk: usize) -> PendingEvaluation {
+        let count = points.dims()[0];
+        let inputs = (0..count).step_by(chunk).map(|start| {
+            let n = (count - start).min(chunk);
+            let padded = Self::static_bucket_size(n, chunk);
+            let pts = points.clone().slice([start..start + n, 0..3]);
+            let pts = if padded == n {
+                pts
+            } else {
+                Tensor::cat(vec![pts, Tensor::zeros([padded - n, 3], &self.device)], 0)
+            };
+            (n, pts)
+        });
+        self.enqueue_cached_inputs(inputs)
+    }
+
+    fn enqueue_cached_inputs(
+        &self,
+        inputs: impl Iterator<Item = (usize, Tensor<2>)>,
+    ) -> PendingEvaluation {
+        let mut chunks = Vec::new();
+        let mut pending_outputs = Vec::new();
         let w0_t = self.effective_weight(0, false).transpose();
         let b0 = self.p("lin0.bias").without_autodiff();
-
-        for pts in points.chunks(chunk) {
-            let n = pts.len();
-            let padded_n = Self::static_bucket_size(n, chunk);
-            let mut flat = Vec::with_capacity(padded_n * 3);
-            flat.extend(pts.iter().flatten().copied());
-            flat.resize(padded_n * 3, 0.0);
-
-            let pts_tensor = tensor(flat, [padded_n, 3], &self.device);
+        for (n, pts_tensor) in inputs {
+            let padded_n = pts_tensor.dims()[0];
             let [y, feat, preactivation] = if self.fused_field {
                 self.fused_forward(pts_tensor.clone(), true)
             } else {

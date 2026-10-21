@@ -1211,7 +1211,7 @@ pub fn verify(path: &std::path::Path, data: Option<&std::path::Path>) -> Result<
 pub fn composite_device(
     patches: &[Patch],
     samples: &[Sample],
-    points: &[[f32; 3]],
+    geometry: burn::tensor::Tensor<2>,
     indices: &[usize],
     sdf: burn::tensor::Tensor<2>,
     variance: f32,
@@ -1227,34 +1227,6 @@ pub fn composite_device(
         n < (1 << 24),
         "compositor index exceeds exact f32 integer range"
     );
-    let mut geometry = Vec::with_capacity(samples.len() * 27);
-    for (s, sample) in samples.iter().enumerate() {
-        let p = &patches[sample.patch];
-        let base = s * 18;
-        for i in 0..9 {
-            let col = i % 3;
-            let row = i / 3;
-            let l = if col == 0 { i } else { i - 1 };
-            let r = if col == 2 { i } else { i + 1 };
-            let u = if row == 0 { i } else { i - 3 };
-            let d = if row == 2 { i } else { i + 3 };
-            let dx = if col == 1 {
-                distance(points[base + l], points[base + i])
-                    + distance(points[base + i], points[base + r])
-            } else {
-                distance(points[base + l], points[base + r])
-            };
-            let dy = if row == 1 {
-                distance(points[base + u], points[base + i])
-                    + distance(points[base + i], points[base + d])
-            } else {
-                distance(points[base + u], points[base + d])
-            };
-            let dt =
-                (sample.end - sample.start) * (dot(p.dirs[4], p.plane) / dot(p.dirs[i], p.plane));
-            geometry.extend([1. / dt, 1. / dx, 1. / dy]);
-        }
-    }
     let mut packed = Vec::with_capacity(patches.len() * 123);
     let mut cursor = 0;
     let inv = (variance * 10.).exp().clamp(1e-6, 1e6);
@@ -1279,7 +1251,6 @@ pub fn composite_device(
     }
     assert_eq!(cursor, samples.len());
     let count = samples.len().max(1);
-    geometry.resize(count * 27, 0.);
     let mut mapping: Vec<f32> = indices.iter().map(|&i| i as f32).collect();
     mapping.resize(count * 18, 0.);
     assert!(
@@ -1298,7 +1269,7 @@ pub fn composite_device(
     }
     let [adjoints, stats] = crate::kernels::composite_gpu([
         sdf,
-        tensor(geometry, [count, 27], &device),
+        geometry,
         tensor(mapping, [count, 18], &device),
         tensor(packed, [patches.len(), 123], &device),
         Tensor::zeros([count, 90], &device),
@@ -1406,4 +1377,64 @@ pub fn march_device(
             end: s[2],
         })
         .collect())
+}
+
+/// Upload compact endpoint descriptors instead of 18 expanded XYZs and 27
+/// finite-difference coefficients per sample. Sharing matches the CPU path.
+pub fn prepare_geometry_device(
+    patches: &[Patch],
+    samples: &[Sample],
+    device: &burn::tensor::Device,
+) -> (burn::tensor::Tensor<2>, Vec<usize>, burn::tensor::Tensor<2>) {
+    use crate::field::tensor;
+    use burn::tensor::Tensor;
+    assert!(!samples.is_empty());
+    let mut rays = Vec::with_capacity(patches.len() * 39);
+    for p in patches {
+        rays.extend(p.origin);
+        rays.extend(p.dirs.iter().flatten().copied());
+        let center = dot(p.dirs[4], p.plane);
+        rays.extend(p.dirs.iter().map(|&d| center / dot(d, p.plane)));
+    }
+    let mut endpoints = Vec::with_capacity(samples.len() * 4);
+    let mut descriptors = Vec::with_capacity(samples.len() * 5);
+    let mut indices = Vec::with_capacity(samples.len() * 18);
+    let mut previous_end = 0usize;
+    for (i, sample) in samples.iter().enumerate() {
+        let reuse = i > 0
+            && samples[i - 1].patch == sample.patch
+            && samples[i - 1].end.to_bits() == sample.start.to_bits();
+        let start = if reuse {
+            previous_end
+        } else {
+            let id = endpoints.len() / 2;
+            endpoints.extend([sample.patch as f32, sample.start]);
+            id
+        };
+        let end = endpoints.len() / 2;
+        endpoints.extend([sample.patch as f32, sample.end]);
+        previous_end = end;
+        descriptors.extend([
+            sample.patch as f32,
+            sample.start,
+            sample.end,
+            start as f32,
+            end as f32,
+        ]);
+        indices.extend((0..9).map(|j| start * 9 + j));
+        indices.extend((0..9).map(|j| end * 9 + j));
+    }
+    let count = endpoints.len() / 2;
+    assert!(
+        count * 9 < (1 << 24) && samples.len() * 18 < (1 << 24),
+        "geometry index exceeds exact f32 range"
+    );
+    let [points, geometry] = crate::sampling_gpu::geometry([
+        tensor(rays, [patches.len(), 39], device),
+        tensor(endpoints, [count, 2], device),
+        tensor(descriptors, [samples.len(), 5], device),
+        Tensor::zeros([count * 9, 3], device),
+        Tensor::zeros([samples.len(), 27], device),
+    ]);
+    (points, indices, geometry)
 }

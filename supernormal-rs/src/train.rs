@@ -90,6 +90,7 @@ struct PreparedBatch {
     points: Vec<[f32; 3]>,
     indices: Vec<usize>,
     unique_count: usize,
+    geometry: Option<burn::tensor::Tensor<2>>,
     pending: crate::field::PendingEvaluation,
 }
 
@@ -100,6 +101,7 @@ fn prepare_batch(
     start: usize,
     size: usize,
     query: usize,
+    cpu_composite: bool,
 ) -> PreparedBatch {
     let end = (start + size).min(patches.len());
     let first = samples.partition_point(|s| s.patch < start);
@@ -112,15 +114,27 @@ fn prepare_batch(
             end: s.end,
         })
         .collect();
-    let (points, unique, indices) = render::sample_and_dedup_points(&patches[start..end], &samples);
-    let pending = field.enqueue_cached(&unique, query);
+    let (points, indices, unique_count, geometry, pending) = if cpu_composite || samples.is_empty()
+    {
+        let (points, unique, indices) =
+            render::sample_and_dedup_points(&patches[start..end], &samples);
+        let pending = field.enqueue_cached(&unique, query);
+        (points, indices, unique.len(), None, pending)
+    } else {
+        let (unique, indices, geometry) =
+            render::prepare_geometry_device(&patches[start..end], &samples, &field.device);
+        let count = unique.dims()[0];
+        let pending = field.enqueue_cached_device(unique, query);
+        (Vec::new(), indices, count, Some(geometry), pending)
+    };
     PreparedBatch {
         start,
         end,
         samples,
         points,
         indices,
-        unique_count: unique.len(),
+        unique_count,
+        geometry,
         pending,
     }
 }
@@ -266,7 +280,13 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         };
         let t0 = std::time::Instant::now();
         let mut prepared = Some(prepare_batch(
-            &field, &patches, &samples, 0, group_size, args.query,
+            &field,
+            &patches,
+            &samples,
+            0,
+            group_size,
+            args.query,
+            args.cpu_composite,
         ));
         t_points += t0.elapsed().as_secs_f64();
         while let Some(batch) = prepared.take() {
@@ -277,6 +297,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 points,
                 indices,
                 unique_count,
+                geometry,
                 pending,
             } = batch;
             let pp = &patches[start..end];
@@ -286,7 +307,15 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 t_eval += t0.elapsed().as_secs_f64();
                 let t1 = std::time::Instant::now();
                 let (adjoints, stats) = render::composite_device(
-                    pp, &local, &points, &indices, sdf, variance, normal_den, pixel_den, sample_den,
+                    pp,
+                    &local,
+                    geometry.expect("GPU geometry"),
+                    &indices,
+                    sdf,
+                    variance,
+                    normal_den,
+                    pixel_den,
+                    sample_den,
                 );
                 device_stats = Some(match device_stats {
                     Some(old) => old + stats,
@@ -304,7 +333,13 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 t_bwd += t2.elapsed().as_secs_f64();
                 if end < patches.len() {
                     prepared = Some(prepare_batch(
-                        &field, &patches, &samples, end, group_size, args.query,
+                        &field,
+                        &patches,
+                        &samples,
+                        end,
+                        group_size,
+                        args.query,
+                        args.cpu_composite,
                     ));
                 }
                 continue;
@@ -314,7 +349,13 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             // activations are live, and all groups use the same model weights.
             if end < patches.len() && args.pipeline_patches > 0 {
                 prepared = Some(prepare_batch(
-                    &field, &patches, &samples, end, group_size, args.query,
+                    &field,
+                    &patches,
+                    &samples,
+                    end,
+                    group_size,
+                    args.query,
+                    args.cpu_composite,
                 ));
                 field
                     .device
@@ -356,29 +397,38 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             t_bwd += t2.elapsed().as_secs_f64();
             if end < patches.len() && prepared.is_none() {
                 prepared = Some(prepare_batch(
-                    &field, &patches, &samples, end, group_size, args.query,
+                    &field,
+                    &patches,
+                    &samples,
+                    end,
+                    group_size,
+                    args.query,
+                    args.cpu_composite,
                 ));
             }
         }
 
-        if let Some(stats) = device_stats {
-            // Only five scalars cross back, after compositor + backward have been
-            // queued. SDFs and per-point derivatives never leave the GPU.
-            let values = stats.try_into_vec_as::<f32>()?;
-            total.normal += values[0] as f64;
-            total.mask += values[1] as f64;
-            total.eikonal += values[2] as f64;
-            variance_grad += values[3];
-            sdf_bias_grad += values[4] as f64;
+        // Keep the two optimizer scalars device-resident. Reading loss before
+        // Adam used to force an idle gap between backward and the update.
+        if let Some(stats) = &device_stats {
+            gradients.insert(
+                "variance".into(),
+                stats.clone().slice([0..1, 3..4]) + variance_grad,
+            );
+            gradients.insert(
+                "lin1.bias".into(),
+                stats.clone().slice([0..1, 4..5]) + sdf_bias_grad as f32,
+            );
+        } else {
+            gradients.insert(
+                "variance".into(),
+                tensor(vec![variance_grad], [1, 1], &field.device),
+            );
+            gradients.insert(
+                "lin1.bias".into(),
+                tensor(vec![sdf_bias_grad as f32], [1, 1], &field.device),
+            );
         }
-        gradients.insert(
-            "variance".into(),
-            tensor(vec![variance_grad], [1, 1], &field.device),
-        );
-        gradients.insert(
-            "lin1.bias".into(),
-            tensor(vec![sdf_bias_grad as f32], [1, 1], &field.device),
-        );
         let factor = if step < 500 {
             step as f64 / 500.
         } else {
@@ -406,6 +456,14 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         }
         let t_adam = t_adam_start.elapsed().as_secs_f64();
 
+        // Read metrics only after submitting the optimizer, so the CPU cannot
+        // delay the update while waiting for compositor statistics.
+        if let Some(stats) = device_stats {
+            let values = stats.slice([0..1, 0..3]).try_into_vec_as::<f32>()?;
+            total.normal += values[0] as f64;
+            total.mask += values[1] as f64;
+            total.eikonal += values[2] as f64;
+        }
         let secs = started.elapsed().as_secs_f64();
         let report =
             args.profile_stages || field.step % args.log_every == 0 || field.step == final_step;

@@ -179,3 +179,25 @@ Checkpoint format and training schedules are preserved. No compilation, runtime
 parity checks or timing measurements were performed for this set. Early-training
 speedup is a hypothesis, not a measured result; compare the same checkpoints and
 watch memory use before committing to a full reconstruction.
+
+
+### GPU training geometry
+
+Training now uploads compact endpoint descriptors and camera rays, then generates
+unique world-space points and finite-difference coefficients on the GPU. The
+field consumes those points directly. Adjacent sample endpoints retain the same
+sharing rule and order; distances use the generated world coordinates rather
+than an approximate camera-space spacing formula. CPU expanded point arrays and
+the per-sample CPU distance calculations are removed from the default path.
+`--cpu-composite` retains CPU point generation and the reference compositor.
+
+Variance and output-bias derivatives stay on the GPU through Adam. Loss metrics
+are read after optimizer submission rather than blocking between backward and
+Adam. CSV losses still describe the current iteration before its update.
+
+Compact ray samples, endpoint/index bookkeeping, and occupancy flag selection
+still pass through the CPU. This is not yet a completely device-resident training
+loop. GPU coordinates now exist for the whole microbatch, so monitor peak memory
+when comparing large microbatches. Shader arithmetic can round differently from
+CPU arithmetic; reconstruction parity and performance require measurement.
+This change was source-reviewed and formatted only, with no build or tests run.

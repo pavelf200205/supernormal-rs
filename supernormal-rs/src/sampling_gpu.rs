@@ -413,3 +413,150 @@ pub fn parameter_gradients(
         summed.slice([0..64, 31..32]).transpose(),
     )
 }
+
+// Separate launches establish a storage dependency: geometry reads the exact
+// same rounded world coordinates that the field evaluates, including origin.
+#[cube(launch)]
+fn points_kernel(rays: &Tensor<f32>, endpoints: &Tensor<f32>, points: &mut Tensor<f32>) {
+    let id = ABSOLUTE_POS;
+    if id >= points.shape(0) {
+        terminate!();
+    }
+    let endpoint = id / 9;
+    let pixel = id % 9;
+    let patch = usize::cast_from(endpoints[endpoint * 2]);
+    let base = patch * 39;
+    let t = endpoints[endpoint * 2 + 1] * rays[base + 30 + pixel];
+    for d in 0..3usize {
+        points[id * 3 + d] = rays[base + d] + rays[base + 3 + pixel * 3 + d] * t;
+    }
+}
+
+#[cube]
+fn point_distance(points: &Tensor<f32>, a: usize, b: usize) -> f32 {
+    let x = points[a * 3] - points[b * 3];
+    let y = points[a * 3 + 1] - points[b * 3 + 1];
+    let z = points[a * 3 + 2] - points[b * 3 + 2];
+    (x * x + y * y + z * z).sqrt()
+}
+
+#[cube(launch)]
+fn geometry_kernel(
+    rays: &Tensor<f32>,
+    samples: &Tensor<f32>,
+    points: &Tensor<f32>,
+    geometry: &mut Tensor<f32>,
+) {
+    let id = ABSOLUTE_POS;
+    if id >= samples.shape(0) * 9 {
+        terminate!();
+    }
+    let sample = id / 9;
+    let pixel = id % 9;
+    let patch = usize::cast_from(samples[sample * 5]);
+    let base = usize::cast_from(samples[sample * 5 + 3]) * 9;
+    let row = pixel / 3;
+    let col = pixel % 3;
+    let mut l = pixel;
+    let mut r = pixel;
+    let mut u = pixel;
+    let mut d = pixel;
+    if col > 0 {
+        l = pixel - 1;
+    }
+    if col < 2 {
+        r = pixel + 1;
+    }
+    if row > 0 {
+        u = pixel - 3;
+    }
+    if row < 2 {
+        d = pixel + 3;
+    }
+    let mut dx = 0.0_f32;
+    if col == 1 {
+        dx = point_distance(points, base + l, base + pixel)
+            + point_distance(points, base + pixel, base + r);
+    } else {
+        dx = point_distance(points, base + l, base + r);
+    }
+    let mut dy = 0.0_f32;
+    if row == 1 {
+        dy = point_distance(points, base + u, base + pixel)
+            + point_distance(points, base + pixel, base + d);
+    } else {
+        dy = point_distance(points, base + u, base + d);
+    }
+    let dt = (samples[sample * 5 + 2] - samples[sample * 5 + 1]) * rays[patch * 39 + 30 + pixel];
+    geometry[id * 3] = 1.0_f32 / dt;
+    geometry[id * 3 + 1] = 1.0_f32 / dx;
+    geometry[id * 3 + 2] = 1.0_f32 / dy;
+}
+
+#[derive(Debug)]
+struct GeometryOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for GeometryOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([r, e, s, p, g], [po, go]) = self.desc.as_fixed();
+        let [r, e, s, p, g] = [r, e, s, p, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let client = r.client.clone();
+        let n = p.meta.shape().dims::<2>()[0];
+        let dim = CubeDim::new(&client, n);
+        points_kernel::launch(
+            &client,
+            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            dim,
+            r.clone().into_tensor_arg(),
+            e.into_tensor_arg(),
+            p.clone().into_tensor_arg(),
+        );
+        let n = s.meta.shape().dims::<2>()[0] * 9;
+        let dim = CubeDim::new(&client, n);
+        geometry_kernel::launch(
+            &client,
+            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            dim,
+            r.into_tensor_arg(),
+            s.into_tensor_arg(),
+            p.clone().into_tensor_arg(),
+            g.clone().into_tensor_arg(),
+        );
+        handles.register_float_tensor::<CubeBackend>(&po.id, p);
+        handles.register_float_tensor::<CubeBackend>(&go.id, g);
+        Ok(())
+    }
+}
+
+pub fn geometry(inputs: [burn::tensor::Tensor<2>; 5]) -> [burn::tensor::Tensor<2>; 2] {
+    let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let outputs: Vec<_> = [3usize, 4usize]
+        .into_iter()
+        .map(|i| {
+            TensorIr::uninit(
+                client.create_empty_handle(),
+                inputs[i].shape.clone(),
+                inputs[i].dtype,
+            )
+        })
+        .collect();
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_geometry",
+        &inputs.map(|t| t.into_ir()),
+        &outputs,
+        vec![],
+    );
+    let outputs: [_; 2] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            GeometryOp { desc },
+        )
+        .outputs();
+    outputs.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
+}
