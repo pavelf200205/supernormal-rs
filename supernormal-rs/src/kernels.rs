@@ -1024,9 +1024,9 @@ pub fn test_hash_grid_forward_parity(device: &burn::tensor::Device) -> anyhow::R
 }
 
 // Four points per workgroup. Hash interpolation groups neighboring points by
-// level; the MLP uses 64 lanes per point. Shared features bridge the layouts.
-// Barriers are uniform, including the tail workgroup. No global feature/hidden
-// buffers are required for inference; training stores only backward's caches.
+// level; when `corner_parallel` is active (default), all 224 threads across
+// (4 points x 14 levels x 4 corner-pairs) issue trilinear corner lookups in
+// parallel instead of serializing 8 corners on 56 threads while 200 sit idle.
 #[cube]
 fn field_feature_index(slot: usize, feature: usize, #[comptime] local_hash: bool) -> usize {
     if local_hash {
@@ -1048,6 +1048,7 @@ fn fused_field_kernel(
     active: u32,
     #[comptime] cache: bool,
     #[comptime] local_hash: bool,
+    #[comptime] corner_parallel: bool,
 ) {
     // CubeCL workgroup coordinates are u32; tensor/shared indices are usize.
     let unit = usize::cast_from(UNIT_POS);
@@ -1065,7 +1066,7 @@ fn fused_field_kernel(
     let point_idx = group * 4 + slot;
     let valid = point_idx < points.shape(0);
     let mut shared_features = Shared::new_slice(128usize);
-    let mut partials = Shared::new_slice(256usize);
+    let mut partials = Shared::new_slice(if corner_parallel { 512usize } else { 256usize });
     if lane < 32 {
         shared_features[field_feature_index(slot, lane, local_hash)] = 0.0_f32;
     }
@@ -1080,58 +1081,128 @@ fn fused_field_kernel(
             shared_features[field_feature_index(slot, 2, local_hash)] = p2;
         }
     }
-    // Neighboring lanes visit the same table for four nearby points. Keep
-    // the MLP's neuron-parallel layout separate from hash interpolation.
-    let hash_slot = if local_hash { unit % 4 } else { slot };
-    let level = if local_hash { unit / 4 } else { lane };
-    let hash_point = group * 4 + hash_slot;
-    if hash_point < points.shape(0) && level < usize::cast_from(active) {
-        let p0 = points[hash_point * 3];
-        let p1 = points[hash_point * 3 + 1];
-        let p2 = points[hash_point * 3 + 2];
-        let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
-        let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
-        let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
-        let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
-        let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
-        let c0 = norm0 * f32::cast_from(res);
-        let c1 = norm1 * f32::cast_from(res);
-        let c2 = norm2 * f32::cast_from(res);
-        let b0 = f32::floor(c0);
-        let b1 = f32::floor(c1);
-        let b2 = f32::floor(c2);
-        let w0 = c0 - b0;
-        let w1 = c1 - b1;
-        let w2 = c2 - b2;
-        let base0 = u32::cast_from(b0);
-        let base1 = u32::cast_from(b1);
-        let base2 = u32::cast_from(b2);
-        let r1 = res + 1;
-        let dense = r1 * r1 * r1 <= 524288;
+    if corner_parallel {
+        // Map 256 threads to (hash_slot in 0..4, corner_pair in 0..4, level in 0..16).
+        // Up to 4 * 4 * 14 = 224 threads concurrently fetch 2 corners each (448 lookups
+        // in flight per workgroup), then reduce the 4 corner-pairs in shared memory.
+        let hash_slot = unit & 3usize;
+        let corner_pair = (unit >> 2) & 3usize;
+        let level = unit >> 4;
+        let hash_point = group * 4 + hash_slot;
         let mut feat0 = 0.0_f32;
         let mut feat1 = 0.0_f32;
-        for corner in 0..8u32 {
-            let bit0 = corner & 1;
-            let bit1 = (corner >> 1) & 1;
-            let bit2 = (corner >> 2) & 1;
-            let v0 = base0 + bit0;
-            let v1 = base1 + bit1;
-            let v2 = base2 + bit2;
-            let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
-            let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
-            let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
-            let weight = kw0 * kw1 * kw2;
-            let idx = if dense {
-                v0 + v1 * r1 + v2 * r1 * r1
-            } else {
-                (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
-            };
-            let entry = usize::cast_from(offset + idx) * 2;
-            feat0 += weight * tables[entry];
-            feat1 += weight * tables[entry + 1];
+        if hash_point < points.shape(0) && level < usize::cast_from(active) {
+            let p0 = points[hash_point * 3];
+            let p1 = points[hash_point * 3 + 1];
+            let p2 = points[hash_point * 3 + 2];
+            let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
+            let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
+            let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
+            let res = u32::cast_from(metadata[level * 2]);
+            let offset = u32::cast_from(metadata[level * 2 + 1]);
+            let c0 = norm0 * f32::cast_from(res);
+            let c1 = norm1 * f32::cast_from(res);
+            let c2 = norm2 * f32::cast_from(res);
+            let b0 = f32::floor(c0);
+            let b1 = f32::floor(c1);
+            let b2 = f32::floor(c2);
+            let w0 = c0 - b0;
+            let w1 = c1 - b1;
+            let w2 = c2 - b2;
+            let base0 = u32::cast_from(b0);
+            let base1 = u32::cast_from(b1);
+            let base2 = u32::cast_from(b2);
+            let r1 = res + 1;
+            let dense = r1 * r1 * r1 <= 524288;
+            for c_sub in 0..2u32 {
+                let corner = u32::cast_from(corner_pair) * 2 + c_sub;
+                let bit0 = corner & 1;
+                let bit1 = (corner >> 1) & 1;
+                let bit2 = (corner >> 2) & 1;
+                let v0 = base0 + bit0;
+                let v1 = base1 + bit1;
+                let v2 = base2 + bit2;
+                let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
+                let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
+                let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
+                let weight = kw0 * kw1 * kw2;
+                let idx = if dense {
+                    v0 + v1 * r1 + v2 * r1 * r1
+                } else {
+                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                };
+                let entry = usize::cast_from(offset + idx) * 2;
+                feat0 += weight * tables[entry];
+                feat1 += weight * tables[entry + 1];
+            }
         }
-        shared_features[field_feature_index(hash_slot, 3 + level * 2, local_hash)] = feat0;
-        shared_features[field_feature_index(hash_slot, 4 + level * 2, local_hash)] = feat1;
+        partials[unit * 2] = feat0;
+        partials[unit * 2 + 1] = feat1;
+        sync_cube();
+        let red_slot = unit & 3usize;
+        let red_level = unit >> 2;
+        if red_level < usize::cast_from(active) {
+            let base_p = (red_level * 16 + red_slot) * 2;
+            let sum0 = (partials[base_p] + partials[base_p + 8])
+                + (partials[base_p + 16] + partials[base_p + 24]);
+            let sum1 = (partials[base_p + 1] + partials[base_p + 9])
+                + (partials[base_p + 17] + partials[base_p + 25]);
+            shared_features[field_feature_index(red_slot, 3 + red_level * 2, local_hash)] = sum0;
+            shared_features[field_feature_index(red_slot, 4 + red_level * 2, local_hash)] = sum1;
+        }
+    } else {
+        // Legacy 56-thread hash evaluation: one thread loops over all 8 corners.
+        let hash_slot = if local_hash { unit % 4 } else { slot };
+        let level = if local_hash { unit / 4 } else { lane };
+        let hash_point = group * 4 + hash_slot;
+        if hash_point < points.shape(0) && level < usize::cast_from(active) {
+            let p0 = points[hash_point * 3];
+            let p1 = points[hash_point * 3 + 1];
+            let p2 = points[hash_point * 3 + 2];
+            let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
+            let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
+            let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
+            let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+            let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+            let c0 = norm0 * f32::cast_from(res);
+            let c1 = norm1 * f32::cast_from(res);
+            let c2 = norm2 * f32::cast_from(res);
+            let b0 = f32::floor(c0);
+            let b1 = f32::floor(c1);
+            let b2 = f32::floor(c2);
+            let w0 = c0 - b0;
+            let w1 = c1 - b1;
+            let w2 = c2 - b2;
+            let base0 = u32::cast_from(b0);
+            let base1 = u32::cast_from(b1);
+            let base2 = u32::cast_from(b2);
+            let r1 = res + 1;
+            let dense = r1 * r1 * r1 <= 524288;
+            let mut feat0 = 0.0_f32;
+            let mut feat1 = 0.0_f32;
+            for corner in 0..8u32 {
+                let bit0 = corner & 1;
+                let bit1 = (corner >> 1) & 1;
+                let bit2 = (corner >> 2) & 1;
+                let v0 = base0 + bit0;
+                let v1 = base1 + bit1;
+                let v2 = base2 + bit2;
+                let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
+                let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
+                let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
+                let weight = kw0 * kw1 * kw2;
+                let idx = if dense {
+                    v0 + v1 * r1 + v2 * r1 * r1
+                } else {
+                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                };
+                let entry = usize::cast_from(offset + idx) * 2;
+                feat0 += weight * tables[entry];
+                feat1 += weight * tables[entry + 1];
+            }
+            shared_features[field_feature_index(hash_slot, 3 + level * 2, local_hash)] = feat0;
+            shared_features[field_feature_index(hash_slot, 4 + level * 2, local_hash)] = feat1;
+        }
     }
     sync_cube();
     let mut contribution = 0.0_f32;
@@ -1185,6 +1256,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             ScalarIr::UInt(active),
             ScalarIr::UInt(cache),
             ScalarIr::UInt(local_hash),
+            ScalarIr::UInt(corner_parallel),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid fused field arguments")
@@ -1208,6 +1280,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             *active as u32,
             *cache != 0,
             *local_hash != 0,
+            *corner_parallel != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&oy.id, output);
         handles.register_float_tensor::<CubeBackend>(&of.id, features);
@@ -1221,13 +1294,21 @@ pub fn fused_field(
     active: usize,
     cache: bool,
     local_hash: bool,
+    corner_parallel: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     let n = inputs[0].dims()[0];
     let device = inputs[0].device();
+    // Use uninitialized buffers instead of zero-filling before full overwrite;
+    // when caching features, active < 14 still requires zeroed inactive columns.
+    let feat_buf = if cache && active < 14 {
+        burn::tensor::Tensor::<2>::zeros([n, 31], &device)
+    } else {
+        burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 31], &device)
+    };
     let buffers = [
-        burn::tensor::Tensor::<2>::zeros([n, 1], &device),
-        burn::tensor::Tensor::<2>::zeros([if cache { n } else { 1 }, 31], &device),
-        burn::tensor::Tensor::<2>::zeros([if cache { n } else { 1 }, 64], &device),
+        burn::tensor::Tensor::<2>::empty([n, 1], &device),
+        feat_buf,
+        burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 64], &device),
     ];
     let inputs: Vec<_> = inputs
         .into_iter()
@@ -1247,6 +1328,7 @@ pub fn fused_field(
             ScalarIr::UInt(active as u64),
             ScalarIr::UInt(cache as u64),
             ScalarIr::UInt(local_hash as u64),
+            ScalarIr::UInt(corner_parallel as u64),
         ],
     );
     let result: [_; 3] = client
@@ -1267,6 +1349,7 @@ fn composite_kernel(
     geometry: &Tensor<f32>,
     ids: &Tensor<f32>,
     patches: &Tensor<f32>,
+    vis_prefix: &Tensor<f32>,
     scratch: &mut Tensor<f32>,
     stats: &mut Tensor<f32>,
 ) {
@@ -1277,8 +1360,25 @@ fn composite_kernel(
         terminate!();
     }
     let pb = p * 123;
-    let begin = usize::cast_from(patches[pb]);
-    let end = usize::cast_from(patches[pb + 1]);
+    let begin = if patches[pb] < 0.0_f32 {
+        let g_ray = usize::cast_from(-patches[pb] - 1.0_f32);
+        let s_base = usize::cast_from(patches[pb + 1]);
+        let g_begin = if g_ray == 0 {
+            0usize
+        } else {
+            usize::cast_from(vis_prefix[(g_ray - 1) * 2])
+        };
+        g_begin - s_base
+    } else {
+        usize::cast_from(patches[pb])
+    };
+    let end = if patches[pb] < 0.0_f32 {
+        let g_ray = usize::cast_from(-patches[pb] - 1.0_f32);
+        let s_base = usize::cast_from(patches[pb + 1]);
+        usize::cast_from(vis_prefix[g_ray * 2]) - s_base
+    } else {
+        usize::cast_from(patches[pb + 1])
+    };
     let inv = patches[pb + 2];
     let normal_den = patches[pb + 3];
     let pixel_den = patches[pb + 4];
@@ -1414,9 +1514,9 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([s, g, i, p, w, d, l, r], [od, ol]) = self.desc.as_fixed();
-        let [s, g, i, p, w, d, l, r] =
-            [s, g, i, p, w, d, l, r].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let ([s, g, i, p, vp, w, d, l, r], [od, ol]) = self.desc.as_fixed();
+        let [s, g, i, p, vp, w, d, l, r] =
+            [s, g, i, p, vp, w, d, l, r].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = s.client.clone();
         let n = p.meta.shape().dims::<2>()[0] * 9;
         let dim = CubeDim::new(&client, n);
@@ -1428,6 +1528,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             g.into_tensor_arg(),
             i.into_tensor_arg(),
             p.into_tensor_arg(),
+            vp.into_tensor_arg(),
             w.clone().into_tensor_arg(),
             l.clone().into_tensor_arg(),
         );
@@ -1446,10 +1547,10 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
         Ok(())
     }
 }
-pub fn composite_gpu(inputs: [burn::tensor::Tensor<2>; 8]) -> [burn::tensor::Tensor<2>; 2] {
+pub fn composite_gpu(inputs: [burn::tensor::Tensor<2>; 9]) -> [burn::tensor::Tensor<2>; 2] {
     let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = inputs[5..7]
+    let outputs: Vec<_> = inputs[6..8]
         .iter()
         .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
         .collect();
@@ -1482,6 +1583,7 @@ fn field_backward_kernel(
     active: u32,
     #[comptime] local_hash: bool,
     #[comptime] compact_gradients: bool,
+    #[comptime] corner_parallel: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -1499,23 +1601,26 @@ fn field_backward_kernel(
     sync_cube();
     let lane = unit % 64;
     let slot = unit / 64;
-    let point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + slot;
+    let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
+    let point = group * 4 + slot;
     let mut shared = Shared::new_slice(256usize);
     // Only the compact variant needs a workgroup-local output-gradient tile.
     let mut output_grads = Shared::new_slice(if compact_gradients { 256usize } else { 1usize });
+    let mut grad_staging = Shared::new_slice(if corner_parallel { 112usize } else { 1usize });
     let mut output_grad = 0.0_f32;
     let mut v = 0.0_f32;
     if point < pre.shape(0) {
         let h = pre[point * 64 + lane];
         let scaled = h * 100.0_f32;
+        let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
         let derivative = if scaled > 20.0_f32 {
             1.0_f32
         } else {
-            1.0_f32 / (1.0_f32 + f32::exp(-scaled))
+            exp_pos / (1.0_f32 + exp_pos)
         };
         v = ds[point] * shared_weights[2048 + lane] * derivative;
         dh[point * 64 + lane] = v;
-        let soft = f32::ln(1.0_f32 + f32::exp(f32::min(scaled, 20.0_f32))) / 100.0_f32;
+        let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
         let hidden = if scaled > 20.0_f32 { h } else { soft };
         output_grad = ds[point] * hidden;
         if !compact_gradients {
@@ -1529,7 +1634,6 @@ fn field_backward_kernel(
     }
     sync_cube();
     if compact_gradients && slot == 0 {
-        let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
         if group < dw1.shape(0) {
             // All tail lanes participate with zero contributions. No atomics
             // and no subgroup-size assumptions; retain all 64 output weights.
@@ -1537,90 +1641,194 @@ fn field_backward_kernel(
                 + (output_grads[128 + lane] + output_grads[192 + lane]);
         }
     }
-    let hash_slot = if local_hash { unit % 4 } else { slot };
-    let level = if local_hash { unit / 4 } else { lane };
-    let hash_point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + hash_slot;
-    if hash_point < pre.shape(0) && level < usize::cast_from(active) {
-        let col = 3 + level * 2;
-        let mut g0 = 0.0_f32;
-        let mut g1 = 0.0_f32;
-        for j in 0..64usize {
-            let hi = if local_hash {
-                j * 4 + hash_slot
-            } else {
-                hash_slot * 64 + j
-            };
-            let w0 = if local_hash {
-                j * 31 + col
-            } else {
-                col * 64 + j
-            };
-            let w1 = if local_hash {
-                j * 31 + col + 1
-            } else {
-                (col + 1) * 64 + j
-            };
-            let h = shared[hi];
-            g0 += h * shared_weights[w0];
-            g1 += h * shared_weights[w1];
-        }
-        if g0 != 0.0_f32 || g1 != 0.0_f32 {
-            let norm0 = f32::clamp(
-                (points[hash_point * 3] + 1.0_f32) * 0.5_f32,
-                0.0_f32,
-                1.0_f32 - 1e-7_f32,
-            );
-            let norm1 = f32::clamp(
-                (points[hash_point * 3 + 1] + 1.0_f32) * 0.5_f32,
-                0.0_f32,
-                1.0_f32 - 1e-7_f32,
-            );
-            let norm2 = f32::clamp(
-                (points[hash_point * 3 + 2] + 1.0_f32) * 0.5_f32,
-                0.0_f32,
-                1.0_f32 - 1e-7_f32,
-            );
-            let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
-            let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
-            let c0 = norm0 * f32::cast_from(res);
-            let c1 = norm1 * f32::cast_from(res);
-            let c2 = norm2 * f32::cast_from(res);
-            let b0 = f32::floor(c0);
-            let b1 = f32::floor(c1);
-            let b2 = f32::floor(c2);
-            let w0 = c0 - b0;
-            let w1 = c1 - b1;
-            let w2 = c2 - b2;
-            let base0 = u32::cast_from(b0);
-            let base1 = u32::cast_from(b1);
-            let base2 = u32::cast_from(b2);
-            let r1 = res + 1;
-            let dense = r1 * r1 * r1 <= 524288;
-
-            for corner in 0..8u32 {
-                let bit0 = corner & 1;
-                let bit1 = (corner >> 1) & 1;
-                let bit2 = (corner >> 2) & 1;
-                let v0 = base0 + bit0;
-                let v1 = base1 + bit1;
-                let v2 = base2 + bit2;
-                let kw0 = if bit0 == 0 { 1.0_f32 - w0 } else { w0 };
-                let kw1 = if bit1 == 0 { 1.0_f32 - w1 } else { w1 };
-                let kw2 = if bit2 == 0 { 1.0_f32 - w2 } else { w2 };
-                let weight = kw0 * kw1 * kw2;
-                let idx = if dense {
-                    v0 + v1 * r1 + v2 * r1 * r1
-                } else {
-                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
-                };
-                let entry = usize::cast_from(offset + idx) * 2;
-                let wg0 = weight * g0;
-                let wg1 = weight * g1;
-                if wg0 != 0.0_f32 {
-                    atomic_add_f32(table_grad, entry, wg0);
+    if corner_parallel {
+        let hash_slot = unit & 3usize;
+        let level = unit >> 2;
+        let hash_point = group * 4 + hash_slot;
+        if level < 14usize {
+            let mut g0 = 0.0_f32;
+            let mut g1 = 0.0_f32;
+            if hash_point < pre.shape(0) && level < usize::cast_from(active) {
+                let col = 3 + level * 2;
+                for j in 0..64usize {
+                    let hi = if local_hash {
+                        j * 4 + hash_slot
+                    } else {
+                        hash_slot * 64 + j
+                    };
+                    let w0 = if local_hash {
+                        j * 31 + col
+                    } else {
+                        col * 64 + j
+                    };
+                    let w1 = if local_hash {
+                        j * 31 + col + 1
+                    } else {
+                        (col + 1) * 64 + j
+                    };
+                    let h = shared[hi];
+                    g0 += h * shared_weights[w0];
+                    g1 += h * shared_weights[w1];
                 }
-                if wg1 != 0.0_f32 {
-                    atomic_add_f32(table_grad, entry + 1, wg1);
+            }
+            grad_staging[(level * 4 + hash_slot) * 2] = g0;
+            grad_staging[(level * 4 + hash_slot) * 2 + 1] = g1;
+        }
+        sync_cube();
+        let c_slot = unit & 3usize;
+        let corner_pair = (unit >> 2) & 3usize;
+        let c_level = unit >> 4;
+        let c_point = group * 4 + c_slot;
+        if c_point < pre.shape(0) && c_level < usize::cast_from(active) {
+            let g0 = grad_staging[(c_level * 4 + c_slot) * 2];
+            let g1 = grad_staging[(c_level * 4 + c_slot) * 2 + 1];
+            if g0 != 0.0_f32 || g1 != 0.0_f32 {
+                let norm0 = f32::clamp(
+                    (points[c_point * 3] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm1 = f32::clamp(
+                    (points[c_point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm2 = f32::clamp(
+                    (points[c_point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let res = u32::cast_from(metadata[c_level * 2]);
+                let offset = u32::cast_from(metadata[c_level * 2 + 1]);
+                let c0 = norm0 * f32::cast_from(res);
+                let c1 = norm1 * f32::cast_from(res);
+                let c2 = norm2 * f32::cast_from(res);
+                let b0 = f32::floor(c0);
+                let b1 = f32::floor(c1);
+                let b2 = f32::floor(c2);
+                let w0 = c0 - b0;
+                let w1 = c1 - b1;
+                let w2 = c2 - b2;
+                let base0 = u32::cast_from(b0);
+                let base1 = u32::cast_from(b1);
+                let base2 = u32::cast_from(b2);
+                let r1 = res + 1;
+                let dense = r1 * r1 * r1 <= 524288;
+                for c_sub in 0..2u32 {
+                    let corner = u32::cast_from(corner_pair) * 2 + c_sub;
+                    let bit0 = corner & 1;
+                    let bit1 = (corner >> 1) & 1;
+                    let bit2 = (corner >> 2) & 1;
+                    let v0 = base0 + bit0;
+                    let v1 = base1 + bit1;
+                    let v2 = base2 + bit2;
+                    let kw0 = if bit0 == 0 { 1.0_f32 - w0 } else { w0 };
+                    let kw1 = if bit1 == 0 { 1.0_f32 - w1 } else { w1 };
+                    let kw2 = if bit2 == 0 { 1.0_f32 - w2 } else { w2 };
+                    let weight = kw0 * kw1 * kw2;
+                    let idx = if dense {
+                        v0 + v1 * r1 + v2 * r1 * r1
+                    } else {
+                        (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                    };
+                    let entry = usize::cast_from(offset + idx) * 2;
+                    let wg0 = weight * g0;
+                    let wg1 = weight * g1;
+                    if wg0 != 0.0_f32 {
+                        atomic_add_f32(table_grad, entry, wg0);
+                    }
+                    if wg1 != 0.0_f32 {
+                        atomic_add_f32(table_grad, entry + 1, wg1);
+                    }
+                }
+            }
+        }
+    } else {
+        let hash_slot = if local_hash { unit % 4 } else { slot };
+        let level = if local_hash { unit / 4 } else { lane };
+        let hash_point = group * 4 + hash_slot;
+        if hash_point < pre.shape(0) && level < usize::cast_from(active) {
+            let col = 3 + level * 2;
+            let mut g0 = 0.0_f32;
+            let mut g1 = 0.0_f32;
+            for j in 0..64usize {
+                let hi = if local_hash {
+                    j * 4 + hash_slot
+                } else {
+                    hash_slot * 64 + j
+                };
+                let w0 = if local_hash {
+                    j * 31 + col
+                } else {
+                    col * 64 + j
+                };
+                let w1 = if local_hash {
+                    j * 31 + col + 1
+                } else {
+                    (col + 1) * 64 + j
+                };
+                let h = shared[hi];
+                g0 += h * shared_weights[w0];
+                g1 += h * shared_weights[w1];
+            }
+            if g0 != 0.0_f32 || g1 != 0.0_f32 {
+                let norm0 = f32::clamp(
+                    (points[hash_point * 3] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm1 = f32::clamp(
+                    (points[hash_point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm2 = f32::clamp(
+                    (points[hash_point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+                let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+                let c0 = norm0 * f32::cast_from(res);
+                let c1 = norm1 * f32::cast_from(res);
+                let c2 = norm2 * f32::cast_from(res);
+                let b0 = f32::floor(c0);
+                let b1 = f32::floor(c1);
+                let b2 = f32::floor(c2);
+                let w0 = c0 - b0;
+                let w1 = c1 - b1;
+                let w2 = c2 - b2;
+                let base0 = u32::cast_from(b0);
+                let base1 = u32::cast_from(b1);
+                let base2 = u32::cast_from(b2);
+                let r1 = res + 1;
+                let dense = r1 * r1 * r1 <= 524288;
+
+                for corner in 0..8u32 {
+                    let bit0 = corner & 1;
+                    let bit1 = (corner >> 1) & 1;
+                    let bit2 = (corner >> 2) & 1;
+                    let v0 = base0 + bit0;
+                    let v1 = base1 + bit1;
+                    let v2 = base2 + bit2;
+                    let kw0 = if bit0 == 0 { 1.0_f32 - w0 } else { w0 };
+                    let kw1 = if bit1 == 0 { 1.0_f32 - w1 } else { w1 };
+                    let kw2 = if bit2 == 0 { 1.0_f32 - w2 } else { w2 };
+                    let weight = kw0 * kw1 * kw2;
+                    let idx = if dense {
+                        v0 + v1 * r1 + v2 * r1 * r1
+                    } else {
+                        (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                    };
+                    let entry = usize::cast_from(offset + idx) * 2;
+                    let wg0 = weight * g0;
+                    let wg1 = weight * g1;
+                    if wg0 != 0.0_f32 {
+                        atomic_add_f32(table_grad, entry, wg0);
+                    }
+                    if wg1 != 0.0_f32 {
+                        atomic_add_f32(table_grad, entry + 1, wg1);
+                    }
                 }
             }
         }
@@ -1641,6 +1849,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
             ScalarIr::UInt(active),
             ScalarIr::UInt(local_hash),
             ScalarIr::UInt(compact_gradients),
+            ScalarIr::UInt(corner_parallel),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid backward scalars")
@@ -1658,7 +1867,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         static NOTICE: std::sync::Once = std::sync::Once::new();
         NOTICE.call_once(|| {
             eprintln!(
-                "Hash gradients: {}; hash layout: {}",
+                "Hash gradients: {}; hash layout: {}; corner parallelism: {}",
                 if native_add {
                     "native float atomics"
                 } else {
@@ -1668,6 +1877,11 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                     "neighboring points grouped by level"
                 } else {
                     "legacy point-major"
+                },
+                if *corner_parallel != 0 {
+                    "256-thread corner-parallel"
+                } else {
+                    "legacy 56-thread sequential corners"
                 },
             );
         });
@@ -1687,6 +1901,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *active as u32,
                 *local_hash != 0,
                 *compact_gradients != 0,
+                *corner_parallel != 0,
             );
         } else {
             field_backward_kernel::launch(
@@ -1704,6 +1919,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *active as u32,
                 *local_hash != 0,
                 *compact_gradients != 0,
+                *corner_parallel != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
@@ -1717,6 +1933,7 @@ pub fn field_backward(
     active: usize,
     local_hash: bool,
     compact_gradients: bool,
+    corner_parallel: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     use burn::tensor::Tensor as BT;
     let n = inputs[0].dims()[0];
@@ -1724,8 +1941,8 @@ pub fn field_backward(
     let inputs: Vec<_> = inputs
         .into_iter()
         .chain([
-            BT::zeros([n, 64], &device),
-            BT::zeros(
+            BT::empty([n, 64], &device),
+            BT::empty(
                 [if compact_gradients { n.div_ceil(4) } else { n }, 64],
                 &device,
             ),
@@ -1745,6 +1962,7 @@ pub fn field_backward(
             ScalarIr::UInt(active as u64),
             ScalarIr::UInt(local_hash as u64),
             ScalarIr::UInt(compact_gradients as u64),
+            ScalarIr::UInt(corner_parallel as u64),
         ],
     );
     let result: [_; 3] = client
@@ -1820,22 +2038,41 @@ fn visibility_kernel(
     let end = usize::cast_from(ranges[ray * 2 + 1]);
     let mut trans = 1.0_f32;
     let mut count = 0usize;
+    let mut ep_count = 0usize;
+    let mut prev_end_id = 0usize;
     for sample in begin..end {
         if trans < 1e-8_f32 {
             break;
         }
+        let i0 = usize::cast_from(pairs[sample * 2]);
+        let i1 = usize::cast_from(pairs[sample * 2 + 1]);
+        if count > 0 && i0 == prev_end_id {
+            ep_count += 1;
+        } else {
+            ep_count += 2;
+        }
+        prev_end_id = i1;
         count += 1;
-        let a = sdf[usize::cast_from(pairs[sample * 2])];
-        let b = sdf[usize::cast_from(pairs[sample * 2 + 1])];
+        let a = sdf[i0];
+        let b = sdf[i1];
         // sigmoid(a*inv), written with the same sign convention as CPU alpha.
         let c = 1.0_f32 / (1.0_f32 + f32::exp(-a * inv));
         let d = 1.0_f32 / (1.0_f32 + f32::exp(-b * inv));
         let alpha = f32::clamp((c - d + 1e-5_f32) / (c + 1e-5_f32), 0.0_f32, 1.0_f32);
         trans *= f32::max(1.0_f32 - alpha, 1e-10_f32);
     }
-    out[ray] = f32::cast_from(count);
-    if ray == 0 {
-        out[ranges.shape(0)] = variance[0];
+    if out.shape(1) == 2 {
+        out[ray * 2] = f32::cast_from(count);
+        out[ray * 2 + 1] = f32::cast_from(ep_count);
+        if ray == 0 {
+            out[ranges.shape(0) * 2] = variance[0];
+            out[ranges.shape(0) * 2 + 1] = variance[0];
+        }
+    } else {
+        out[ray] = f32::cast_from(count);
+        if ray == 0 {
+            out[ranges.shape(0)] = variance[0];
+        }
     }
 }
 #[derive(Debug)]
@@ -1904,6 +2141,7 @@ fn field_backward_native_kernel(
     active: u32,
     #[comptime] local_hash: bool,
     #[comptime] compact_gradients: bool,
+    #[comptime] corner_parallel: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -1921,23 +2159,26 @@ fn field_backward_native_kernel(
     sync_cube();
     let lane = unit % 64;
     let slot = unit / 64;
-    let point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + slot;
+    let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
+    let point = group * 4 + slot;
     let mut shared = Shared::new_slice(256usize);
     // Only the compact variant needs a workgroup-local output-gradient tile.
     let mut output_grads = Shared::new_slice(if compact_gradients { 256usize } else { 1usize });
+    let mut grad_staging = Shared::new_slice(if corner_parallel { 112usize } else { 1usize });
     let mut output_grad = 0.0_f32;
     let mut v = 0.0_f32;
     if point < pre.shape(0) {
         let h = pre[point * 64 + lane];
         let scaled = h * 100.0_f32;
+        let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
         let derivative = if scaled > 20.0_f32 {
             1.0_f32
         } else {
-            1.0_f32 / (1.0_f32 + f32::exp(-scaled))
+            exp_pos / (1.0_f32 + exp_pos)
         };
         v = ds[point] * shared_weights[2048 + lane] * derivative;
         dh[point * 64 + lane] = v;
-        let soft = f32::ln(1.0_f32 + f32::exp(f32::min(scaled, 20.0_f32))) / 100.0_f32;
+        let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
         let hidden = if scaled > 20.0_f32 { h } else { soft };
         output_grad = ds[point] * hidden;
         if !compact_gradients {
@@ -1951,7 +2192,6 @@ fn field_backward_native_kernel(
     }
     sync_cube();
     if compact_gradients && slot == 0 {
-        let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
         if group < dw1.shape(0) {
             // All tail lanes participate with zero contributions. No atomics
             // and no subgroup-size assumptions; retain all 64 output weights.
@@ -1959,90 +2199,194 @@ fn field_backward_native_kernel(
                 + (output_grads[128 + lane] + output_grads[192 + lane]);
         }
     }
-    let hash_slot = if local_hash { unit % 4 } else { slot };
-    let level = if local_hash { unit / 4 } else { lane };
-    let hash_point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + hash_slot;
-    if hash_point < pre.shape(0) && level < usize::cast_from(active) {
-        let col = 3 + level * 2;
-        let mut g0 = 0.0_f32;
-        let mut g1 = 0.0_f32;
-        for j in 0..64usize {
-            let hi = if local_hash {
-                j * 4 + hash_slot
-            } else {
-                hash_slot * 64 + j
-            };
-            let w0 = if local_hash {
-                j * 31 + col
-            } else {
-                col * 64 + j
-            };
-            let w1 = if local_hash {
-                j * 31 + col + 1
-            } else {
-                (col + 1) * 64 + j
-            };
-            let h = shared[hi];
-            g0 += h * shared_weights[w0];
-            g1 += h * shared_weights[w1];
-        }
-        if g0 != 0.0_f32 || g1 != 0.0_f32 {
-            let norm0 = f32::clamp(
-                (points[hash_point * 3] + 1.0_f32) * 0.5_f32,
-                0.0_f32,
-                1.0_f32 - 1e-7_f32,
-            );
-            let norm1 = f32::clamp(
-                (points[hash_point * 3 + 1] + 1.0_f32) * 0.5_f32,
-                0.0_f32,
-                1.0_f32 - 1e-7_f32,
-            );
-            let norm2 = f32::clamp(
-                (points[hash_point * 3 + 2] + 1.0_f32) * 0.5_f32,
-                0.0_f32,
-                1.0_f32 - 1e-7_f32,
-            );
-            let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
-            let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
-            let c0 = norm0 * f32::cast_from(res);
-            let c1 = norm1 * f32::cast_from(res);
-            let c2 = norm2 * f32::cast_from(res);
-            let b0 = f32::floor(c0);
-            let b1 = f32::floor(c1);
-            let b2 = f32::floor(c2);
-            let w0 = c0 - b0;
-            let w1 = c1 - b1;
-            let w2 = c2 - b2;
-            let base0 = u32::cast_from(b0);
-            let base1 = u32::cast_from(b1);
-            let base2 = u32::cast_from(b2);
-            let r1 = res + 1;
-            let dense = r1 * r1 * r1 <= 524288;
-
-            for corner in 0..8u32 {
-                let bit0 = corner & 1;
-                let bit1 = (corner >> 1) & 1;
-                let bit2 = (corner >> 2) & 1;
-                let v0 = base0 + bit0;
-                let v1 = base1 + bit1;
-                let v2 = base2 + bit2;
-                let kw0 = if bit0 == 0 { 1.0_f32 - w0 } else { w0 };
-                let kw1 = if bit1 == 0 { 1.0_f32 - w1 } else { w1 };
-                let kw2 = if bit2 == 0 { 1.0_f32 - w2 } else { w2 };
-                let weight = kw0 * kw1 * kw2;
-                let idx = if dense {
-                    v0 + v1 * r1 + v2 * r1 * r1
-                } else {
-                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
-                };
-                let entry = usize::cast_from(offset + idx) * 2;
-                let wg0 = weight * g0;
-                let wg1 = weight * g1;
-                if wg0 != 0.0_f32 {
-                    table_grad[entry].fetch_add(wg0);
+    if corner_parallel {
+        let hash_slot = unit & 3usize;
+        let level = unit >> 2;
+        let hash_point = group * 4 + hash_slot;
+        if level < 14usize {
+            let mut g0 = 0.0_f32;
+            let mut g1 = 0.0_f32;
+            if hash_point < pre.shape(0) && level < usize::cast_from(active) {
+                let col = 3 + level * 2;
+                for j in 0..64usize {
+                    let hi = if local_hash {
+                        j * 4 + hash_slot
+                    } else {
+                        hash_slot * 64 + j
+                    };
+                    let w0 = if local_hash {
+                        j * 31 + col
+                    } else {
+                        col * 64 + j
+                    };
+                    let w1 = if local_hash {
+                        j * 31 + col + 1
+                    } else {
+                        (col + 1) * 64 + j
+                    };
+                    let h = shared[hi];
+                    g0 += h * shared_weights[w0];
+                    g1 += h * shared_weights[w1];
                 }
-                if wg1 != 0.0_f32 {
-                    table_grad[entry + 1].fetch_add(wg1);
+            }
+            grad_staging[(level * 4 + hash_slot) * 2] = g0;
+            grad_staging[(level * 4 + hash_slot) * 2 + 1] = g1;
+        }
+        sync_cube();
+        let c_slot = unit & 3usize;
+        let corner_pair = (unit >> 2) & 3usize;
+        let c_level = unit >> 4;
+        let c_point = group * 4 + c_slot;
+        if c_point < pre.shape(0) && c_level < usize::cast_from(active) {
+            let g0 = grad_staging[(c_level * 4 + c_slot) * 2];
+            let g1 = grad_staging[(c_level * 4 + c_slot) * 2 + 1];
+            if g0 != 0.0_f32 || g1 != 0.0_f32 {
+                let norm0 = f32::clamp(
+                    (points[c_point * 3] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm1 = f32::clamp(
+                    (points[c_point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm2 = f32::clamp(
+                    (points[c_point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let res = u32::cast_from(metadata[c_level * 2]);
+                let offset = u32::cast_from(metadata[c_level * 2 + 1]);
+                let c0 = norm0 * f32::cast_from(res);
+                let c1 = norm1 * f32::cast_from(res);
+                let c2 = norm2 * f32::cast_from(res);
+                let b0 = f32::floor(c0);
+                let b1 = f32::floor(c1);
+                let b2 = f32::floor(c2);
+                let w0 = c0 - b0;
+                let w1 = c1 - b1;
+                let w2 = c2 - b2;
+                let base0 = u32::cast_from(b0);
+                let base1 = u32::cast_from(b1);
+                let base2 = u32::cast_from(b2);
+                let r1 = res + 1;
+                let dense = r1 * r1 * r1 <= 524288;
+                for c_sub in 0..2u32 {
+                    let corner = u32::cast_from(corner_pair) * 2 + c_sub;
+                    let bit0 = corner & 1;
+                    let bit1 = (corner >> 1) & 1;
+                    let bit2 = (corner >> 2) & 1;
+                    let v0 = base0 + bit0;
+                    let v1 = base1 + bit1;
+                    let v2 = base2 + bit2;
+                    let kw0 = if bit0 == 0 { 1.0_f32 - w0 } else { w0 };
+                    let kw1 = if bit1 == 0 { 1.0_f32 - w1 } else { w1 };
+                    let kw2 = if bit2 == 0 { 1.0_f32 - w2 } else { w2 };
+                    let weight = kw0 * kw1 * kw2;
+                    let idx = if dense {
+                        v0 + v1 * r1 + v2 * r1 * r1
+                    } else {
+                        (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                    };
+                    let entry = usize::cast_from(offset + idx) * 2;
+                    let wg0 = weight * g0;
+                    let wg1 = weight * g1;
+                    if wg0 != 0.0_f32 {
+                        table_grad[entry].fetch_add(wg0);
+                    }
+                    if wg1 != 0.0_f32 {
+                        table_grad[entry + 1].fetch_add(wg1);
+                    }
+                }
+            }
+        }
+    } else {
+        let hash_slot = if local_hash { unit % 4 } else { slot };
+        let level = if local_hash { unit / 4 } else { lane };
+        let hash_point = group * 4 + hash_slot;
+        if hash_point < pre.shape(0) && level < usize::cast_from(active) {
+            let col = 3 + level * 2;
+            let mut g0 = 0.0_f32;
+            let mut g1 = 0.0_f32;
+            for j in 0..64usize {
+                let hi = if local_hash {
+                    j * 4 + hash_slot
+                } else {
+                    hash_slot * 64 + j
+                };
+                let w0 = if local_hash {
+                    j * 31 + col
+                } else {
+                    col * 64 + j
+                };
+                let w1 = if local_hash {
+                    j * 31 + col + 1
+                } else {
+                    (col + 1) * 64 + j
+                };
+                let h = shared[hi];
+                g0 += h * shared_weights[w0];
+                g1 += h * shared_weights[w1];
+            }
+            if g0 != 0.0_f32 || g1 != 0.0_f32 {
+                let norm0 = f32::clamp(
+                    (points[hash_point * 3] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm1 = f32::clamp(
+                    (points[hash_point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm2 = f32::clamp(
+                    (points[hash_point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+                let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+                let c0 = norm0 * f32::cast_from(res);
+                let c1 = norm1 * f32::cast_from(res);
+                let c2 = norm2 * f32::cast_from(res);
+                let b0 = f32::floor(c0);
+                let b1 = f32::floor(c1);
+                let b2 = f32::floor(c2);
+                let w0 = c0 - b0;
+                let w1 = c1 - b1;
+                let w2 = c2 - b2;
+                let base0 = u32::cast_from(b0);
+                let base1 = u32::cast_from(b1);
+                let base2 = u32::cast_from(b2);
+                let r1 = res + 1;
+                let dense = r1 * r1 * r1 <= 524288;
+
+                for corner in 0..8u32 {
+                    let bit0 = corner & 1;
+                    let bit1 = (corner >> 1) & 1;
+                    let bit2 = (corner >> 2) & 1;
+                    let v0 = base0 + bit0;
+                    let v1 = base1 + bit1;
+                    let v2 = base2 + bit2;
+                    let kw0 = if bit0 == 0 { 1.0_f32 - w0 } else { w0 };
+                    let kw1 = if bit1 == 0 { 1.0_f32 - w1 } else { w1 };
+                    let kw2 = if bit2 == 0 { 1.0_f32 - w2 } else { w2 };
+                    let weight = kw0 * kw1 * kw2;
+                    let idx = if dense {
+                        v0 + v1 * r1 + v2 * r1 * r1
+                    } else {
+                        (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                    };
+                    let entry = usize::cast_from(offset + idx) * 2;
+                    let wg0 = weight * g0;
+                    let wg1 = weight * g1;
+                    if wg0 != 0.0_f32 {
+                        table_grad[entry].fetch_add(wg0);
+                    }
+                    if wg1 != 0.0_f32 {
+                        table_grad[entry + 1].fetch_add(wg1);
+                    }
                 }
             }
         }

@@ -42,6 +42,7 @@ pub struct Field {
     pub local_hash: bool,
     pub compact_gradients: bool,
     pub wide_gradient_tiles: bool,
+    pub corner_parallel: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
 }
@@ -296,6 +297,7 @@ impl Field {
             local_hash: true,
             compact_gradients: true,
             wide_gradient_tiles: true,
+            corner_parallel: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         }
@@ -376,6 +378,7 @@ impl Field {
             local_hash: true,
             compact_gradients: true,
             wide_gradient_tiles: true,
+            corner_parallel: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         })
@@ -483,6 +486,41 @@ impl Field {
         pending
     }
 
+    /// Evaluate points that are already device-resident `[count, 3]` without
+    /// downloading or re-uploading coordinates.
+    pub fn evaluate_device_tensor(&self, points: Tensor<2>, chunk: usize) -> Tensor<2> {
+        let count = points.dims()[0];
+        let outputs: Vec<_> = (0..count)
+            .step_by(chunk)
+            .map(|start| {
+                let n = (count - start).min(chunk);
+                let padded_n = Self::static_bucket_size(n, chunk);
+                let pts = points.clone().slice([start..start + n, 0..3]);
+                let xyz = if padded_n == n {
+                    pts
+                } else {
+                    Tensor::cat(
+                        vec![pts, Tensor::zeros([padded_n - n, 3], &self.device)],
+                        0,
+                    )
+                };
+                let y = if self.fused_field {
+                    let [y, _, _] = self.fused_forward(xyz, false);
+                    y
+                } else {
+                    let features = self.compute_features_gpu(xyz);
+                    self.mlp_forward(features, false)
+                };
+                if y.dims()[0] == n {
+                    y
+                } else {
+                    y.slice([0..n, 0..1])
+                }
+            })
+            .collect();
+        Tensor::cat(outputs, 0)
+    }
+
     pub fn evaluate_device(&self, points: &[[f32; 3]], chunk: usize) -> Tensor<2> {
         let outputs = self
             .enqueue_evaluation(points, chunk)
@@ -529,11 +567,31 @@ impl Field {
             tensor(pairs, [samples, 2], &self.device),
             tensor(ranges, [rays, 2], &self.device),
             self.p("variance").without_autodiff(),
-            Tensor::zeros([rays + 1, 1], &self.device),
+            Tensor::empty([rays + 1, 1], &self.device),
         ]);
         let mut values = result.try_into_vec_as::<f32>()?;
         self.variance_host = values.pop().expect("visibility variance");
         Ok(values.into_iter().map(|v| v as usize).collect())
+    }
+
+    /// Evaluate visibility on device-resident center points, pairs, and ranges,
+    /// returning the `[rays + 1, 1]` result tensor without host transfers.
+    pub fn visibility_device(
+        &self,
+        unique_pts: Tensor<2>,
+        pairs: Tensor<2>,
+        ranges: Tensor<2>,
+        chunk: usize,
+    ) -> Tensor<2> {
+        let rays = ranges.dims()[0];
+        let sdf = self.evaluate_device_tensor(unique_pts, chunk);
+        crate::kernels::visibility([
+            sdf,
+            pairs,
+            ranges,
+            self.p("variance").without_autodiff(),
+            Tensor::empty([rays + 1, 2], &self.device),
+        ])
     }
 
     pub fn evaluate_visibility(&mut self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
@@ -705,7 +763,11 @@ impl Field {
         if active == 0 {
             return Tensor::cat(vec![xyz, Tensor::zeros([n, 28], &self.device)], 1);
         }
-        let features = Tensor::zeros([n, 31], &self.device);
+        let features = if active < 14 {
+            Tensor::zeros([n, 31], &self.device)
+        } else {
+            Tensor::empty([n, 31], &self.device)
+        };
         let (tables, metadata) = self.packed_tables();
         crate::kernels::forward_packed(xyz, tables, metadata, features, active)
     }
@@ -745,6 +807,7 @@ impl Field {
             self.active.min(14),
             cache,
             self.local_hash,
+            self.corner_parallel,
         )
     }
 
@@ -896,6 +959,7 @@ impl Field {
                     active_levels,
                     self.local_hash,
                     self.compact_gradients,
+                    self.corner_parallel,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
                 (dh, None, dw1.sum_dim(0))

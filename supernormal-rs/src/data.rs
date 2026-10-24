@@ -25,6 +25,11 @@ pub struct View {
     pub origin: Vector3<f32>,
     pub rotation: Matrix3<f32>,
     pub inv_k: Matrix3<f32>,
+    /// Precomputed world-space ray directions `[height * width]` and analytical
+    /// inverse basis rows `[height * width]` so per-step patch sampling becomes
+    /// a zero-compute table lookup.
+    pub cached_dirs: Vec<[f32; 3]>,
+    pub cached_inverses: Vec<[[f32; 3]; 3]>,
 }
 
 pub struct Dataset {
@@ -91,6 +96,7 @@ impl Dataset {
             let r1 = temp / k11;
             let rotation = Matrix3::from_columns(&[r1, r2, r3]);
             let k = Matrix3::new(k11, k12, k13, 0., k22, k23, 0., 0., k33) / k33;
+            let inv_k = k.try_inverse().context("singular intrinsics")?;
 
             let normal = image::open(&file)?.to_rgb32f();
             let (w, h) = normal.dimensions();
@@ -112,14 +118,57 @@ impl Dataset {
                     }
                 })
                 .collect();
+
+            let width = w as usize;
+            let height = h as usize;
+            let u_col = rotation.column(0).into_owned();
+            let v_col = rotation.column(1).into_owned();
+            let w_col = u_col.cross(&v_col);
+            let (cached_dirs, cached_inverses): (Vec<[f32; 3]>, Vec<[[f32; 3]; 3]>) = (0..width
+                * height)
+                .into_par_iter()
+                .map(|idx| {
+                    let xx = idx % width;
+                    let yy = idx / width;
+                    let dir =
+                        rotation * (inv_k * Vector3::new(xx as f32, yy as f32, 1.)).normalize();
+                    // Analytical inverse of [dir^T; u^T; v^T] using orthonormal camera axes (u, v, w = u x v):
+                    // det = dir . w; col0 = w / det, col1 = (v x dir) / det, col2 = (dir x u) / det.
+                    let det = dir.dot(&w_col);
+                    let inv = if det.abs() > 1e-12 {
+                        let inv_det = 1.0 / det;
+                        let c0 = w_col * inv_det;
+                        let c1 = v_col.cross(&dir) * inv_det;
+                        let c2 = dir.cross(&u_col) * inv_det;
+                        [
+                            [c0[0], c1[0], c2[0]],
+                            [c0[1], c1[1], c2[1]],
+                            [c0[2], c1[2], c2[2]],
+                        ]
+                    } else {
+                        let basis = Matrix3::from_rows(&[
+                            dir.transpose(),
+                            u_col.transpose(),
+                            v_col.transpose(),
+                        ]);
+                        let m = basis.try_inverse().unwrap();
+                        std::array::from_fn(|r| std::array::from_fn(|c| m[(r, c)]))
+                    };
+                    let dir_arr: [f32; 3] = dir.into();
+                    (dir_arr, inv)
+                })
+                .unzip::<[f32; 3], [[f32; 3]; 3], Vec<[f32; 3]>, Vec<[[f32; 3]; 3]>>();
+
             views.push(View {
-                width: w as usize,
-                height: h as usize,
+                width,
+                height,
                 normals,
                 mask: masks,
                 origin,
                 rotation,
-                inv_k: k.try_inverse().context("singular intrinsics")?,
+                inv_k,
+                cached_dirs,
+                cached_inverses,
             });
         }
         Ok(Self {
@@ -131,7 +180,7 @@ impl Dataset {
 
     pub fn random_patches(&self, count: usize, rng: &mut impl Rng) -> Vec<Patch> {
         // Draw random coordinates sequentially to preserve exact deterministic RNG state,
-        // then compute patch ray bases and 3x3 inversions in parallel across CPU cores.
+        // then gather precomputed patch ray bases and 3x3 inversions in parallel.
         let coords: Vec<(usize, usize, usize)> = (0..count)
             .map(|_| {
                 let v = rng.random_range(0..self.views.len());
@@ -166,22 +215,11 @@ impl View {
                 let i = py * 3 + px;
                 let xx = x + px - 1;
                 let yy = y + py - 1;
-                let dir = self.rotation
-                    * (self.inv_k * Vector3::new(xx as f32, yy as f32, 1.)).normalize();
-                let basis = Matrix3::from_rows(&[
-                    dir.transpose(),
-                    self.rotation.column(0).transpose(),
-                    self.rotation.column(1).transpose(),
-                ]);
-                let inv = basis.try_inverse().unwrap();
-                patch.dirs[i] = dir.into();
-                patch.inverse[i] = std::array::from_fn(|r| std::array::from_fn(|c| inv[(r, c)]));
-                patch.normals[i] = self.normals[yy * self.width + xx].map(half::f16::to_f32);
-                patch.mask[i] = if self.mask[yy * self.width + xx] {
-                    1.
-                } else {
-                    0.
-                };
+                let idx = yy * self.width + xx;
+                patch.dirs[i] = self.cached_dirs[idx];
+                patch.inverse[i] = self.cached_inverses[idx];
+                patch.normals[i] = self.normals[idx].map(half::f16::to_f32);
+                patch.mask[i] = if self.mask[idx] { 1. } else { 0. };
             }
         }
         patch

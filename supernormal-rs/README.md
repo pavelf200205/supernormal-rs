@@ -270,3 +270,28 @@ first with neither flag, then with each flag separately and both flags together.
 Use short early- and late-stage runs, discount shader compilation/warm-up, and
 check losses as well as throughput. No builds, tests, or runtime measurements
 were run for this update.
+
+
+### 256-thread corner-parallel hash kernels and device-resident visibility/geometry pipeline (Update 3)
+
+Four bottlenecks previously capped board power around 85 W / 170 W TDP and caused iteration rate to fall from ~45 it/s at step 2,000 down to ~12 it/s at step 30,000:
+
+1. **78% idle threads during hash-grid evaluation and backward scatter**: In the 256-thread fused workgroup (`4` points × `64` lanes), the hash stage assigned one thread per `(point_slot, level)` (`<= 56` active threads) to loop sequentially over all `8` trilinear cube corners while `200+` threads waited at `sync_cube()`.
+   - `fused_field_kernel` and `field_backward_kernel` / `field_backward_native_kernel` now map `256` threads across `(point_slot in 0..4, corner_pair in 0..4, level in 0..16)`. Up to `224` threads (`87.5%` of the workgroup) concurrently issue `2` corner lookups or atomic scatter-adds each (`448` corners in flight per workgroup, 4× higher memory-level parallelism to hide L2/DRAM latency across the 14 hash levels), reducing partial corner pairs in shared memory before `sync_cube()`.
+   - In backward, `exp(min(scaled, 20.0))` is evaluated once per neuron activation and reused for both the sigmoid derivative and softplus reconstruction, cutting transcendental SFU instructions per point in half.
+   - Pass `--legacy-corner-loop` to restore the 56-thread sequential 8-corner loop for A/B comparison.
+
+2. **Elimination of host sample readbacks and CPU index-table uploads between march, visibility, and compositing**:
+   - `march_kernel` now counts both marched samples and deduplicated center-ray endpoints per ray in a single `[patches, 2]` prefix sum.
+   - `compact_and_center_endpoints_kernel` compacts marched samples while simultaneously materializing deduplicated 3D center-ray points, endpoint index pairs, and per-ray ranges on the GPU.
+   - `visibility_kernel` outputs both visible sample counts and retained unique endpoint counts per ray (`[patches + 1, 2]`), reading back only a single 3-float metadata slice (`total_visible`, `total_visible_endpoints`, and `variance`) for the default full-batch configuration.
+   - `build_visible_geometry_tables_kernel` builds `endpoints`, `descriptors`, forward `mapping` (`[vis_count, 18]`), and `reverse` occurrence tables (`[ep_count * 9, 2]`) directly on the GPU without atomics or host transfers, and `composite_kernel` reads per-patch sample ranges directly from the device-resident `vis_prefix` tensor.
+   - Pass `--host-sample-compaction` to restore the host sample readback and CPU index-table construction path for A/B comparison.
+
+3. **Elimination of redundant `Tensor::zeros` buffer-fill dispatches**:
+   - Write-only output buffers in `fused_field`, `field_backward`, `parameter_gradients`, `composite_gpu`, `geometry`, `march`, `compact`, `occupancy`, and `visibility` now use uninitialized `Tensor::empty` allocations instead of `Tensor::zeros`, removing ~10 redundant zero-fill kernel dispatches and tens of megabytes of wasted DRAM writes per step.
+
+4. **Precomputed camera ray directions and analytical 3×3 basis inversions (`src/data.rs`)**:
+   - `Dataset::load` precomputes world-space ray directions and closed-form orthonormal cross-product basis inverses for every pixel once on startup, turning `View::patch` (`18,432` rays per step) into a direct table lookup with zero per-step matrix inversions or ray normalizations.
+
+See `OPTIMIZATIONS.md` for a detailed technical breakdown and A/B benchmarking instructions.

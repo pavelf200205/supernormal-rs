@@ -109,7 +109,7 @@ impl Occupancy {
                 tensor(heads, [n, 1], &field.device),
                 tensor(next, [ids.len(), 1], &field.device),
                 old,
-                Tensor::zeros([n, 1], &field.device),
+                Tensor::empty([n, 1], &field.device),
             ]);
             let threshold = values.clone().mean().clamp_max(0.1).reshape([1, 1]);
             let flags = values.clone().greater(threshold).float();
@@ -146,6 +146,31 @@ pub struct Sample {
     pub patch: usize,
     pub start: f32,
     pub end: f32,
+}
+
+/// Device-resident visible sample batch produced by `march_and_filter_device`,
+/// keeping marched/visible sample compaction, endpoint deduplication, geometry
+/// calculation, mapping `[count, 18]`, and reverse occurrence tables `[n, 2]`
+/// entirely on the GPU without downloading or re-uploading sample arrays.
+pub struct DeviceVisibleBatch {
+    pub marched: burn::tensor::Tensor<2>,
+    pub march_prefix: burn::tensor::Tensor<2>,
+    pub vis_prefix: burn::tensor::Tensor<2>,
+    pub vis_prefix_host: Vec<usize>,
+    pub vis_ep_prefix_host: Vec<usize>,
+    pub total_visible: usize,
+    pub total_visible_endpoints: usize,
+}
+
+pub struct DevicePreparedGeometry {
+    pub unique_points: burn::tensor::Tensor<2>,
+    pub geometry: burn::tensor::Tensor<2>,
+    pub mapping: burn::tensor::Tensor<2>,
+    pub reverse: burn::tensor::Tensor<2>,
+    pub vis_prefix: burn::tensor::Tensor<2>,
+    pub patch_start: usize,
+    pub s_base: usize,
+    pub visible_count: usize,
 }
 
 pub fn sigmoid(x: f32) -> f32 {
@@ -1272,10 +1297,77 @@ pub fn composite_device(
         geometry,
         tensor(mapping, [count, 18], &device),
         tensor(packed, [patches.len(), 123], &device),
-        Tensor::zeros([count, 90], &device),
-        Tensor::zeros([n, 1], &device),
-        Tensor::zeros([patches.len() * 9, 5], &device),
+        Tensor::empty([1, 2], &device),
+        Tensor::empty([count, 90], &device),
+        Tensor::empty([n, 1], &device),
+        Tensor::empty([patches.len() * 9, 5], &device),
         tensor(reverse, [n, 2], &device),
+    ]);
+    let stats = stats.sum_dim(0);
+    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
+        10. * inv
+    } else {
+        0.
+    };
+    let stats = stats * tensor(vec![1., 1., 1., vscale, 1.], [1, 5], &device);
+    (adjoints, stats)
+}
+
+/// Fully device-resident compositor variant: consumes GPU-built `geometry`,
+/// `mapping`, and `reverse` tables without uploading index or reverse arrays
+/// from the CPU.
+pub fn composite_device_tables(
+    patches: &[Patch],
+    patch_start: usize,
+    s_base: usize,
+    visible_count: usize,
+    vis_prefix: burn::tensor::Tensor<2>,
+    geometry: burn::tensor::Tensor<2>,
+    mapping: burn::tensor::Tensor<2>,
+    reverse: burn::tensor::Tensor<2>,
+    sdf: burn::tensor::Tensor<2>,
+    variance: f32,
+    normal_den: f32,
+    pixel_den: f32,
+    sample_den: f32,
+) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
+    use crate::field::tensor;
+    use burn::tensor::Tensor;
+    let device = sdf.device();
+    let n = sdf.dims()[0];
+    assert!(
+        n < (1 << 24),
+        "compositor index exceeds exact f32 integer range"
+    );
+    let mut packed = Vec::with_capacity(patches.len() * 123);
+    let inv = (variance * 10.).exp().clamp(1e-6, 1e6);
+    for (pi, p) in patches.iter().enumerate() {
+        let g_ray = patch_start + pi;
+        packed.extend([
+            -(g_ray as f32) - 1.0_f32,
+            s_base as f32,
+            inv,
+            normal_den,
+            pixel_den,
+            sample_den,
+        ]);
+        for i in 0..9 {
+            packed.extend(p.inverse[i].iter().flatten().copied());
+            packed.extend(p.normals[i]);
+            packed.push(p.mask[i]);
+        }
+    }
+    let count = visible_count.max(1);
+    let [adjoints, stats] = crate::kernels::composite_gpu([
+        sdf,
+        geometry,
+        mapping,
+        tensor(packed, [patches.len(), 123], &device),
+        vis_prefix,
+        Tensor::empty([count, 90], &device),
+        Tensor::empty([n, 1], &device),
+        Tensor::empty([patches.len() * 9, 5], &device),
+        reverse,
     ]);
     let stats = stats.sum_dim(0);
     let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
@@ -1289,7 +1381,7 @@ pub fn composite_device(
 
 /// March into bounded per-ray storage, then compact in stable order on the GPU.
 /// A scalar total determines the final allocation; existing geometry preparation
-/// still consumes the compact samples on the host.
+/// still consumes the compact samples on the host when legacy CPU visibility is used.
 pub fn march_device(
     patches: &[Patch],
     occ: &mut Occupancy,
@@ -1354,8 +1446,8 @@ pub fn march_device(
     let [samples, counts] = crate::sampling_gpu::march([
         rays.clone(),
         flags,
-        Tensor::zeros([capacity, 2], device),
-        Tensor::zeros([patches.len(), 1], device),
+        Tensor::empty([capacity, 2], device),
+        Tensor::empty([patches.len(), 1], device),
     ]);
     let prefix = counts.cumsum(0);
     let total = prefix
@@ -1367,7 +1459,7 @@ pub fn march_device(
         return Ok(Vec::new());
     }
     let [packed] =
-        crate::sampling_gpu::compact([rays, samples, prefix, Tensor::zeros([total, 3], device)]);
+        crate::sampling_gpu::compact([rays, samples, prefix, Tensor::empty([total, 3], device)]);
     let packed = packed.try_into_vec_as::<f32>()?;
     Ok(packed
         .chunks_exact(3)
@@ -1377,6 +1469,240 @@ pub fn march_device(
             end: s[2],
         })
         .collect())
+}
+
+/// Device-resident ray marching + visibility filtering: keeps marched samples,
+/// center-ray endpoint deduplication, SDF evaluation, and visibility compaction
+/// entirely on the GPU without downloading or re-uploading sample arrays.
+pub fn march_and_filter_device(
+    field: &mut Field,
+    patches: &[Patch],
+    occ: &mut Occupancy,
+    step_size: f32,
+    query: usize,
+    group_size: usize,
+    rng: &mut impl Rng,
+) -> Result<(DeviceVisibleBatch, f64, f64)> {
+    use crate::field::tensor;
+    use burn::tensor::Tensor;
+    let march_started = std::time::Instant::now();
+    let device = &field.device;
+    let n_patches = patches.len();
+    let mut rays = Vec::with_capacity(n_patches * 12);
+    let mut capacity = 0usize;
+    for patch in patches {
+        let d = patch.dirs[4];
+        let o = patch.origin;
+        let a = dot(d, d);
+        let b = 2. * dot(o, d);
+        let c = dot(o, o) - 1.;
+        let disc = b * b - 4. * a * c;
+        let (near, far, count) = if disc > 0. {
+            let near = (-b - disc.sqrt()) / (2. * a) + rng.random::<f32>() * step_size;
+            let far = (-b + disc.sqrt()) / (2. * a);
+            (
+                near,
+                far,
+                ((far - near) / step_size).ceil().max(0.) as usize,
+            )
+        } else {
+            (0., 0., 0)
+        };
+        rays.extend(o);
+        rays.extend(d);
+        rays.extend([
+            near,
+            far,
+            step_size,
+            capacity as f32,
+            count as f32,
+            occ.resolution as f32,
+        ]);
+        capacity = capacity
+            .checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
+    }
+    anyhow::ensure!(
+        capacity < (1 << 24),
+        "march batch exceeds exact index range; reduce batch size"
+    );
+    if capacity == 0 {
+        anyhow::bail!("empty march capacity");
+    }
+    let flags = occ
+        .device_flags
+        .get_or_insert_with(|| {
+            tensor(
+                occ.flags.iter().map(|&v| if v { 1. } else { 0. }).collect(),
+                [occ.flags.len(), 1],
+                device,
+            )
+        })
+        .clone();
+    let rays = tensor(rays, [n_patches, 12], device);
+    let [samples, counts] = crate::sampling_gpu::march([
+        rays.clone(),
+        flags,
+        Tensor::empty([capacity, 2], device),
+        Tensor::empty([n_patches, 2], device),
+    ]);
+    let march_prefix = counts.cumsum(0);
+    let tail_totals = march_prefix
+        .clone()
+        .slice([n_patches - 1..n_patches, 0..2])
+        .try_into_vec_as::<f32>()?;
+    let total_marched = tail_totals[0] as usize;
+    let unique_ep_count = tail_totals[1] as usize;
+    anyhow::ensure!(total_marched <= capacity, "invalid compacted sample count");
+    if total_marched == 0 {
+        return Ok((
+            DeviceVisibleBatch {
+                marched: Tensor::empty([1, 3], device),
+                march_prefix,
+                vis_prefix: Tensor::zeros([n_patches, 2], device),
+                vis_prefix_host: vec![0; n_patches],
+                vis_ep_prefix_host: vec![0; n_patches],
+                total_visible: 0,
+                total_visible_endpoints: 0,
+            },
+            march_started.elapsed().as_secs_f64(),
+            0.0,
+        ));
+    }
+    anyhow::ensure!(
+        unique_ep_count < (1 << 24) && total_marched < (1 << 24),
+        "visibility indices exceed f32 range"
+    );
+    let [marched, unique_pts, pairs, ranges] = crate::sampling_gpu::compact_and_center_endpoints(
+        rays,
+        samples,
+        march_prefix.clone(),
+        total_marched,
+        unique_ep_count,
+    );
+    let march_seconds = march_started.elapsed().as_secs_f64();
+
+    let vis_started = std::time::Instant::now();
+    let vis_out = field.visibility_device(unique_pts, pairs, ranges, query);
+    let vis_counts = vis_out.clone().slice([0..n_patches, 0..2]);
+    let vis_prefix = vis_counts.cumsum(0);
+    let var_row = vis_out.slice([n_patches..n_patches + 1, 0..2]);
+
+    let (vis_prefix_host, vis_ep_prefix_host, total_visible, total_visible_endpoints) =
+        if group_size >= n_patches {
+            let tail = vis_prefix
+                .clone()
+                .slice([n_patches - 1..n_patches, 0..2]);
+            let meta = Tensor::cat(vec![tail, var_row], 0).try_into_vec_as::<f32>()?;
+            let tot_s = meta[0] as usize;
+            let tot_ep = meta[1] as usize;
+            field.variance_host = meta[2];
+            (vec![], vec![], tot_s, tot_ep)
+        } else {
+            let meta = Tensor::cat(vec![vis_prefix.clone(), var_row], 0).try_into_vec_as::<f32>()?;
+            field.variance_host = meta[n_patches * 2];
+            let mut s_host = Vec::with_capacity(n_patches);
+            let mut ep_host = Vec::with_capacity(n_patches);
+            for p in 0..n_patches {
+                s_host.push(meta[p * 2] as usize);
+                ep_host.push(meta[p * 2 + 1] as usize);
+            }
+            let tot_s = *s_host.last().unwrap_or(&0);
+            let tot_ep = *ep_host.last().unwrap_or(&0);
+            (s_host, ep_host, tot_s, tot_ep)
+        };
+    let vis_seconds = vis_started.elapsed().as_secs_f64();
+    Ok((
+        DeviceVisibleBatch {
+            marched,
+            march_prefix,
+            vis_prefix,
+            vis_prefix_host,
+            vis_ep_prefix_host,
+            total_visible,
+            total_visible_endpoints,
+        },
+        march_seconds,
+        vis_seconds,
+    ))
+}
+
+/// Prepare 3D points, finite-difference geometry, forward mapping, and reverse
+/// occurrence tables directly on the GPU for a slice of patches `[start..end]`
+/// with ZERO additional GPU-to-CPU readbacks.
+pub fn prepare_geometry_from_device_batch(
+    patches: &[Patch],
+    vis_batch: &DeviceVisibleBatch,
+    start: usize,
+    end: usize,
+    device: &burn::tensor::Device,
+) -> Option<DevicePreparedGeometry> {
+    use crate::field::tensor;
+    use burn::tensor::Tensor;
+    let sub_patches = &patches[start..end];
+    let (s_begin, s_end, ep_begin, ep_end) = if start == 0 && end == patches.len() {
+        (0, vis_batch.total_visible, 0, vis_batch.total_visible_endpoints)
+    } else {
+        let sb = if start == 0 {
+            0
+        } else {
+            vis_batch.vis_prefix_host[start - 1]
+        };
+        let se = vis_batch.vis_prefix_host[end - 1];
+        let eb = if start == 0 {
+            0
+        } else {
+            vis_batch.vis_ep_prefix_host[start - 1]
+        };
+        let ee = vis_batch.vis_ep_prefix_host[end - 1];
+        (sb, se, eb, ee)
+    };
+    let vis_count = s_end - s_begin;
+    let ep_count = ep_end - ep_begin;
+    if vis_count == 0 || ep_count == 0 {
+        return None;
+    }
+    assert!(
+        ep_count * 9 < (1 << 24) && vis_count * 18 < (1 << 24),
+        "geometry index exceeds exact f32 range"
+    );
+    let [endpoints, descriptors, mapping, reverse] =
+        crate::sampling_gpu::build_visible_geometry_tables(
+            vis_batch.marched.clone(),
+            vis_batch.march_prefix.clone(),
+            vis_batch.vis_prefix.clone(),
+            start,
+            sub_patches.len(),
+            s_begin,
+            ep_begin,
+            vis_count,
+            ep_count,
+        );
+
+    let mut rays = Vec::with_capacity(sub_patches.len() * 39);
+    for p in sub_patches {
+        rays.extend(p.origin);
+        rays.extend(p.dirs.iter().flatten().copied());
+        let center = dot(p.dirs[4], p.plane);
+        rays.extend(p.dirs.iter().map(|&d| center / dot(d, p.plane)));
+    }
+    let [unique_points, geometry] = crate::sampling_gpu::geometry([
+        tensor(rays, [sub_patches.len(), 39], device),
+        endpoints,
+        descriptors,
+        Tensor::empty([ep_count * 9, 3], device),
+        Tensor::empty([vis_count, 27], device),
+    ]);
+    Some(DevicePreparedGeometry {
+        unique_points,
+        geometry,
+        mapping,
+        reverse,
+        vis_prefix: vis_batch.vis_prefix.clone(),
+        patch_start: start,
+        s_base: s_begin,
+        visible_count: vis_count,
+    })
 }
 
 /// Upload compact endpoint descriptors instead of 18 expanded XYZs and 27
@@ -1433,8 +1759,8 @@ pub fn prepare_geometry_device(
         tensor(rays, [patches.len(), 39], device),
         tensor(endpoints, [count, 2], device),
         tensor(descriptors, [samples.len(), 5], device),
-        Tensor::zeros([count * 9, 3], device),
-        Tensor::zeros([samples.len(), 27], device),
+        Tensor::empty([count * 9, 3], device),
+        Tensor::empty([samples.len(), 27], device),
     ]);
     (points, indices, geometry)
 }

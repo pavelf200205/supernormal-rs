@@ -66,6 +66,14 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_gradient_tiles: bool,
+    /// Restore 56-thread sequential-corner hash forward/backward instead of 256-thread corner parallelism.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_corner_loop: bool,
+    /// Restore host sample readbacks between march, visibility, and geometry preparation.
+    #[arg(long)]
+    #[serde(default)]
+    pub host_sample_compaction: bool,
     #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
@@ -103,19 +111,52 @@ struct PreparedBatch {
     indices: Vec<usize>,
     unique_count: usize,
     geometry: Option<burn::tensor::Tensor<2>>,
-    pending: crate::field::PendingEvaluation,
+    device_tables: Option<render::DevicePreparedGeometry>,
+    pending: Option<crate::field::PendingEvaluation>,
 }
 
 fn prepare_batch(
     field: &Field,
     patches: &[crate::data::Patch],
     samples: &[render::Sample],
+    device_vis: Option<&render::DeviceVisibleBatch>,
     start: usize,
     size: usize,
     query: usize,
     cpu_composite: bool,
 ) -> PreparedBatch {
     let end = (start + size).min(patches.len());
+    if let Some(vis_batch) = device_vis {
+        if let Some(prep) =
+            render::prepare_geometry_from_device_batch(patches, vis_batch, start, end, &field.device)
+        {
+            let count = prep.unique_points.dims()[0];
+            let pending = field.enqueue_cached_device(prep.unique_points.clone(), query);
+            return PreparedBatch {
+                start,
+                end,
+                samples: Vec::new(),
+                points: Vec::new(),
+                indices: Vec::new(),
+                unique_count: count,
+                geometry: None,
+                device_tables: Some(prep),
+                pending: Some(pending),
+            };
+        } else {
+            return PreparedBatch {
+                start,
+                end,
+                samples: Vec::new(),
+                points: Vec::new(),
+                indices: Vec::new(),
+                unique_count: 0,
+                geometry: None,
+                device_tables: None,
+                pending: None,
+            };
+        }
+    }
     let first = samples.partition_point(|s| s.patch < start);
     let last = samples.partition_point(|s| s.patch < end);
     let samples: Vec<_> = samples[first..last]
@@ -131,13 +172,13 @@ fn prepare_batch(
         let (points, unique, indices) =
             render::sample_and_dedup_points(&patches[start..end], &samples);
         let pending = field.enqueue_cached(&unique, query);
-        (points, indices, unique.len(), None, pending)
+        (points, indices, unique.len(), None, Some(pending))
     } else {
         let (unique, indices, geometry) =
             render::prepare_geometry_device(&patches[start..end], &samples, &field.device);
         let count = unique.dims()[0];
         let pending = field.enqueue_cached_device(unique, query);
-        (Vec::new(), indices, count, Some(geometry), pending)
+        (Vec::new(), indices, count, Some(geometry), Some(pending))
     };
     PreparedBatch {
         start,
@@ -147,6 +188,7 @@ fn prepare_batch(
         indices,
         unique_count,
         geometry,
+        device_tables: None,
         pending,
     }
 }
@@ -191,6 +233,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.local_hash = !args.legacy_hash_layout;
     field.compact_gradients = !args.legacy_output_gradients;
     field.wide_gradient_tiles = !args.legacy_gradient_tiles;
+    field.corner_parallel = !args.legacy_corner_loop;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
     let mut restored_state = false;
@@ -244,19 +287,48 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         field.active = (step / 2000 + 1).min(14);
         let patches = dataset.random_patches(args.batch, &mut rng);
         let step_size = 10f32.powf(-2. - step as f32 / args.end_iter as f32);
-        let march_started = std::time::Instant::now();
-        let marched = if args.cpu_march {
-            render::march(&patches, &occ, step_size, &mut rng)
+
+        let group_size = if args.pipeline_patches == 0 {
+            args.microbatch
         } else {
-            render::march_device(&patches, &mut occ, step_size, &mut rng, &field.device)?
+            args.microbatch.min(args.pipeline_patches)
         };
-        let march_seconds = march_started.elapsed().as_secs_f64();
-        let visible_started = std::time::Instant::now();
-        // Previous backward/Adam kernels run while we prepare patches and rays.
-        // Visibility reads its SDFs and the updated variance in one transfer.
-        let samples = render::visible(&mut field, &patches, marched, args.query)?;
-        let visibility_seconds = visible_started.elapsed().as_secs_f64();
-        if samples.is_empty() {
+        let use_device_pipeline = !args.cpu_march
+            && !args.cpu_visibility
+            && !args.cpu_composite
+            && !args.host_sample_compaction;
+
+        let (samples, device_vis, visible_count, march_seconds, visibility_seconds) =
+            if use_device_pipeline {
+                let (vis_batch, m_sec, v_sec) = render::march_and_filter_device(
+                    &mut field,
+                    &patches,
+                    &mut occ,
+                    step_size,
+                    args.query,
+                    group_size,
+                    &mut rng,
+                )?;
+                let count = vis_batch.total_visible;
+                (Vec::new(), Some(vis_batch), count, m_sec, v_sec)
+            } else {
+                let march_started = std::time::Instant::now();
+                let marched = if args.cpu_march {
+                    render::march(&patches, &occ, step_size, &mut rng)
+                } else {
+                    render::march_device(&patches, &mut occ, step_size, &mut rng, &field.device)?
+                };
+                let m_sec = march_started.elapsed().as_secs_f64();
+                let visible_started = std::time::Instant::now();
+                // Previous backward/Adam kernels run while we prepare patches and rays.
+                // Visibility reads its SDFs and the updated variance in one transfer.
+                let samples = render::visible(&mut field, &patches, marched, args.query)?;
+                let v_sec = visible_started.elapsed().as_secs_f64();
+                let count = samples.len();
+                (samples, None, count, m_sec, v_sec)
+            };
+
+        if visible_count == 0 {
             anyhow::bail!(
                 "empty occupancy batch at step {step}; checkpoint/config requires investigation"
             );
@@ -264,7 +336,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let normal_den = patches.iter().flat_map(|p| p.mask).sum::<f32>() + 1e-5;
         let sampling_seconds = started.elapsed().as_secs_f64() - occupancy_seconds;
         let pixel_den = (patches.len() * 9) as f32;
-        let sample_den = (samples.len() * 9) as f32;
+        let sample_den = (visible_count * 9) as f32;
 
         let mut gradients = crate::field::Gradients::default();
         let mut total = Loss::default();
@@ -277,16 +349,12 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let mut t_comp = 0.0;
         let mut t_bwd = 0.0;
 
-        let group_size = if args.pipeline_patches == 0 {
-            args.microbatch
-        } else {
-            args.microbatch.min(args.pipeline_patches)
-        };
         let t0 = std::time::Instant::now();
         let mut prepared = Some(prepare_batch(
             &field,
             &patches,
             &samples,
+            device_vis.as_ref(),
             0,
             group_size,
             args.query,
@@ -302,25 +370,61 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 indices,
                 unique_count,
                 geometry,
+                device_tables,
                 pending,
             } = batch;
             let pp = &patches[start..end];
             let t0 = std::time::Instant::now();
+            if !args.cpu_composite && unique_count == 0 {
+                if end < patches.len() {
+                    let tp = std::time::Instant::now();
+                    prepared = Some(prepare_batch(
+                        &field,
+                        &patches,
+                        &samples,
+                        device_vis.as_ref(),
+                        end,
+                        group_size,
+                        args.query,
+                        args.cpu_composite,
+                    ));
+                    t_points += tp.elapsed().as_secs_f64();
+                }
+                continue;
+            }
             if !args.cpu_composite && unique_count > 0 {
-                let (sdf, cache) = pending.into_device();
+                let (sdf, cache) = pending.expect("GPU pending evaluation").into_device();
                 t_eval += t0.elapsed().as_secs_f64();
                 let t1 = std::time::Instant::now();
-                let (adjoints, stats) = render::composite_device(
-                    pp,
-                    &local,
-                    geometry.expect("GPU geometry"),
-                    &indices,
-                    sdf,
-                    variance,
-                    normal_den,
-                    pixel_den,
-                    sample_den,
-                );
+                let (adjoints, stats) = if let Some(tables) = device_tables {
+                    render::composite_device_tables(
+                        pp,
+                        tables.patch_start,
+                        tables.s_base,
+                        tables.visible_count,
+                        tables.vis_prefix,
+                        tables.geometry,
+                        tables.mapping,
+                        tables.reverse,
+                        sdf,
+                        variance,
+                        normal_den,
+                        pixel_den,
+                        sample_den,
+                    )
+                } else {
+                    render::composite_device(
+                        pp,
+                        &local,
+                        geometry.expect("GPU geometry"),
+                        &indices,
+                        sdf,
+                        variance,
+                        normal_den,
+                        pixel_den,
+                        sample_den,
+                    )
+                };
                 device_stats = Some(match device_stats {
                     Some(old) => old + stats,
                     None => stats,
@@ -336,19 +440,22 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 }
                 t_bwd += t2.elapsed().as_secs_f64();
                 if end < patches.len() {
+                    let tp = std::time::Instant::now();
                     prepared = Some(prepare_batch(
                         &field,
                         &patches,
                         &samples,
+                        device_vis.as_ref(),
                         end,
                         group_size,
                         args.query,
                         args.cpu_composite,
                     ));
+                    t_points += tp.elapsed().as_secs_f64();
                 }
                 continue;
             }
-            let (unique_sdf, cache) = pending.finish()?;
+            let (unique_sdf, cache) = pending.expect("CPU pending evaluation").finish()?;
             // Submit the next forward before CPU compositing. Only two groups'
             // activations are live, and all groups use the same model weights.
             if end < patches.len() && args.pipeline_patches > 0 {
@@ -356,6 +463,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     &field,
                     &patches,
                     &samples,
+                    device_vis.as_ref(),
                     end,
                     group_size,
                     args.query,
@@ -404,6 +512,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     &field,
                     &patches,
                     &samples,
+                    device_vis.as_ref(),
                     end,
                     group_size,
                     args.query,
@@ -497,7 +606,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             total.mask,
             total.eikonal,
             total.total(),
-            samples.len(),
+            visible_count,
             secs,
             field.active
         )?;
