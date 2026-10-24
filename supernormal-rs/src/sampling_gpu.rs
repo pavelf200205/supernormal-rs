@@ -8,7 +8,8 @@ use burn_cubecl::{
 use burn_fusion::{
     Fusion,
     custom::{
-        CustomOpIr, HandleContainer, Operation, OperationIr, OperationOutput, StreamId, TensorIr,
+        CustomOpIr, HandleContainer, Operation, OperationIr, OperationOutput, ScalarIr, StreamId,
+        TensorIr,
     },
 };
 use cubecl::prelude::*;
@@ -309,48 +310,62 @@ pub fn occupancy(inputs: [burn::tensor::Tensor<2>; 5]) -> [burn::tensor::Tensor<
     result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
-// 8x8 parameter tile, 32 samples staged at a time. The last feature column
-// is the bias, so one pass computes both dW and db. Partials avoid atomics.
+// Default: an 8x32 tile reuses each staged hidden derivative across all
+// features and bias, instead of loading it independently for four 8x8 tiles.
+// Keep the original 8x8 layout available for independent A/B comparisons.
 #[cube(launch)]
-fn parameter_kernel(dh: &Tensor<f32>, features: &Tensor<f32>, partials: &mut Tensor<f32>) {
+fn parameter_kernel(
+    dh: &Tensor<f32>,
+    features: &Tensor<f32>,
+    partials: &mut Tensor<f32>,
+    #[comptime] tile_cols: usize,
+) {
     let unit = usize::cast_from(UNIT_POS);
     let tile = usize::cast_from(CUBE_POS_X);
     let part = usize::cast_from(CUBE_POS_Y);
-    let row = unit / 8;
-    let col = unit % 8;
-    let row_base = (tile / 4) * 8;
-    let col_base = (tile % 4) * 8;
+    let units = 8 * tile_cols;
+    let row = unit / tile_cols;
+    let col = unit % tile_cols;
+    let tiles_per_row = 32 / tile_cols;
+    let row_base = (tile / tiles_per_row) * 8;
+    let col_base = (tile % tiles_per_row) * tile_cols;
     let mut hs = Shared::new_slice(256usize);
-    let mut xs = Shared::new_slice(256usize);
+    let mut xs = Shared::new_slice(32 * tile_cols);
     let mut sum = 0.0_f32;
     for block in 0..8usize {
         let sample_base = part * 256 + block * 32;
         for load in 0..4usize {
-            let index = unit + load * 64;
-            let sample = sample_base + index / 8;
-            let channel = index % 8;
-            let mut h = 0.0_f32;
+            let index = unit + load * units;
+            if index < 256 {
+                let sample = sample_base + index / 8;
+                let channel = index % 8;
+                let mut h = 0.0_f32;
+                if sample < dh.shape(0) {
+                    h = dh[sample * dh.stride(0) + (row_base + channel) * dh.stride(1)];
+                }
+                hs[index] = h;
+            }
+            let sample = sample_base + index / tile_cols;
+            let feature = col_base + index % tile_cols;
             let mut x = 0.0_f32;
             if sample < dh.shape(0) {
-                h = dh[sample * dh.stride(0) + (row_base + channel) * dh.stride(1)];
-                let feature = col_base + channel;
                 if feature == 31 {
                     x = 1.0_f32;
                 } else {
                     x = features[sample * features.stride(0) + feature * features.stride(1)];
                 }
             }
-            hs[index] = h;
             xs[index] = x;
         }
         sync_cube();
         for j in 0..32usize {
-            sum += hs[j * 8 + row] * xs[j * 8 + col];
+            sum += hs[j * 8 + row] * xs[j * tile_cols + col];
         }
         sync_cube();
     }
     partials[part * 2048 + (row_base + row) * 32 + col_base + col] = sum;
 }
+
 #[derive(Debug)]
 struct ParameterOp {
     desc: CustomOpIr,
@@ -362,15 +377,20 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
     ) -> Result<(), ExecutionError> {
         let ([h, f, p], [out]) = self.desc.as_fixed();
         let [h, f, p] = [h, f, p].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [ScalarIr::UInt(wide)] = self.desc.scalars.as_slice() else {
+            panic!("invalid parameter-gradient arguments")
+        };
+        let tile_cols = if *wide != 0 { 32usize } else { 8usize };
         let client = h.client.clone();
         let parts = h.meta.shape().dims::<2>()[0].div_ceil(256);
         parameter_kernel::launch(
             &client,
-            CubeCount::Static(32, parts as u32, 1),
-            CubeDim::new_1d(64),
+            CubeCount::Static((2048 / (8 * tile_cols)) as u32, parts as u32, 1),
+            CubeDim::new_1d((8 * tile_cols) as u32),
             h.into_tensor_arg(),
             f.into_tensor_arg(),
             p.clone().into_tensor_arg(),
+            tile_cols,
         );
         handles.register_float_tensor::<CubeBackend>(&out.id, p);
         Ok(())
@@ -379,6 +399,7 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
 pub fn parameter_gradients(
     dh: burn::tensor::Tensor<2>,
     features: burn::tensor::Tensor<2>,
+    wide: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use burn::tensor::Tensor;
     let parts = dh.dims()[0].div_ceil(256);
@@ -396,7 +417,7 @@ pub fn parameter_gradients(
         "supernormal_parameter_gradients",
         &inputs.map(|t| t.into_ir()),
         &[out],
-        vec![],
+        vec![ScalarIr::UInt(wide as u64)],
     );
     let [out] = client
         .register(

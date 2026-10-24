@@ -234,3 +234,39 @@ check losses/reconstruction quality. Floating-point atomic update order can
 differ, so bitwise equality is not expected. Test on both integrated and discrete
 GPUs before judging the default. No build, tests, or runtime measurements were
 performed for this change.
+
+
+### Backward memory traffic optimizations
+
+The fused backward kernels now reduce four points' output-weight gradients in
+shared memory before storing a partial row. Their global output-gradient buffer
+contains `ceil(query_points / 4)` rows instead of one row per point, reducing
+that buffer's allocation and write/read volume by approximately 75%. The final
+reduction still runs on the GPU. Shared storage grows by 1 KiB per workgroup;
+no extra workgroup barrier or global atomic is needed. Tail lanes contribute
+zero, and the rounded-up 2D dispatch is bounded before partial writes.
+
+First-layer parameter gradients default to 8x32 tiles (256 threads) instead of
+8x8 tiles (64 threads). Each tile handles all 31 features plus bias for eight
+neurons. It loads the hidden derivatives once for all feature columns, reducing
+explicit derivative loads by 4x, and reads wider contiguous feature spans.
+Feature-load count and the partial-output shape remain unchanged. Shared
+storage grows from 2 KiB to 5 KiB per tile, and fewer, larger workgroups may
+behave differently on different GPUs. This is not a claimed 4x kernel speedup.
+
+Comparison switches are independent:
+
+- `--legacy-output-gradients`: restore per-point output-weight gradient rows.
+- `--legacy-gradient-tiles`: restore 8x8 first-layer gradient tiles.
+
+Pass both switches to compare against the preceding locality update while
+retaining its improved hash layout. `--legacy-hash-layout` remains independent.
+The output-gradient optimization requires the fused field, and the wider tile
+optimization is bypassed by `--untiled-gradients`. Checkpoints and training
+schedules are unchanged; sum grouping changes floating-point rounding.
+
+Rebuild and compare the same checkpoint/settings in fresh output directories,
+first with neither flag, then with each flag separately and both flags together.
+Use short early- and late-stage runs, discount shader compilation/warm-up, and
+check losses as well as throughput. No builds, tests, or runtime measurements
+were run for this update.

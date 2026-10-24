@@ -40,6 +40,8 @@ pub struct Field {
     pub cpu_visibility: bool,
     pub tiled_gradients: bool,
     pub local_hash: bool,
+    pub compact_gradients: bool,
+    pub wide_gradient_tiles: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
 }
@@ -292,6 +294,8 @@ impl Field {
             cpu_visibility: false,
             tiled_gradients: true,
             local_hash: true,
+            compact_gradients: true,
+            wide_gradient_tiles: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         }
@@ -370,6 +374,8 @@ impl Field {
             cpu_visibility: false,
             tiled_gradients: true,
             local_hash: true,
+            compact_gradients: true,
+            wide_gradient_tiles: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         })
@@ -889,6 +895,7 @@ impl Field {
                     ],
                     active_levels,
                     self.local_hash,
+                    self.compact_gradients,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
                 (dh, None, dw1.sum_dim(0))
@@ -904,7 +911,7 @@ impl Field {
                 (dh, Some(df), dw1)
             };
             let (dw0_chunk, db0_chunk) = if self.tiled_gradients {
-                crate::sampling_gpu::parameter_gradients(dh, chunk.feat)
+                crate::sampling_gpu::parameter_gradients(dh, chunk.feat, self.wide_gradient_tiles)
             } else {
                 (dh.clone().transpose().matmul(chunk.feat), dh.sum_dim(0))
             };

@@ -58,6 +58,14 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_hash_layout: bool,
+    /// Restore per-point output-weight gradients instead of workgroup partials.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_output_gradients: bool,
+    /// Restore the original 8x8 first-layer gradient tiles.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_gradient_tiles: bool,
     #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
@@ -181,6 +189,8 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.cpu_visibility = args.cpu_visibility;
     field.tiled_gradients = !args.untiled_gradients;
     field.local_hash = !args.legacy_hash_layout;
+    field.compact_gradients = !args.legacy_output_gradients;
+    field.wide_gradient_tiles = !args.legacy_gradient_tiles;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
     let mut restored_state = false;

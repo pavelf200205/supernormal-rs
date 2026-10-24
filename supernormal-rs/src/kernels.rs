@@ -1481,6 +1481,7 @@ fn field_backward_kernel(
     table_grad: &Tensor<Atomic<u32>>,
     active: u32,
     #[comptime] local_hash: bool,
+    #[comptime] compact_gradients: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -1500,6 +1501,9 @@ fn field_backward_kernel(
     let slot = unit / 64;
     let point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + slot;
     let mut shared = Shared::new_slice(256usize);
+    // Only the compact variant needs a workgroup-local output-gradient tile.
+    let mut output_grads = Shared::new_slice(if compact_gradients { 256usize } else { 1usize });
+    let mut output_grad = 0.0_f32;
     let mut v = 0.0_f32;
     if point < pre.shape(0) {
         let h = pre[point * 64 + lane];
@@ -1513,11 +1517,26 @@ fn field_backward_kernel(
         dh[point * 64 + lane] = v;
         let soft = f32::ln(1.0_f32 + f32::exp(f32::min(scaled, 20.0_f32))) / 100.0_f32;
         let hidden = if scaled > 20.0_f32 { h } else { soft };
-        dw1[point * 64 + lane] = ds[point] * hidden;
+        output_grad = ds[point] * hidden;
+        if !compact_gradients {
+            dw1[point * 64 + lane] = output_grad;
+        }
     }
     let shared_index = if local_hash { lane * 4 + slot } else { unit };
     shared[shared_index] = v;
+    if compact_gradients {
+        output_grads[unit] = output_grad;
+    }
     sync_cube();
+    if compact_gradients && slot == 0 {
+        let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
+        if group < dw1.shape(0) {
+            // All tail lanes participate with zero contributions. No atomics
+            // and no subgroup-size assumptions; retain all 64 output weights.
+            dw1[group * 64 + lane] = (output_grads[lane] + output_grads[64 + lane])
+                + (output_grads[128 + lane] + output_grads[192 + lane]);
+        }
+    }
     let hash_slot = if local_hash { unit % 4 } else { slot };
     let level = if local_hash { unit / 4 } else { lane };
     let hash_point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + hash_slot;
@@ -1618,7 +1637,11 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([p, d, w, x, m, t, h, g], [ot, oh, og]) = self.desc.as_fixed();
-        let [ScalarIr::UInt(active), ScalarIr::UInt(local_hash)] = self.desc.scalars.as_slice()
+        let [
+            ScalarIr::UInt(active),
+            ScalarIr::UInt(local_hash),
+            ScalarIr::UInt(compact_gradients),
+        ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid backward scalars")
         };
@@ -1663,6 +1686,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 t.clone().into_tensor_arg(),
                 *active as u32,
                 *local_hash != 0,
+                *compact_gradients != 0,
             );
         } else {
             field_backward_kernel::launch(
@@ -1679,6 +1703,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 t.clone().into_tensor_arg(),
                 *active as u32,
                 *local_hash != 0,
+                *compact_gradients != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
@@ -1691,13 +1716,20 @@ pub fn field_backward(
     inputs: [burn::tensor::Tensor<2>; 6],
     active: usize,
     local_hash: bool,
+    compact_gradients: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     use burn::tensor::Tensor as BT;
     let n = inputs[0].dims()[0];
     let device = inputs[0].device();
     let inputs: Vec<_> = inputs
         .into_iter()
-        .chain([BT::zeros([n, 64], &device), BT::zeros([n, 64], &device)])
+        .chain([
+            BT::zeros([n, 64], &device),
+            BT::zeros(
+                [if compact_gradients { n.div_ceil(4) } else { n }, 64],
+                &device,
+            ),
+        ])
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
     let client = inputs[0].client.clone();
@@ -1712,6 +1744,7 @@ pub fn field_backward(
         vec![
             ScalarIr::UInt(active as u64),
             ScalarIr::UInt(local_hash as u64),
+            ScalarIr::UInt(compact_gradients as u64),
         ],
     );
     let result: [_; 3] = client
@@ -1870,6 +1903,7 @@ fn field_backward_native_kernel(
     table_grad: &Tensor<Atomic<f32>>,
     active: u32,
     #[comptime] local_hash: bool,
+    #[comptime] compact_gradients: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -1889,6 +1923,9 @@ fn field_backward_native_kernel(
     let slot = unit / 64;
     let point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + slot;
     let mut shared = Shared::new_slice(256usize);
+    // Only the compact variant needs a workgroup-local output-gradient tile.
+    let mut output_grads = Shared::new_slice(if compact_gradients { 256usize } else { 1usize });
+    let mut output_grad = 0.0_f32;
     let mut v = 0.0_f32;
     if point < pre.shape(0) {
         let h = pre[point * 64 + lane];
@@ -1902,11 +1939,26 @@ fn field_backward_native_kernel(
         dh[point * 64 + lane] = v;
         let soft = f32::ln(1.0_f32 + f32::exp(f32::min(scaled, 20.0_f32))) / 100.0_f32;
         let hidden = if scaled > 20.0_f32 { h } else { soft };
-        dw1[point * 64 + lane] = ds[point] * hidden;
+        output_grad = ds[point] * hidden;
+        if !compact_gradients {
+            dw1[point * 64 + lane] = output_grad;
+        }
     }
     let shared_index = if local_hash { lane * 4 + slot } else { unit };
     shared[shared_index] = v;
+    if compact_gradients {
+        output_grads[unit] = output_grad;
+    }
     sync_cube();
+    if compact_gradients && slot == 0 {
+        let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
+        if group < dw1.shape(0) {
+            // All tail lanes participate with zero contributions. No atomics
+            // and no subgroup-size assumptions; retain all 64 output weights.
+            dw1[group * 64 + lane] = (output_grads[lane] + output_grads[64 + lane])
+                + (output_grads[128 + lane] + output_grads[192 + lane]);
+        }
+    }
     let hash_slot = if local_hash { unit % 4 } else { slot };
     let level = if local_hash { unit / 4 } else { lane };
     let hash_point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + hash_slot;
