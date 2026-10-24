@@ -1023,10 +1023,19 @@ pub fn test_hash_grid_forward_parity(device: &burn::tensor::Device) -> anyhow::R
     Ok(())
 }
 
-// Four points per workgroup, 64 lanes per point. Hash levels run in parallel;
-// the same lanes then evaluate the 64 hidden neurons from shared features.
+// Four points per workgroup. Hash interpolation groups neighboring points by
+// level; the MLP uses 64 lanes per point. Shared features bridge the layouts.
 // Barriers are uniform, including the tail workgroup. No global feature/hidden
 // buffers are required for inference; training stores only backward's caches.
+#[cube]
+fn field_feature_index(slot: usize, feature: usize, #[comptime] local_hash: bool) -> usize {
+    if local_hash {
+        feature * 4 + slot
+    } else {
+        slot * 32 + feature
+    }
+}
+
 #[cube(launch)]
 fn fused_field_kernel(
     points: &Tensor<f32>,
@@ -1038,6 +1047,7 @@ fn fused_field_kernel(
     preactivation: &mut Tensor<f32>,
     active: u32,
     #[comptime] cache: bool,
+    #[comptime] local_hash: bool,
 ) {
     // CubeCL workgroup coordinates are u32; tensor/shared indices are usize.
     let unit = usize::cast_from(UNIT_POS);
@@ -1057,7 +1067,7 @@ fn fused_field_kernel(
     let mut shared_features = Shared::new_slice(128usize);
     let mut partials = Shared::new_slice(256usize);
     if lane < 32 {
-        shared_features[slot * 32 + lane] = 0.0_f32;
+        shared_features[field_feature_index(slot, lane, local_hash)] = 0.0_f32;
     }
     sync_cube();
     if valid {
@@ -1065,57 +1075,63 @@ fn fused_field_kernel(
         let p1 = points[point_idx * 3 + 1];
         let p2 = points[point_idx * 3 + 2];
         if lane == 0 {
-            shared_features[slot * 32] = p0;
-            shared_features[slot * 32 + 1] = p1;
-            shared_features[slot * 32 + 2] = p2;
+            shared_features[field_feature_index(slot, 0, local_hash)] = p0;
+            shared_features[field_feature_index(slot, 1, local_hash)] = p1;
+            shared_features[field_feature_index(slot, 2, local_hash)] = p2;
         }
+    }
+    // Neighboring lanes visit the same table for four nearby points. Keep
+    // the MLP's neuron-parallel layout separate from hash interpolation.
+    let hash_slot = if local_hash { unit % 4 } else { slot };
+    let level = if local_hash { unit / 4 } else { lane };
+    let hash_point = group * 4 + hash_slot;
+    if hash_point < points.shape(0) && level < usize::cast_from(active) {
+        let p0 = points[hash_point * 3];
+        let p1 = points[hash_point * 3 + 1];
+        let p2 = points[hash_point * 3 + 2];
         let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
         let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
         let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
-        if lane < usize::cast_from(active) {
-            let level = lane;
-            let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
-            let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
-            let c0 = norm0 * f32::cast_from(res);
-            let c1 = norm1 * f32::cast_from(res);
-            let c2 = norm2 * f32::cast_from(res);
-            let b0 = f32::floor(c0);
-            let b1 = f32::floor(c1);
-            let b2 = f32::floor(c2);
-            let w0 = c0 - b0;
-            let w1 = c1 - b1;
-            let w2 = c2 - b2;
-            let base0 = u32::cast_from(b0);
-            let base1 = u32::cast_from(b1);
-            let base2 = u32::cast_from(b2);
-            let r1 = res + 1;
-            let dense = r1 * r1 * r1 <= 524288;
-            let mut feat0 = 0.0_f32;
-            let mut feat1 = 0.0_f32;
-            for corner in 0..8u32 {
-                let bit0 = corner & 1;
-                let bit1 = (corner >> 1) & 1;
-                let bit2 = (corner >> 2) & 1;
-                let v0 = base0 + bit0;
-                let v1 = base1 + bit1;
-                let v2 = base2 + bit2;
-                let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
-                let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
-                let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
-                let weight = kw0 * kw1 * kw2;
-                let idx = if dense {
-                    v0 + v1 * r1 + v2 * r1 * r1
-                } else {
-                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
-                };
-                let entry = usize::cast_from(offset + idx) * 2;
-                feat0 += weight * tables[entry];
-                feat1 += weight * tables[entry + 1];
-            }
-            let col = slot * 32 + 3 + level * 2;
-            shared_features[col] = feat0;
-            shared_features[col + 1] = feat1;
+        let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+        let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+        let c0 = norm0 * f32::cast_from(res);
+        let c1 = norm1 * f32::cast_from(res);
+        let c2 = norm2 * f32::cast_from(res);
+        let b0 = f32::floor(c0);
+        let b1 = f32::floor(c1);
+        let b2 = f32::floor(c2);
+        let w0 = c0 - b0;
+        let w1 = c1 - b1;
+        let w2 = c2 - b2;
+        let base0 = u32::cast_from(b0);
+        let base1 = u32::cast_from(b1);
+        let base2 = u32::cast_from(b2);
+        let r1 = res + 1;
+        let dense = r1 * r1 * r1 <= 524288;
+        let mut feat0 = 0.0_f32;
+        let mut feat1 = 0.0_f32;
+        for corner in 0..8u32 {
+            let bit0 = corner & 1;
+            let bit1 = (corner >> 1) & 1;
+            let bit2 = (corner >> 2) & 1;
+            let v0 = base0 + bit0;
+            let v1 = base1 + bit1;
+            let v2 = base2 + bit2;
+            let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
+            let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
+            let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
+            let weight = kw0 * kw1 * kw2;
+            let idx = if dense {
+                v0 + v1 * r1 + v2 * r1 * r1
+            } else {
+                (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+            };
+            let entry = usize::cast_from(offset + idx) * 2;
+            feat0 += weight * tables[entry];
+            feat1 += weight * tables[entry + 1];
         }
+        shared_features[field_feature_index(hash_slot, 3 + level * 2, local_hash)] = feat0;
+        shared_features[field_feature_index(hash_slot, 4 + level * 2, local_hash)] = feat1;
     }
     sync_cube();
     let mut contribution = 0.0_f32;
@@ -1123,13 +1139,15 @@ fn fused_field_kernel(
         let mut h = 0.0_f32;
         // Packed input-major weights give adjacent lanes adjacent reads.
         for k in 0..(3 + usize::cast_from(active) * 2) {
-            h += shared_features[slot * 32 + k] * shared_weights[k * 64 + lane];
+            h += shared_features[field_feature_index(slot, k, local_hash)]
+                * shared_weights[k * 64 + lane];
         }
         h += shared_weights[1984 + lane];
         if cache {
             preactivation[point_idx * 64 + lane] = h;
             if lane < 31 {
-                features[point_idx * 31 + lane] = shared_features[slot * 32 + lane];
+                features[point_idx * 31 + lane] =
+                    shared_features[field_feature_index(slot, lane, local_hash)];
             }
         }
         let scaled = h * 100.;
@@ -1163,7 +1181,12 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([p, t, m, w, y, f, h], [oy, of, oh]) = self.desc.as_fixed();
-        let [ScalarIr::UInt(active), ScalarIr::UInt(cache)] = self.desc.scalars.as_slice() else {
+        let [
+            ScalarIr::UInt(active),
+            ScalarIr::UInt(cache),
+            ScalarIr::UInt(local_hash),
+        ] = self.desc.scalars.as_slice()
+        else {
             panic!("invalid fused field arguments")
         };
         let [points, tables, metadata, weights, output, features, hidden] =
@@ -1184,6 +1207,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             hidden.clone().into_tensor_arg(),
             *active as u32,
             *cache != 0,
+            *local_hash != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&oy.id, output);
         handles.register_float_tensor::<CubeBackend>(&of.id, features);
@@ -1196,6 +1220,7 @@ pub fn fused_field(
     inputs: [burn::tensor::Tensor<2>; 4],
     active: usize,
     cache: bool,
+    local_hash: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     let n = inputs[0].dims()[0];
     let device = inputs[0].device();
@@ -1218,7 +1243,11 @@ pub fn fused_field(
         "supernormal_fused_field",
         &inputs.into_iter().map(|t| t.into_ir()).collect::<Vec<_>>(),
         &outputs,
-        vec![ScalarIr::UInt(active as u64), ScalarIr::UInt(cache as u64)],
+        vec![
+            ScalarIr::UInt(active as u64),
+            ScalarIr::UInt(cache as u64),
+            ScalarIr::UInt(local_hash as u64),
+        ],
     );
     let result: [_; 3] = client
         .register(
@@ -1451,13 +1480,19 @@ fn field_backward_kernel(
     metadata: &Tensor<f32>,
     table_grad: &Tensor<Atomic<u32>>,
     active: u32,
+    #[comptime] local_hash: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
     for tile in 0..9usize {
         let index = unit + tile * 256;
         if index < 2113 {
-            shared_weights[index] = weights[index];
+            let target = if local_hash && index < 1984 {
+                (index % 64) * 31 + index / 64
+            } else {
+                index
+            };
+            shared_weights[target] = weights[index];
         }
     }
     sync_cube();
@@ -1480,31 +1515,49 @@ fn field_backward_kernel(
         let hidden = if scaled > 20.0_f32 { h } else { soft };
         dw1[point * 64 + lane] = ds[point] * hidden;
     }
-    shared[unit] = v;
+    let shared_index = if local_hash { lane * 4 + slot } else { unit };
+    shared[shared_index] = v;
     sync_cube();
-    if point < pre.shape(0) && lane < usize::cast_from(active) {
-        let level = lane;
+    let hash_slot = if local_hash { unit % 4 } else { slot };
+    let level = if local_hash { unit / 4 } else { lane };
+    let hash_point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + hash_slot;
+    if hash_point < pre.shape(0) && level < usize::cast_from(active) {
         let col = 3 + level * 2;
         let mut g0 = 0.0_f32;
         let mut g1 = 0.0_f32;
         for j in 0..64usize {
-            let h = shared[slot * 64 + j];
-            g0 += h * shared_weights[col * 64 + j];
-            g1 += h * shared_weights[(col + 1) * 64 + j];
+            let hi = if local_hash {
+                j * 4 + hash_slot
+            } else {
+                hash_slot * 64 + j
+            };
+            let w0 = if local_hash {
+                j * 31 + col
+            } else {
+                col * 64 + j
+            };
+            let w1 = if local_hash {
+                j * 31 + col + 1
+            } else {
+                (col + 1) * 64 + j
+            };
+            let h = shared[hi];
+            g0 += h * shared_weights[w0];
+            g1 += h * shared_weights[w1];
         }
         if g0 != 0.0_f32 || g1 != 0.0_f32 {
             let norm0 = f32::clamp(
-                (points[point * 3] + 1.0_f32) * 0.5_f32,
+                (points[hash_point * 3] + 1.0_f32) * 0.5_f32,
                 0.0_f32,
                 1.0_f32 - 1e-7_f32,
             );
             let norm1 = f32::clamp(
-                (points[point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                (points[hash_point * 3 + 1] + 1.0_f32) * 0.5_f32,
                 0.0_f32,
                 1.0_f32 - 1e-7_f32,
             );
             let norm2 = f32::clamp(
-                (points[point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                (points[hash_point * 3 + 2] + 1.0_f32) * 0.5_f32,
                 0.0_f32,
                 1.0_f32 - 1e-7_f32,
             );
@@ -1565,7 +1618,8 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([p, d, w, x, m, t, h, g], [ot, oh, og]) = self.desc.as_fixed();
-        let [ScalarIr::UInt(active)] = self.desc.scalars.as_slice() else {
+        let [ScalarIr::UInt(active), ScalarIr::UInt(local_hash)] = self.desc.scalars.as_slice()
+        else {
             panic!("invalid backward scalars")
         };
         let [p, d, w, x, m, t, h, g] =
@@ -1578,6 +1632,22 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
             .properties()
             .atomic_type_usage(Type::atomic(f32::elem_type_native()))
             .contains(cubecl::ir::features::AtomicUsage::Add);
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            eprintln!(
+                "Hash gradients: {}; hash layout: {}",
+                if native_add {
+                    "native float atomics"
+                } else {
+                    "compare-and-swap atomics"
+                },
+                if *local_hash != 0 {
+                    "neighboring points grouped by level"
+                } else {
+                    "legacy point-major"
+                },
+            );
+        });
         if native_add {
             field_backward_native_kernel::launch(
                 &client,
@@ -1592,6 +1662,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 m.into_tensor_arg(),
                 t.clone().into_tensor_arg(),
                 *active as u32,
+                *local_hash != 0,
             );
         } else {
             field_backward_kernel::launch(
@@ -1607,6 +1678,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 m.into_tensor_arg(),
                 t.clone().into_tensor_arg(),
                 *active as u32,
+                *local_hash != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
@@ -1618,6 +1690,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
 pub fn field_backward(
     inputs: [burn::tensor::Tensor<2>; 6],
     active: usize,
+    local_hash: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     use burn::tensor::Tensor as BT;
     let n = inputs[0].dims()[0];
@@ -1636,7 +1709,10 @@ pub fn field_backward(
         "supernormal_field_backward",
         &inputs.into_iter().map(|t| t.into_ir()).collect::<Vec<_>>(),
         &outputs,
-        vec![ScalarIr::UInt(active as u64)],
+        vec![
+            ScalarIr::UInt(active as u64),
+            ScalarIr::UInt(local_hash as u64),
+        ],
     );
     let result: [_; 3] = client
         .register(
@@ -1793,13 +1869,19 @@ fn field_backward_native_kernel(
     metadata: &Tensor<f32>,
     table_grad: &Tensor<Atomic<f32>>,
     active: u32,
+    #[comptime] local_hash: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
     for tile in 0..9usize {
         let index = unit + tile * 256;
         if index < 2113 {
-            shared_weights[index] = weights[index];
+            let target = if local_hash && index < 1984 {
+                (index % 64) * 31 + index / 64
+            } else {
+                index
+            };
+            shared_weights[target] = weights[index];
         }
     }
     sync_cube();
@@ -1822,31 +1904,49 @@ fn field_backward_native_kernel(
         let hidden = if scaled > 20.0_f32 { h } else { soft };
         dw1[point * 64 + lane] = ds[point] * hidden;
     }
-    shared[unit] = v;
+    let shared_index = if local_hash { lane * 4 + slot } else { unit };
+    shared[shared_index] = v;
     sync_cube();
-    if point < pre.shape(0) && lane < usize::cast_from(active) {
-        let level = lane;
+    let hash_slot = if local_hash { unit % 4 } else { slot };
+    let level = if local_hash { unit / 4 } else { lane };
+    let hash_point = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 4 + hash_slot;
+    if hash_point < pre.shape(0) && level < usize::cast_from(active) {
         let col = 3 + level * 2;
         let mut g0 = 0.0_f32;
         let mut g1 = 0.0_f32;
         for j in 0..64usize {
-            let h = shared[slot * 64 + j];
-            g0 += h * shared_weights[col * 64 + j];
-            g1 += h * shared_weights[(col + 1) * 64 + j];
+            let hi = if local_hash {
+                j * 4 + hash_slot
+            } else {
+                hash_slot * 64 + j
+            };
+            let w0 = if local_hash {
+                j * 31 + col
+            } else {
+                col * 64 + j
+            };
+            let w1 = if local_hash {
+                j * 31 + col + 1
+            } else {
+                (col + 1) * 64 + j
+            };
+            let h = shared[hi];
+            g0 += h * shared_weights[w0];
+            g1 += h * shared_weights[w1];
         }
         if g0 != 0.0_f32 || g1 != 0.0_f32 {
             let norm0 = f32::clamp(
-                (points[point * 3] + 1.0_f32) * 0.5_f32,
+                (points[hash_point * 3] + 1.0_f32) * 0.5_f32,
                 0.0_f32,
                 1.0_f32 - 1e-7_f32,
             );
             let norm1 = f32::clamp(
-                (points[point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                (points[hash_point * 3 + 1] + 1.0_f32) * 0.5_f32,
                 0.0_f32,
                 1.0_f32 - 1e-7_f32,
             );
             let norm2 = f32::clamp(
-                (points[point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                (points[hash_point * 3 + 2] + 1.0_f32) * 0.5_f32,
                 0.0_f32,
                 1.0_f32 - 1e-7_f32,
             );

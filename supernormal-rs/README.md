@@ -201,3 +201,36 @@ loop. GPU coordinates now exist for the whole microbatch, so monitor peak memory
 when comparing large microbatches. Shader arithmetic can round differently from
 CPU arithmetic; reconstruction parity and performance require measurement.
 This change was source-reviewed and formatted only, with no build or tests run.
+
+
+### Hash access locality experiment
+
+Fused field kernels now assign consecutive hash-work lanes to four neighboring
+points at the same grid level, rather than different levels of one point.
+Nearby patch pixels can consequently reuse the same grid vertices/cache lines
+within a wave. This is a locality opportunity, not a guarantee: high-resolution
+hashed levels may map even nearby vertices to unrelated addresses.
+
+The MLP retains its neuron-parallel layout. Shared feature/derivative buffers
+bridge these ownership layouts; backward stages the first-layer weights in a
+transposed shared layout so different levels no longer read columns separated
+by a 64-float stride. This targets shared-memory bank conflicts as well as
+hash-table cache reuse, without sorting points or allocating new global buffers.
+Both native-float and compare-and-swap atomic paths use the new layout. A
+one-time training message reports the selected atomic path and hash layout.
+The number of atomic additions is unchanged; closer updates may also increase
+contention, which is why hardware comparison remains necessary.
+
+The new layout is the default. Add `--legacy-hash-layout` to the same training
+command to restore the previous shared layouts and point-major hash ownership.
+The switch applies to fused field evaluation and backward; `--unfused-field`
+bypasses these kernels. Existing checkpoints require no conversion.
+
+Compare separate fresh output directories resumed from the same late-stage
+checkpoint, using identical batch/query settings and API. Use several hundred
+iterations, discount shader warm-up, and disable mesh extraction during the
+comparison. Compare samples per second alongside iterations per second and
+check losses/reconstruction quality. Floating-point atomic update order can
+differ, so bitwise equality is not expected. Test on both integrated and discrete
+GPUs before judging the default. No build, tests, or runtime measurements were
+performed for this change.

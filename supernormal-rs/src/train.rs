@@ -54,6 +54,10 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub untiled_gradients: bool,
+    /// Restore point-major hash lookup/scatter ownership for comparison.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_hash_layout: bool,
     #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
@@ -176,6 +180,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.fused_field = !args.unfused_field;
     field.cpu_visibility = args.cpu_visibility;
     field.tiled_gradients = !args.untiled_gradients;
+    field.local_hash = !args.legacy_hash_layout;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
     let mut restored_state = false;

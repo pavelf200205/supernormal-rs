@@ -39,6 +39,7 @@ pub struct Field {
     pub fused_field: bool,
     pub cpu_visibility: bool,
     pub tiled_gradients: bool,
+    pub local_hash: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
 }
@@ -290,6 +291,7 @@ impl Field {
             fused_field: true,
             cpu_visibility: false,
             tiled_gradients: true,
+            local_hash: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         }
@@ -367,6 +369,7 @@ impl Field {
             fused_field: true,
             cpu_visibility: false,
             tiled_gradients: true,
+            local_hash: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
         })
@@ -731,7 +734,12 @@ impl Field {
         }
         let weights = self.packed_mlp.borrow().as_ref().unwrap().clone();
         let (tables, metadata) = self.packed_tables();
-        crate::kernels::fused_field([xyz, tables, metadata, weights], self.active.min(14), cache)
+        crate::kernels::fused_field(
+            [xyz, tables, metadata, weights],
+            self.active.min(14),
+            cache,
+            self.local_hash,
+        )
     }
 
     pub fn enqueue_cached(&self, points: &[[f32; 3]], chunk: usize) -> PendingEvaluation {
@@ -880,6 +888,7 @@ impl Field {
                         table_grad,
                     ],
                     active_levels,
+                    self.local_hash,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
                 (dh, None, dw1.sum_dim(0))
