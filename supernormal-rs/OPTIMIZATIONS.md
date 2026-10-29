@@ -228,3 +228,15 @@ half-warp shuffles, or CUDA-specific approximate instructions. No precision or
 loss changes are introduced. Speed and parity remain unmeasured for part 2;
 rebuild and test on the target GPUs. The latest power-interrupted reconstruction
 is incomplete and is not used here as completed-run performance evidence.
+
+
+## Follow-up: kernel scheduling and measured attribution
+
+See the final section of README.md and NEXT_COMMIT_ANALYSIS.md for flags and
+scope. Added level-indexed Adam, exact endpoint reuse, safe subgroup reduction,
+optional forward weight reuse and derivative recomputation, selectable
+aggregation scope, a local microbatch dispatch fix, and full-run timing output.
+Optional diagnostics use the installed CubeCL profiling-window API and distinguish
+system/device timing from unavailable measurements. They count conditional copy
+bytes and sample address reuse without claiming hardware atomic/cache counters.
+No build or tests were run; default and experimental paths need user validation.

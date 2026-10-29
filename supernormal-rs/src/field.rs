@@ -44,6 +44,13 @@ pub struct Field {
     pub wide_gradient_tiles: bool,
     pub corner_parallel: bool,
     pub aggregate_hash: bool,
+    pub level_adam: bool,
+    pub point_tiles: usize,
+    pub subgroup_reduce: bool,
+    pub aggregation_levels: usize,
+    pub cross_corners: bool,
+    pub recompute_parameter_gradients: bool,
+    pub reuse_endpoints: bool,
     pub chunked_eval: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
@@ -313,6 +320,13 @@ impl Field {
             wide_gradient_tiles: true,
             corner_parallel: true,
             aggregate_hash: true,
+            level_adam: true,
+            point_tiles: 1,
+            subgroup_reduce: true,
+            aggregation_levels: 14,
+            cross_corners: false,
+            recompute_parameter_gradients: false,
+            reuse_endpoints: true,
             chunked_eval: false,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
@@ -397,6 +411,13 @@ impl Field {
             wide_gradient_tiles: true,
             corner_parallel: true,
             aggregate_hash: true,
+            level_adam: true,
+            point_tiles: 1,
+            subgroup_reduce: true,
+            aggregation_levels: 14,
+            cross_corners: false,
+            recompute_parameter_gradients: false,
+            reuse_endpoints: true,
             chunked_eval: false,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
@@ -621,13 +642,16 @@ impl Field {
             .collect();
         let rays = ranges.len() / 2;
         let samples = pairs.len() / 2;
-        let result = crate::kernels::visibility([
-            Tensor::cat(outputs, 0),
-            tensor(pairs, [samples, 2], &self.device),
-            tensor(ranges, [rays, 2], &self.device),
-            self.p("variance").without_autodiff(),
-            Tensor::empty([rays + 1, 1], &self.device),
-        ]);
+        let result = crate::kernels::visibility(
+            [
+                Tensor::cat(outputs, 0),
+                tensor(pairs, [samples, 2], &self.device),
+                tensor(ranges, [rays, 2], &self.device),
+                self.p("variance").without_autodiff(),
+                Tensor::empty([rays + 1, 1], &self.device),
+            ],
+            self.reuse_endpoints,
+        );
         let mut values = result.try_into_vec_as::<f32>()?;
         self.variance_host = values.pop().expect("visibility variance");
         Ok(values.into_iter().map(|v| v as usize).collect())
@@ -645,13 +669,16 @@ impl Field {
     ) -> Tensor<2> {
         let rays = ranges.dims()[0];
         let sdf = self.evaluate_device_tensor_valid(unique_pts, valid_ep_count, chunk);
-        crate::kernels::visibility([
-            sdf,
-            pairs,
-            ranges,
-            self.p("variance").without_autodiff(),
-            Tensor::empty([rays + 1, 2], &self.device),
-        ])
+        crate::kernels::visibility(
+            [
+                sdf,
+                pairs,
+                ranges,
+                self.p("variance").without_autodiff(),
+                Tensor::empty([rays + 1, 2], &self.device),
+            ],
+            self.reuse_endpoints,
+        )
     }
 
     pub fn evaluate_visibility(&mut self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
@@ -869,6 +896,8 @@ impl Field {
             cache,
             self.local_hash,
             self.corner_parallel,
+            self.point_tiles,
+            self.subgroup_reduce,
         )
     }
 
@@ -931,6 +960,8 @@ impl Field {
         };
         for (chunk_idx, (n, pts_tensor)) in inputs.enumerate() {
             let padded_n = pts_tensor.dims()[0];
+            crate::diagnostics::count("field.cached_forward_points", n);
+            crate::diagnostics::count("field.cached_capacity_points", padded_n);
             if self.fused_field {
                 let keep_cache = chunk_idx < MAX_CACHED_CHUNKS;
                 let [y, feat, preactivation] =
@@ -976,14 +1007,19 @@ impl Field {
     }
 
     pub fn trim_memory(&self) {
-        let _ = self.device.sync();
+        crate::diagnostics::count("memory.pool_checks", 1);
         if let Some(usage) = self.device.memory_pool_usage() {
             self.peak_reserved_bytes
                 .set(self.peak_reserved_bytes.get().max(usage.bytes_reserved));
             if usage.bytes_reserved > 768 * 1024 * 1024 {
+                crate::diagnostics::count("memory.cleanup_calls", 1);
+                let _ = self.device.sync();
                 self.device.memory_cleanup();
+                return;
             }
         }
+        // A maintenance check must still submit pending lazy work.
+        let _ = self.device.flush();
     }
 
     pub fn accumulate_gradients_cached(
@@ -1004,6 +1040,25 @@ impl Field {
         cached: Vec<FeatureChunk>,
         adjoints: Tensor<2>,
         accumulated: &mut Gradients,
+    ) {
+        self.accumulate_gradients_device_impl(cached, adjoints, accumulated, true);
+    }
+
+    pub fn accumulate_training_gradients_device(
+        &self,
+        cached: Vec<FeatureChunk>,
+        adjoints: Tensor<2>,
+        accumulated: &mut Gradients,
+    ) {
+        self.accumulate_gradients_device_impl(cached, adjoints, accumulated, false);
+    }
+
+    fn accumulate_gradients_device_impl(
+        &self,
+        cached: Vec<FeatureChunk>,
+        adjoints: Tensor<2>,
+        accumulated: &mut Gradients,
+        need_bias: bool,
     ) {
         let active_levels = self.active.min(14);
         let (_, metadata) = self.packed_tables();
@@ -1039,6 +1094,7 @@ impl Field {
 
         for chunk in cached {
             let n = chunk.point_count;
+            crate::diagnostics::count("field.backward_points", n);
             let padded_n = chunk.padded_count;
             let mut ds_tensor = if single_chunk && adjoints.dims()[0] == n {
                 adjoints.clone()
@@ -1046,15 +1102,28 @@ impl Field {
                 adjoints.clone().slice([offset..offset + n, 0..1])
             };
             offset += n;
+            crate::diagnostics::sample_addresses(&chunk.pts_tensor, &ds_tensor, n, active_levels);
 
             let (feat, preactivation) = match (chunk.feat, chunk.preactivation) {
                 (Some(f), Some(p)) => (f, p),
                 _ => {
+                    crate::diagnostics::count("field.recomputed_points", n);
                     let [_, f, p] = self.fused_forward_valid(chunk.pts_tensor.clone(), n, true);
                     (f, p)
                 }
             };
 
+            let recompute =
+                self.fused_field && self.tiled_gradients && self.recompute_parameter_gradients;
+            let parameter_inputs = if recompute {
+                Some((
+                    preactivation.clone(),
+                    ds_tensor.clone(),
+                    self.packed_mlp.borrow().as_ref().unwrap().clone(),
+                ))
+            } else {
+                None
+            };
             let (dh, d_feat_tensor, dw1_chunk, db1_chunk) = if self.fused_field {
                 let weights = self
                     .packed_mlp
@@ -1078,11 +1147,27 @@ impl Field {
                     self.compact_gradients,
                     self.corner_parallel,
                     self.aggregate_hash,
+                    self.aggregation_levels,
+                    self.cross_corners,
+                    !recompute,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
-                (dh, None, dw1.sum_dim(0), ds_tensor.sum_dim(0))
+                (
+                    dh,
+                    None,
+                    dw1.sum_dim(0),
+                    if need_bias {
+                        Some(ds_tensor.sum_dim(0))
+                    } else {
+                        None
+                    },
+                )
             } else {
-                let db1_chunk = ds_tensor.clone().sum_dim(0);
+                let db1_chunk = if need_bias {
+                    Some(ds_tensor.clone().sum_dim(0))
+                } else {
+                    None
+                };
                 if padded_n != n {
                     ds_tensor = Tensor::cat(
                         vec![ds_tensor, Tensor::zeros([padded_n - n, 1], &self.device)],
@@ -1100,7 +1185,19 @@ impl Field {
                 (dh, Some(df), dw1, db1_chunk)
             };
             let (dw0_chunk, db0_chunk) = if self.tiled_gradients {
-                crate::sampling_gpu::parameter_gradients(dh, feat, n, self.wide_gradient_tiles)
+                if let Some((pre, ds, weights)) = parameter_inputs {
+                    crate::diagnostics::count("field.recomputed_parameter_points", n);
+                    crate::sampling_gpu::parameter_gradients_recompute(
+                        pre,
+                        feat,
+                        ds,
+                        weights,
+                        n,
+                        self.wide_gradient_tiles,
+                    )
+                } else {
+                    crate::sampling_gpu::parameter_gradients(dh, feat, n, self.wide_gradient_tiles)
+                }
             } else {
                 let dh_valid = if padded_n == n {
                     dh
@@ -1130,10 +1227,12 @@ impl Field {
                 Some(acc) => (acc + db0_chunk).without_autodiff(),
                 None => db0_chunk,
             });
-            db1_total = Some(match db1_total {
-                Some(acc) => (acc + db1_chunk).without_autodiff(),
-                None => db1_chunk,
-            });
+            if let Some(db1_chunk) = db1_chunk {
+                db1_total = Some(match db1_total {
+                    Some(acc) => (acc + db1_chunk).without_autodiff(),
+                    None => db1_chunk,
+                });
+            }
 
             if let Some(d_feat_tensor) = d_feat_tensor.filter(|_| active_levels > 0) {
                 let table_grad = accumulated.params.remove("encoding.packed").unwrap();
@@ -1149,9 +1248,7 @@ impl Field {
             }
         }
 
-        if let (Some(dw0), Some(dw1), Some(db0), Some(db1)) =
-            (dw0_total, dw1_total, db0_total, db1_total)
-        {
+        if let (Some(dw0), Some(dw1), Some(db0)) = (dw0_total, dw1_total, db0_total) {
             let (dv0, dg0) = self.weight_gradients(0, dw0);
             let (dv1, dg1) = self.weight_gradients(1, dw1);
 
@@ -1161,7 +1258,6 @@ impl Field {
                 ("lin0.bias", db0),
                 ("lin1.weight_v", dv1),
                 ("lin1.weight_g", dg1),
-                ("lin1.bias", db1),
             ] {
                 accumulated
                     .params
@@ -1169,6 +1265,13 @@ impl Field {
                     .and_modify(|v| *v = (v.clone() + grad.clone()).without_autodiff())
                     .or_insert(grad);
             }
+        }
+        if let Some(db1) = db1_total {
+            accumulated
+                .params
+                .entry("lin1.bias".into())
+                .and_modify(|g| *g = (g.clone() + db1.clone()).without_autodiff())
+                .or_insert(db1);
         }
     }
 
@@ -1212,6 +1315,11 @@ impl Field {
                     packed_grad.without_autodiff(),
                     tensor(corrections, [active, 3], &self.device),
                     active_rows,
+                    (0..active)
+                        .map(|l| self.level_offsets[l + 1] - self.level_offsets[l])
+                        .max()
+                        .unwrap(),
+                    self.level_adam,
                 );
                 self.packed_embedding = Some(Parameter {
                     value,

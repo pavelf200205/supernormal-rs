@@ -209,16 +209,6 @@ fn compact_and_center_endpoints_kernel(
     }
 }
 
-/// Initialize reverse occurrence slots `[n_entries, 2]` to `-1.0`.
-#[cube(launch)]
-fn init_reverse_kernel(reverse: &mut Tensor<f32>, valid_entries: u32) {
-    let i = ABSOLUTE_POS;
-    if i >= usize::cast_from(valid_entries) {
-        terminate!();
-    }
-    reverse[i] = -1.0_f32;
-}
-
 /// Build `endpoints` `[ep_count, 2]`, `descriptors` `[vis_count, 5]`,
 /// compact `mapping` `[vis_count, 1]` (storing `start_ep * 9`, since `end_ep`
 /// is always `start_ep + 1` so the 18 sample points are always contiguous at
@@ -234,13 +224,13 @@ fn build_visible_geometry_tables_kernel(
     mapping: &mut Tensor<f32>,
     reverse: &mut Tensor<f32>,
     patch_start: u32,
+    patch_count: u32,
     s_base: u32,
     ep_base: u32,
 ) {
     let local_ray = ABSOLUTE_POS;
     let ray = usize::cast_from(patch_start) + local_ray;
-    if ray >= vis_prefix.shape(0) || local_ray >= vis_prefix.shape(0) - usize::cast_from(patch_start)
-    {
+    if local_ray >= usize::cast_from(patch_count) || ray >= vis_prefix.shape(0) {
         terminate!();
     }
     let m_begin = if ray == 0 {
@@ -313,8 +303,10 @@ fn build_visible_geometry_tables_kernel(
         mapping[vis_idx] = f32::cast_from(start_ep * 9);
         if !reuse_prev {
             reverse[start_ep * 2] = f32::cast_from(vis_idx * 2);
+            reverse[start_ep * 2 + 1] = -1.0_f32;
         }
         reverse[end_ep * 2] = f32::cast_from(vis_idx * 2 + 1);
+        reverse[end_ep * 2 + 1] = -1.0_f32;
         if reuse_next {
             reverse[end_ep * 2 + 1] = f32::cast_from((vis_idx + 1) * 2);
         }
@@ -486,6 +478,7 @@ impl Operation<FusionCubeRuntime> for MarchOp {
         let ([r, f, s, c], [o0, o1]) = self.desc.as_fixed();
         let [r, f, s, c] = [r, f, s, c].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = r.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.MarchOp");
         let n = r.meta.shape().dims::<2>()[0];
         let dim = CubeDim::new(&client, n);
         march_kernel::launch(
@@ -543,6 +536,7 @@ impl Operation<FusionCubeRuntime> for CompactOp {
         let ([r, s, p, o], [o0]) = self.desc.as_fixed();
         let [r, s, p, o] = [r, s, p, o].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = r.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.CompactOp");
         let n = r.meta.shape().dims::<2>()[0];
         let dim = CubeDim::new(&client, n);
         compact_kernel::launch(
@@ -600,6 +594,7 @@ impl Operation<FusionCubeRuntime> for CompactAndCenterEndpointsOp {
         let [r, s, p, m, u, pr, rg] =
             [r, s, p, m, u, pr, rg].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = r.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.CompactAndCenterEndpointsOp");
         let n = r.meta.shape().dims::<2>()[0];
         let dim = CubeDim::new(&client, n);
         compact_and_center_endpoints_kernel::launch(
@@ -679,7 +674,7 @@ impl Operation<FusionCubeRuntime> for BuildVisibleGeometryTablesOp {
             ScalarIr::UInt(patch_count),
             ScalarIr::UInt(s_base),
             ScalarIr::UInt(ep_base),
-            ScalarIr::UInt(ep_count),
+            ScalarIr::UInt(_ep_count),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid visible geometry table scalars")
@@ -687,15 +682,7 @@ impl Operation<FusionCubeRuntime> for BuildVisibleGeometryTablesOp {
         let [m, mp, vp, e, d, map, r] =
             [m, mp, vp, e, d, map, r].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = m.client.clone();
-        let n_rev = ((*ep_count as usize) * 2).max(1);
-        let dim_rev = CubeDim::new(&client, n_rev);
-        init_reverse_kernel::launch(
-            &client,
-            cubecl::calculate_cube_count_elemwise(&client, n_rev, dim_rev),
-            dim_rev,
-            r.clone().into_tensor_arg(),
-            n_rev as u32,
-        );
+        let _timing = crate::diagnostics::start(&client, "geometry_tables");
         let n_rays = (*patch_count as usize).max(1);
         let dim = CubeDim::new(&client, n_rays);
         build_visible_geometry_tables_kernel::launch(
@@ -710,6 +697,7 @@ impl Operation<FusionCubeRuntime> for BuildVisibleGeometryTablesOp {
             map.clone().into_tensor_arg(),
             r.clone().into_tensor_arg(),
             *patch_start as u32,
+            *patch_count as u32,
             *s_base as u32,
             *ep_base as u32,
         );
@@ -738,8 +726,16 @@ pub fn build_visible_geometry_tables(
     let d_buf = burn::tensor::Tensor::<2>::empty([vis_cap, 5], &device);
     let map_buf = burn::tensor::Tensor::<2>::empty([vis_cap, 1], &device);
     let r_buf = burn::tensor::Tensor::<2>::empty([ep_cap, 2], &device);
-    let inputs = [marched, march_prefix, vis_prefix, e_buf, d_buf, map_buf, r_buf]
-        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let inputs = [
+        marched,
+        march_prefix,
+        vis_prefix,
+        e_buf,
+        d_buf,
+        map_buf,
+        r_buf,
+    ]
+    .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let outputs: Vec<_> = [3usize, 4usize, 5usize, 6usize]
         .into_iter()
@@ -794,6 +790,7 @@ impl Operation<FusionCubeRuntime> for OccupancyGridPointsOp {
         };
         let p = handles.get_float_tensor::<CubeBackend>(p);
         let client = p.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.OccupancyGridPointsOp");
         let n = (*valid_n as usize).max(1);
         let dim = CubeDim::new(&client, n);
         occupancy_grid_points_kernel::launch(
@@ -860,6 +857,7 @@ impl Operation<FusionCubeRuntime> for OccupancyApplySliceOp {
         let [s, v] = [s, v].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let v = if v.can_mut() { v } else { v.copy() };
         let client = v.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.OccupancyApplySliceOp");
         let n = (*valid_n as usize).max(1);
         let dim = CubeDim::new(&client, n);
         occupancy_apply_slice_kernel::launch(
@@ -927,6 +925,7 @@ impl Operation<FusionCubeRuntime> for OccupancyCountOp {
         };
         let [f, c] = [f, c].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = f.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.OccupancyCountOp");
         let n = c.meta.shape().dims::<2>()[0];
         let dim = CubeDim::new(&client, n);
         occupancy_count_kernel::launch(
@@ -1000,6 +999,7 @@ impl Operation<FusionCubeRuntime> for OccupancyCompactPointsOp {
         };
         let [f, pr, id, pt] = [f, pr, id, pt].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = f.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.OccupancyCompactPointsOp");
         let n = pr.meta.shape().dims::<2>()[0];
         let dim = CubeDim::new(&client, n);
         occupancy_compact_points_kernel::launch(
@@ -1084,6 +1084,7 @@ impl Operation<FusionCubeRuntime> for OccupancyApplySelectedOp {
         let [id, s, v] = [id, s, v].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let v = if v.can_mut() { v } else { v.copy() };
         let client = v.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.OccupancyApplySelectedOp");
         let n = (*valid_n as usize).max(1);
         let dim = CubeDim::new(&client, n);
         occupancy_apply_selected_kernel::launch(
@@ -1137,8 +1138,12 @@ fn parameter_kernel(
     dh: &Tensor<f32>,
     features: &Tensor<f32>,
     partials: &mut Tensor<f32>,
+    pre: &Tensor<f32>,
+    ds: &Tensor<f32>,
+    weights: &Tensor<f32>,
     valid_rows: u32,
     #[comptime] tile_cols: usize,
+    #[comptime] recompute: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let tile = usize::cast_from(CUBE_POS_X);
@@ -1162,7 +1167,23 @@ fn parameter_kernel(
                 let channel = index % 8;
                 let mut h = 0.0_f32;
                 if sample < valid_n {
-                    h = dh[sample * dh.stride(0) + (row_base + channel) * dh.stride(1)];
+                    if recompute {
+                        let d = ds[sample * ds.stride(0)];
+                        if d != 0.0_f32 {
+                            let scaled = pre
+                                [sample * pre.stride(0) + (row_base + channel) * pre.stride(1)]
+                                * 100.0_f32;
+                            let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
+                            let derivative = if scaled > 20.0_f32 {
+                                1.0_f32
+                            } else {
+                                exp_pos / (1.0_f32 + exp_pos)
+                            };
+                            h = d * weights[2048 + row_base + channel] * derivative;
+                        }
+                    } else {
+                        h = dh[sample * dh.stride(0) + (row_base + channel) * dh.stride(1)];
+                    }
                 }
                 hs[index] = h;
             }
@@ -1196,14 +1217,20 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([h, f, p], [out]) = self.desc.as_fixed();
-        let [h, f, p] = [h, f, p].map(|x| handles.get_float_tensor::<CubeBackend>(x));
-        let [ScalarIr::UInt(wide), ScalarIr::UInt(valid_rows)] = self.desc.scalars.as_slice()
+        let ([h, f, p, pre, ds, w], [out]) = self.desc.as_fixed();
+        let [h, f, p, pre, ds, w] =
+            [h, f, p, pre, ds, w].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [
+            ScalarIr::UInt(wide),
+            ScalarIr::UInt(valid_rows),
+            ScalarIr::UInt(recompute),
+        ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid parameter-gradient arguments")
         };
         let tile_cols = if *wide != 0 { 32usize } else { 8usize };
         let client = h.client.clone();
+        let _timing = crate::diagnostics::start(&client, "parameter_gradients");
         let parts = (*valid_rows as usize).div_ceil(256).max(1);
         parameter_kernel::launch(
             &client,
@@ -1212,8 +1239,12 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
             h.into_tensor_arg(),
             f.into_tensor_arg(),
             p.clone().into_tensor_arg(),
+            pre.into_tensor_arg(),
+            ds.into_tensor_arg(),
+            w.into_tensor_arg(),
             *valid_rows as u32,
             tile_cols,
+            *recompute != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&out.id, p);
         Ok(())
@@ -1225,13 +1256,55 @@ pub fn parameter_gradients(
     valid_rows: usize,
     wide: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
+    parameter_gradients_impl(
+        dh.clone(),
+        features,
+        dh.clone(),
+        dh.clone(),
+        dh,
+        valid_rows,
+        wide,
+        false,
+    )
+}
+
+pub fn parameter_gradients_recompute(
+    pre: burn::tensor::Tensor<2>,
+    features: burn::tensor::Tensor<2>,
+    ds: burn::tensor::Tensor<2>,
+    weights: burn::tensor::Tensor<2>,
+    valid_rows: usize,
+    wide: bool,
+) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
+    parameter_gradients_impl(
+        pre.clone(),
+        features,
+        pre,
+        ds,
+        weights,
+        valid_rows,
+        wide,
+        true,
+    )
+}
+
+fn parameter_gradients_impl(
+    dh: burn::tensor::Tensor<2>,
+    features: burn::tensor::Tensor<2>,
+    pre: burn::tensor::Tensor<2>,
+    ds: burn::tensor::Tensor<2>,
+    weights: burn::tensor::Tensor<2>,
+    valid_rows: usize,
+    wide: bool,
+    recompute: bool,
+) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use burn::tensor::Tensor;
     let parts = valid_rows.div_ceil(256).max(1);
     assert!(parts <= 65535, "parameter-gradient query too large");
     // Use uninitialized output allocation instead of zero-filling before full overwrite.
     let buffer = Tensor::empty([parts, 2048], &dh.device());
-    let inputs =
-        [dh, features, buffer].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let inputs = [dh, features, buffer, pre, ds, weights]
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let out = TensorIr::uninit(
         client.create_empty_handle(),
@@ -1245,6 +1318,7 @@ pub fn parameter_gradients(
         vec![
             ScalarIr::UInt(wide as u64),
             ScalarIr::UInt(valid_rows as u64),
+            ScalarIr::UInt(recompute as u64),
         ],
     );
     let [out] = client
@@ -1363,6 +1437,7 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
         };
         let [r, e, s, p, g] = [r, e, s, p, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = r.client.clone();
+        let _timing = crate::diagnostics::start(&client, "geometry");
         let n_pts = (*valid_points as usize).max(1);
         let dim_pts = CubeDim::new(&client, n_pts);
         points_kernel::launch(
@@ -1571,6 +1646,7 @@ impl Operation<FusionCubeRuntime> for GatherPatchTablesOp {
         let [c, vm, pr, gr, pp] =
             [c, vm, pr, gr, pp].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = c.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.GatherPatchTablesOp");
         let n = gr.meta.shape().dims::<2>()[0] * 9;
         let dim = CubeDim::new(&client, n);
         gather_patch_tables_kernel::launch(
@@ -1656,6 +1732,7 @@ impl Operation<FusionCubeRuntime> for MeshSlabPointsOp {
         let ([pr, p], [op]) = self.desc.as_fixed();
         let [pr, p] = [pr, p].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = p.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.MeshSlabPointsOp");
         let n = p.meta.shape().dims::<2>()[0];
         let dim = CubeDim::new(&client, n);
         mesh_slab_points_kernel::launch(

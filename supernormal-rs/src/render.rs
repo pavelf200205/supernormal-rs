@@ -1304,6 +1304,7 @@ pub fn composite_device(
     pixel_den: f32,
     sample_den: f32,
     coalesced_scratch: bool,
+    reuse_endpoints: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use crate::field::tensor;
     use burn::tensor::Tensor;
@@ -1369,6 +1370,7 @@ pub fn composite_device(
         n,
         false,
         coalesced_scratch,
+        reuse_endpoints,
     );
     let stats = stats.sum_dim(0);
     let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
@@ -1400,6 +1402,7 @@ pub fn composite_device_tables(
     pixel_den: f32,
     sample_den: f32,
     coalesced_scratch: bool,
+    reuse_endpoints: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use crate::field::tensor;
     use burn::tensor::Tensor;
@@ -1448,6 +1451,7 @@ pub fn composite_device_tables(
         n,
         true,
         coalesced_scratch,
+        reuse_endpoints,
     );
     let stats = stats.sum_dim(0);
     let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {

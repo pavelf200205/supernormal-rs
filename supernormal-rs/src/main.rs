@@ -3,6 +3,7 @@ use burn::tensor::{Device, DeviceKind, Tensor};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 mod data;
+mod diagnostics;
 mod field;
 mod kernels;
 mod mc_table;

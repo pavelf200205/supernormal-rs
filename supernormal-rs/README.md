@@ -369,3 +369,58 @@ bypasses local hash aggregation by selecting the original sequential scatter.
 Use fresh output directories. Rebuild and test yourself: no build, test, or
 runtime benchmark was performed for this update. See
 [KOPANAS_AUDIT.md](KOPANAS_AUDIT.md) for applicability and implementation details.
+
+
+### Training kernel scheduling and diagnostics
+
+This update fixes the visible-geometry microbatch guard: rounded-up shader
+invocations are bounded by the local patch count, not the remaining global ray
+count. Reverse occurrence slots are now fully initialized by their owning ray,
+removing the separate reverse-table fill dispatch.
+
+Enabled by default:
+
+- Level-indexed packed Adam (same update/clearing formulas and moment decay).
+  Add `--legacy-adam-dispatch` for the former per-scalar level search.
+- Exact endpoint-ID-based sigmoid reuse in visibility and compositing.
+  Add `--no-endpoint-reuse` to evaluate both endpoints independently.
+- Subgroup forward output reduction only for advertised fixed 32/64-wide
+  subgroup devices with subgroup operations. Logical lane ownership uses actual
+  subgroup IDs, rather than assuming local invocation ordering. Other devices
+  retain the portable shared-memory tree. `--legacy-field-reduction` forces it.
+- GPU training omits the field-only output-bias reduction that compositing
+  replaces. Standalone/reference backward still computes that derivative.
+- Memory maintenance queries reservation before synchronizing; it still cleans
+  above the existing threshold. `--trim-interval N` controls periodic checks
+  (default 200). Zero disables periodic checks; warmup/mesh cleanup remains.
+
+Independent experiments (measure separately from defaults):
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--field-points-per-group 8` or `16` | 4 | Reuses staged MLP weights across 2/4 sequential four-point tiles; does not expand the activation cache. |
+| `--hash-aggregation-levels N` | 14 | Aggregate only levels below N; zero disables aggregation. Upper levels scatter directly. |
+| `--hash-aggregation-cross-corners` | off | Combines matching addresses across all 32 point/corner candidates per level, rather than four candidates at a fixed corner. More coordination can regress speed. |
+| `--recompute-parameter-gradients` | off | Avoids writing/reading the full global `dh` buffer by recomputing derivatives in parameter tiles. Trades bandwidth for extra sigmoid arithmetic; requires fused field and tiled gradients. |
+| `--diagnostics` | off | Records up to 128 timing windows per custom-op label, copy-byte/work counters, and a small address-reuse model sample per active-level count. |
+
+`diagnostics.json` identifies device versus system timing per row and records
+unavailable/failed measurements separately from zero durations. The address
+model downloads at most 256 prefix points once per level count and excludes zero
+adjoints; it does not measure hardware cache hits or actual atomic instructions,
+and ignores cancellation of feature gradients. Use short checkpoint resumes.
+Instrumentation alters scheduling and adds readbacks: never use diagnostic
+throughput as production throughput. Excluding the first timing sample does not
+guarantee all compilation/autotuning overhead has disappeared.
+
+`wall_time.json` records elapsed time within the train call, including loading,
+checkpointing and mesh extraction, with separate checkpoint/mesh totals. It is
+written only after successful completion and excludes diagnostic-report
+serialization. A power-interrupted run has no completed timing summary.
+
+Checkpoint format, ray order, losses and the three-chunk activation-cache cap
+remain unchanged. Subgroup/local reductions change floating-point sum grouping;
+GPU gradient/mesh parity and performance still require user validation. Larger
+tiles, selective aggregation and recomputation are selectable experiments, not
+promised speedups. No build, tests, GPU captures or benchmarks were run by the
+assistant for this update. Rebuild and test the binary yourself.

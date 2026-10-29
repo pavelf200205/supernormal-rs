@@ -78,6 +78,29 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_composite_scratch: bool,
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_adam_dispatch: bool,
+    #[arg(long)]
+    #[serde(default)]
+    pub no_endpoint_reuse: bool,
+    /// Forward workgroup weight-reuse tile: 4, 8, or 16 points.
+    #[arg(long, default_value_t = 4)]
+    #[serde(default = "default_field_points")]
+    pub field_points_per_group: usize,
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_field_reduction: bool,
+    #[arg(long, default_value_t = 14)]
+    #[serde(default = "default_aggregation_levels")]
+    pub hash_aggregation_levels: usize,
+    #[arg(long)]
+    #[serde(default)]
+    pub hash_aggregation_cross_corners: bool,
+    /// Avoid the global dh buffer by recomputing derivatives in parameter tiles.
+    #[arg(long)]
+    #[serde(default)]
+    pub recompute_parameter_gradients: bool,
     /// Restore host sample readbacks between march, visibility, and geometry preparation.
     #[arg(long)]
     #[serde(default)]
@@ -109,10 +132,29 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub profile_stages: bool,
+    /// Optional per-custom-op timing windows and logical work/copy counters.
+    #[arg(long)]
+    #[serde(default)]
+    pub diagnostics: bool,
+    /// Maintenance interval; zero disables periodic trimming (warmup/mesh cleanup remain).
+    #[arg(long, default_value_t = 200)]
+    #[serde(default = "default_trim_interval")]
+    pub trim_interval: usize,
     /// Plain log/CSV flush interval; interactive progress refreshes at most 4 Hz.
     #[arg(long, default_value_t = 10)]
     #[serde(default = "default_log_every")]
     pub log_every: usize,
+}
+
+fn default_field_points() -> usize {
+    4
+}
+fn default_aggregation_levels() -> usize {
+    14
+}
+
+fn default_trim_interval() -> usize {
+    200
 }
 
 fn default_log_every() -> usize {
@@ -248,6 +290,10 @@ struct DeferredStepMetric {
 }
 
 pub fn train(args: TrainArgs, device: Device) -> Result<()> {
+    let command_clock = std::time::Instant::now();
+    let mut checkpoint_seconds = 0.0f64;
+    let mut mesh_seconds = 0.0f64;
+    crate::diagnostics::configure(args.diagnostics);
     ensure!(
         args.batch > 0
             && args.microbatch > 0
@@ -282,6 +328,21 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.wide_gradient_tiles = !args.legacy_gradient_tiles;
     field.corner_parallel = !args.legacy_corner_loop;
     field.aggregate_hash = !args.no_hash_aggregation;
+    ensure!(
+        [4, 8, 16].contains(&args.field_points_per_group),
+        "field-points-per-group must be 4, 8, or 16"
+    );
+    ensure!(
+        args.hash_aggregation_levels <= 14,
+        "hash-aggregation-levels must be <= 14"
+    );
+    field.point_tiles = args.field_points_per_group / 4;
+    field.subgroup_reduce = !args.legacy_field_reduction;
+    field.aggregation_levels = args.hash_aggregation_levels;
+    field.cross_corners = args.hash_aggregation_cross_corners;
+    field.recompute_parameter_gradients = args.recompute_parameter_gradients;
+    field.level_adam = !args.legacy_adam_dispatch;
+    field.reuse_endpoints = !args.no_endpoint_reuse;
     field.chunked_eval = args.chunked_eval;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
@@ -537,6 +598,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         pixel_den,
                         sample_den,
                         !args.legacy_composite_scratch,
+                        !args.no_endpoint_reuse,
                     )
                 } else {
                     render::composite_device(
@@ -550,6 +612,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         pixel_den,
                         sample_den,
                         !args.legacy_composite_scratch,
+                        !args.no_endpoint_reuse,
                     )
                 };
                 device_stats = Some(match device_stats {
@@ -558,7 +621,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 });
                 t_comp += t1.elapsed().as_secs_f64();
                 let t2 = std::time::Instant::now();
-                field.accumulate_gradients_device(cache, adjoints, &mut gradients);
+                field.accumulate_training_gradients_device(cache, adjoints, &mut gradients);
                 if args.profile_stages {
                     field
                         .device
@@ -702,7 +765,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             // sample spike subsides so VRAM stays at its steady low baseline.
             let _ = field.device.sync();
             field.device.memory_cleanup();
-        } else if field.step % 200 == 0 {
+        } else if args.trim_interval > 0 && field.step % args.trim_interval == 0 {
             field.trim_memory();
         } else if args.profile_stages || field.step == final_step {
             field
@@ -802,6 +865,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         }
 
         if will_checkpoint {
+            let checkpoint_clock = std::time::Instant::now();
             if let Some(dm) = deferred_metric.take() {
                 flush_deferred(dm, None, &mut progress, &mut metrics)?;
             }
@@ -828,8 +892,10 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             };
             std::fs::write(temp.join("training.json"), serde_json::to_vec(&state)?)?;
             std::fs::rename(temp, dest)?;
+            checkpoint_seconds += checkpoint_clock.elapsed().as_secs_f64();
         }
         if will_mesh {
+            let mesh_clock = std::time::Instant::now();
             if let Some(dm) = deferred_metric.take() {
                 flush_deferred(dm, None, &mut progress, &mut metrics)?;
             }
@@ -844,10 +910,27 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             )?;
             let _ = field.device.sync();
             field.device.memory_cleanup();
+            mesh_seconds += mesh_clock.elapsed().as_secs_f64();
         }
     }
     if let Some(dm) = deferred_metric.take() {
         flush_deferred(dm, None, &mut progress, &mut metrics)?;
     }
+    field
+        .device
+        .sync()
+        .map_err(|e| anyhow::anyhow!("final synchronization failed: {e:?}"))?;
+    let elapsed = command_clock.elapsed().as_secs_f64();
+    std::fs::write(
+        args.out.join("wall_time.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "command_seconds": elapsed, "includes_loading_checkpointing_and_mesh_extraction": true,
+            "final_step": field.step, "diagnostics_enabled": args.diagnostics,
+            "checkpoint_seconds": checkpoint_seconds, "mesh_seconds": mesh_seconds,
+            "seconds_excluding_checkpoint_and_mesh": (elapsed - checkpoint_seconds - mesh_seconds).max(0.0),
+            "excludes_diagnostic_report_serialization": true,
+        }))?,
+    )?;
+    crate::diagnostics::report(&args.out.join("diagnostics.json"))?;
     Ok(())
 }
