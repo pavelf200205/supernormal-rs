@@ -128,6 +128,10 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_parameter_kernel: bool,
+    /// Restore 16-neuron parameter tiles instead of sharing features across 32 neurons.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_parameter_rows: bool,
     /// Experimental: fill spare feature-cache capacity with full preactivations.
     #[arg(long, conflicts_with = "no_hybrid_cache")]
     #[serde(default)]
@@ -409,6 +413,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.selective_forward_weights = !args.dense_forward_weight_loads;
     field.device_occupancy_update = !args.legacy_occupancy_readback;
     field.register_gradient_tiles = !args.legacy_parameter_kernel;
+    field.wide_parameter_rows = !args.legacy_parameter_rows;
     field.hybrid_activation_cache = args.hybrid_activation_cache && !args.no_hybrid_cache;
     field.fused_mlp_packing = !args.legacy_mlp_packing;
     field.chunked_eval = args.chunked_eval;

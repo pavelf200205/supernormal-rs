@@ -62,6 +62,7 @@ pub struct Field {
     pub selective_forward_weights: bool,
     pub device_occupancy_update: bool,
     pub register_gradient_tiles: bool,
+    pub wide_parameter_rows: bool,
     pub hybrid_activation_cache: bool,
     pub fused_mlp_packing: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
@@ -349,6 +350,7 @@ impl Field {
             selective_forward_weights: true,
             device_occupancy_update: true,
             register_gradient_tiles: true,
+            wide_parameter_rows: true,
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
             packed_mlp: std::cell::RefCell::new(None),
@@ -452,6 +454,7 @@ impl Field {
             selective_forward_weights: true,
             device_occupancy_update: true,
             register_gradient_tiles: true,
+            wide_parameter_rows: true,
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
             packed_mlp: std::cell::RefCell::new(None),
@@ -1443,6 +1446,7 @@ impl Field {
                         } else {
                             31
                         },
+                        self.wide_parameter_rows,
                     )
                 }
             } else {

@@ -1,5 +1,11 @@
 # SuperNormal reconstruction in Rust + Burn
 
+Parameter-gradient update: 32 neurons per workgroup halve repeated feature
+staging and use contiguous 32-channel derivative loads. Enabled by default;
+`--legacy-parameter-rows` restores 16-neuron groups. See
+[RUN11_PARAMETER_TILING.md](RUN11_PARAMETER_TILING.md) for run comparisons and
+resource tradeoffs. Rebuild and test locally; performance is unmeasured.
+
 Newest update: GPU-driven occupancy with persistent weight reuse and fused EMA,
 hash-grid replay fused into backward for cache misses, and active-only forward
 weight staging. All are on by default. Comparison flags:

@@ -1327,6 +1327,150 @@ fn parameter_register_kernel(
     }
 }
 
+// A 32-neuron tile halves repeated feature staging; eight accumulators per thread.
+#[cube(launch)]
+fn parameter_register_wide_rows_kernel(
+    dh: &Tensor<f32>,
+    features: &Tensor<f32>,
+    partials: &mut Tensor<f32>,
+    valid_rows: u32,
+    active_columns: u32,
+) {
+    let unit = usize::cast_from(UNIT_POS);
+    let row_base = usize::cast_from(CUBE_POS_X) * 32;
+    let part = usize::cast_from(CUBE_POS_Y);
+    let row = unit / 16;
+    let col = unit % 16;
+    let valid_n = usize::cast_from(valid_rows);
+    let active_cols = usize::cast_from(active_columns);
+    // Pack active input features followed by bias into the left of the tile.
+    // This avoids executing a second half-tile just to process column-31 bias.
+    let first_active = col <= active_cols;
+    let second_active = col + 16 <= active_cols;
+    let mut hs = Shared::new_slice(1024usize);
+    let mut xs = Shared::new_slice(1024usize);
+    let mut sum00 = 0.0_f32;
+    let mut sum01 = 0.0_f32;
+    let mut sum10 = 0.0_f32;
+    let mut sum11 = 0.0_f32;
+    let mut sum20 = 0.0_f32;
+    let mut sum21 = 0.0_f32;
+    let mut sum30 = 0.0_f32;
+    let mut sum31 = 0.0_f32;
+    for block in 0..8usize {
+        let sample_base = part * 256 + block * 32;
+        for load in 0..8usize {
+            let index = unit + load * 128;
+            let sample = sample_base + index / 32;
+            let channel = row_base + index % 32;
+            let mut h = 0.0_f32;
+            if sample < valid_n {
+                h = dh[sample * dh.stride(0) + channel * dh.stride(1)];
+            }
+            hs[index] = h;
+        }
+        for load in 0..8usize {
+            let index = unit + load * 128;
+            let sample = sample_base + index / 32;
+            let feature = index % 32;
+            let mut x = 0.0_f32;
+            if sample < valid_n {
+                if feature == active_cols {
+                    x = 1.0_f32;
+                } else if feature < active_cols {
+                    x = features[sample * features.stride(0) + feature * features.stride(1)];
+                }
+            }
+            xs[index] = x;
+        }
+        sync_cube();
+        if first_active && second_active {
+            for j in 0..32usize {
+                let x0 = xs[j * 32 + col];
+                let x1 = xs[j * 32 + col + 16];
+                let h0 = hs[j * 32 + row];
+                sum00 += h0 * x0;
+                sum01 += h0 * x1;
+                let h1 = hs[j * 32 + row + 8];
+                sum10 += h1 * x0;
+                sum11 += h1 * x1;
+                let h2 = hs[j * 32 + row + 16];
+                sum20 += h2 * x0;
+                sum21 += h2 * x1;
+                let h3 = hs[j * 32 + row + 24];
+                sum30 += h3 * x0;
+                sum31 += h3 * x1;
+            }
+        } else if first_active {
+            for j in 0..32usize {
+                let x0 = xs[j * 32 + col];
+                let h0 = hs[j * 32 + row];
+                sum00 += h0 * x0;
+                let h1 = hs[j * 32 + row + 8];
+                sum10 += h1 * x0;
+                let h2 = hs[j * 32 + row + 16];
+                sum20 += h2 * x0;
+                let h3 = hs[j * 32 + row + 24];
+                sum30 += h3 * x0;
+            }
+        } else if second_active {
+            for j in 0..32usize {
+                let x1 = xs[j * 32 + col + 16];
+                let h0 = hs[j * 32 + row];
+                sum01 += h0 * x1;
+                let h1 = hs[j * 32 + row + 8];
+                sum11 += h1 * x1;
+                let h2 = hs[j * 32 + row + 16];
+                sum21 += h2 * x1;
+                let h3 = hs[j * 32 + row + 24];
+                sum31 += h3 * x1;
+            }
+        }
+        // No next tile overwrites shared storage after the final block;
+        // each thread writes only its own output accumulators below.
+        if block < 7usize {
+            sync_cube();
+        }
+    }
+    let row0 = part * 2048 + (row_base + row + 0) * 32;
+    let row1 = part * 2048 + (row_base + row + 8) * 32;
+    let row2 = part * 2048 + (row_base + row + 16) * 32;
+    let row3 = part * 2048 + (row_base + row + 24) * 32;
+    // Disjoint writers cover the full dense partial, including inactive columns.
+    if col >= active_cols && col != 31 {
+        partials[row0 + col] = 0.0_f32;
+        partials[row1 + col] = 0.0_f32;
+        partials[row2 + col] = 0.0_f32;
+        partials[row3 + col] = 0.0_f32;
+    }
+    if col + 16 >= active_cols && col + 16 != 31 {
+        partials[row0 + col + 16] = 0.0_f32;
+        partials[row1 + col + 16] = 0.0_f32;
+        partials[row2 + col + 16] = 0.0_f32;
+        partials[row3 + col + 16] = 0.0_f32;
+    }
+    if first_active {
+        let mut output_col = col;
+        if col == active_cols {
+            output_col = 31usize;
+        }
+        partials[row0 + output_col] = sum00;
+        partials[row1 + output_col] = sum10;
+        partials[row2 + output_col] = sum20;
+        partials[row3 + output_col] = sum30;
+    }
+    if second_active {
+        let mut output_col = col + 16;
+        if col + 16 == active_cols {
+            output_col = 31usize;
+        }
+        partials[row0 + output_col] = sum01;
+        partials[row1 + output_col] = sum11;
+        partials[row2 + output_col] = sum21;
+        partials[row3 + output_col] = sum31;
+    }
+}
+
 #[derive(Debug)]
 struct ParameterOp {
     desc: CustomOpIr,
@@ -1345,6 +1489,7 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
             ScalarIr::UInt(recompute),
             ScalarIr::UInt(register_tiles),
             ScalarIr::UInt(active_columns),
+            ScalarIr::UInt(wide_rows),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid parameter-gradient arguments")
@@ -1353,7 +1498,18 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
         let client = h.client.clone();
         let _timing = crate::diagnostics::start(&client, "parameter_gradients");
         let parts = (*valid_rows as usize).div_ceil(256).max(1);
-        if *register_tiles != 0 && *wide != 0 && *recompute == 0 {
+        if *register_tiles != 0 && *wide != 0 && *recompute == 0 && *wide_rows != 0 {
+            parameter_register_wide_rows_kernel::launch(
+                &client,
+                CubeCount::Static(2, parts as u32, 1),
+                CubeDim::new_1d(128),
+                h.into_tensor_arg(),
+                f.into_tensor_arg(),
+                p.clone().into_tensor_arg(),
+                *valid_rows as u32,
+                *active_columns as u32,
+            );
+        } else if *register_tiles != 0 && *wide != 0 && *recompute == 0 {
             parameter_register_kernel::launch(
                 &client,
                 CubeCount::Static(4, parts as u32, 1),
@@ -1391,6 +1547,7 @@ pub fn parameter_gradients(
     wide: bool,
     register_tiles: bool,
     active_columns: usize,
+    wide_rows: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     parameter_gradients_impl(
         dh.clone(),
@@ -1402,6 +1559,7 @@ pub fn parameter_gradients(
         wide,
         register_tiles,
         active_columns,
+        wide_rows,
         false,
     )
 }
@@ -1425,6 +1583,7 @@ pub fn parameter_gradients_recompute(
         wide,
         register_tiles,
         31,
+        false,
         true,
     )
 }
@@ -1439,6 +1598,7 @@ fn parameter_gradients_impl(
     wide: bool,
     register_tiles: bool,
     active_columns: usize,
+    wide_rows: bool,
     recompute: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use burn::tensor::Tensor;
@@ -1465,6 +1625,7 @@ fn parameter_gradients_impl(
             ScalarIr::UInt(recompute as u64),
             ScalarIr::UInt(register_tiles as u64),
             ScalarIr::UInt(active_columns as u64),
+            ScalarIr::UInt(wide_rows as u64),
         ],
     );
     let [out] = client
