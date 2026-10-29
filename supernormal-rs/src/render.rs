@@ -123,29 +123,52 @@ impl Occupancy {
                     seed,
                 );
                 let prefix = counts.cumsum(0);
-                let total_selected = prefix
-                    .clone()
-                    .slice([num_blocks - 1..num_blocks, 0..1])
-                    .try_into_vec_as::<f32>()?[0] as usize;
-                if total_selected > 0 {
-                    let padded_pts = Field::padded_point_capacity(total_selected, query);
+                // Bound temporary capacity to 32 MiB (IDs + XYZ at 128^3).
+                // Compaction emits each cell at most once, so N slots cannot overflow.
+                // Larger grids and explicit chunked evaluation retain the old path.
+                if field.device_occupancy_update
+                    && field.fused_field
+                    && !field.chunked_eval
+                    && n <= 128usize.pow(3)
+                {
                     let [selected_ids, pts] = crate::sampling_gpu::occupancy_compact_points(
                         flags,
-                        prefix,
-                        total_selected,
-                        padded_pts,
+                        prefix.clone(),
+                        n,
+                        n,
                         n,
                         cells_per_thread,
                         r,
                         seed,
                     );
-                    let sdf = field.evaluate_device_tensor_valid(pts, total_selected, query);
-                    values = crate::sampling_gpu::occupancy_apply_selected(
-                        selected_ids,
-                        sdf,
-                        values,
-                        total_selected,
-                    );
+                    values = field.update_occupancy_device(pts, prefix, selected_ids, values);
+                    crate::diagnostics::count("occupancy.device_count_updates", 1);
+                } else {
+                    let total_selected = prefix
+                        .clone()
+                        .slice([num_blocks - 1..num_blocks, 0..1])
+                        .try_into_vec_as::<f32>()?[0]
+                        as usize;
+                    if total_selected > 0 {
+                        let padded_pts = Field::padded_point_capacity(total_selected, query);
+                        let [selected_ids, pts] = crate::sampling_gpu::occupancy_compact_points(
+                            flags,
+                            prefix,
+                            total_selected,
+                            padded_pts,
+                            n,
+                            cells_per_thread,
+                            r,
+                            seed,
+                        );
+                        let sdf = field.evaluate_device_tensor_valid(pts, total_selected, query);
+                        values = crate::sampling_gpu::occupancy_apply_selected(
+                            selected_ids,
+                            sdf,
+                            values,
+                            total_selected,
+                        );
+                    }
                 }
             }
             let threshold = values.clone().mean().clamp_max(0.1).reshape([1, 1]);

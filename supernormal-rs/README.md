@@ -1,5 +1,13 @@
 # SuperNormal reconstruction in Rust + Burn
 
+Newest update: GPU-driven occupancy with persistent weight reuse and fused EMA,
+hash-grid replay fused into backward for cache misses, and active-only forward
+weight staging. All are on by default. Comparison flags:
+`--legacy-occupancy-readback`, `--legacy-hash-replay`,
+`--dense-forward-weight-loads`. See
+[FUSED_REPLAY_OCCUPANCY.md](FUSED_REPLAY_OCCUPANCY.md) for limits and memory costs.
+Rebuild and test locally; this update has not been compiled or benchmarked.
+
 Latest training update: zero-state hash Adam, active-column parameter gradients,
 direct chunk adjoints, and selective backward weight staging are on by default.
 Independent fallback flags: `--dense-hash-adam`, `--dense-parameter-gradients`,

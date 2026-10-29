@@ -112,6 +112,18 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_feature_replay: bool,
+    /// Restore a separate full forward replay for chunks outside the feature cache.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_hash_replay: bool,
+    /// Stage every first-layer weight in forward before hash levels activate.
+    #[arg(long)]
+    #[serde(default)]
+    pub dense_forward_weight_loads: bool,
+    /// Restore occupancy count readback, chunked field queries and separate EMA application.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_occupancy_readback: bool,
     /// Restore one-output-per-thread parameter-gradient tiles.
     #[arg(long)]
     #[serde(default)]
@@ -393,6 +405,9 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.reuse_endpoints = !args.no_endpoint_reuse;
     field.feature_only_cache = !args.legacy_activation_cache;
     field.fused_feature_replay = !args.legacy_feature_replay;
+    field.fused_hash_replay = !args.legacy_hash_replay;
+    field.selective_forward_weights = !args.dense_forward_weight_loads;
+    field.device_occupancy_update = !args.legacy_occupancy_readback;
     field.register_gradient_tiles = !args.legacy_parameter_kernel;
     field.hybrid_activation_cache = args.hybrid_activation_cache && !args.no_hybrid_cache;
     field.fused_mlp_packing = !args.legacy_mlp_packing;

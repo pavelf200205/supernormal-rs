@@ -58,6 +58,9 @@ pub struct Field {
     pub chunked_eval: bool,
     pub feature_only_cache: bool,
     pub fused_feature_replay: bool,
+    pub fused_hash_replay: bool,
+    pub selective_forward_weights: bool,
+    pub device_occupancy_update: bool,
     pub register_gradient_tiles: bool,
     pub hybrid_activation_cache: bool,
     pub fused_mlp_packing: bool,
@@ -342,6 +345,9 @@ impl Field {
             chunked_eval: false,
             feature_only_cache: true,
             fused_feature_replay: true,
+            fused_hash_replay: true,
+            selective_forward_weights: true,
+            device_occupancy_update: true,
             register_gradient_tiles: true,
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
@@ -442,6 +448,9 @@ impl Field {
             chunked_eval: false,
             feature_only_cache: true,
             fused_feature_replay: true,
+            fused_hash_replay: true,
+            selective_forward_weights: true,
+            device_occupancy_update: true,
             register_gradient_tiles: true,
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
@@ -902,13 +911,7 @@ impl Field {
         self.fused_forward_cache_valid(xyz, valid_n, cache, cache)
     }
 
-    fn fused_forward_cache_valid(
-        &self,
-        xyz: Tensor<2>,
-        valid_n: usize,
-        cache_features: bool,
-        cache_preactivation: bool,
-    ) -> [Tensor<2>; 3] {
+    fn packed_mlp_weights(&self) -> Tensor<2> {
         if self.packed_mlp.borrow().is_none() {
             let weights = if self.fused_mlp_packing {
                 crate::kernels::pack_mlp_weights([
@@ -932,7 +935,37 @@ impl Field {
             };
             *self.packed_mlp.borrow_mut() = Some(weights);
         }
-        let weights = self.packed_mlp.borrow().as_ref().unwrap().clone();
+        self.packed_mlp.borrow().as_ref().unwrap().clone()
+    }
+
+    pub fn update_occupancy_device(
+        &self,
+        points: Tensor<2>,
+        prefix: Tensor<2>,
+        ids: Tensor<2>,
+        values: Tensor<2>,
+    ) -> Tensor<2> {
+        let weights = self.packed_mlp_weights();
+        let (tables, metadata) = self.packed_tables();
+        crate::kernels::fused_occupancy_field(
+            [points, tables, metadata, weights, prefix, ids, values],
+            self.active.min(14),
+            self.local_hash,
+            self.corner_parallel,
+            self.point_tiles,
+            self.subgroup_reduce,
+            self.selective_forward_weights,
+        )
+    }
+
+    fn fused_forward_cache_valid(
+        &self,
+        xyz: Tensor<2>,
+        valid_n: usize,
+        cache_features: bool,
+        cache_preactivation: bool,
+    ) -> [Tensor<2>; 3] {
+        let weights = self.packed_mlp_weights();
         let (tables, metadata) = self.packed_tables();
         crate::kernels::fused_field(
             [xyz, tables, metadata, weights],
@@ -944,6 +977,7 @@ impl Field {
             self.corner_parallel,
             self.point_tiles,
             self.subgroup_reduce,
+            self.selective_forward_weights,
         )
     }
 
@@ -1186,7 +1220,7 @@ impl Field {
         need_bias: bool,
     ) {
         let active_levels = self.active.min(14);
-        let (_, metadata) = self.packed_tables();
+        let (tables, metadata) = self.packed_tables();
         if !accumulated.params.contains_key("encoding.packed") {
             let total_entries = *self.level_offsets.last().unwrap();
             let grad_buf = self
@@ -1254,15 +1288,19 @@ impl Field {
             }
 
             let mut replay_features = false;
-            let (feat, preactivation) = match (chunk.feat, chunk.preactivation) {
+            let mut replay_hash = false;
+            let (mut feat, preactivation) = match (chunk.feat, chunk.preactivation) {
                 (Some(f), Some(p)) => (f, p),
                 (Some(f), None)
-                    if self.fused_feature_replay && !self.recompute_parameter_gradients =>
+                    if self.fused_field
+                        && self.fused_feature_replay
+                        && !self.recompute_parameter_gradients =>
                 {
                     replay_features = true;
                     crate::diagnostics::count("field.fused_feature_replay_points", n);
                     // Placeholder only: the shader rebuilds h in registers from f.
-                    (f.clone(), f)
+                    // Keep this separate from the feature output binding.
+                    (f, Tensor::empty([1, 64], &self.device))
                 }
                 (Some(f), None) => {
                     crate::diagnostics::count("field.mlp_only_recomputed_points", n);
@@ -1279,6 +1317,22 @@ impl Field {
                         active_levels,
                     );
                     (f, pre)
+                }
+                (None, _)
+                    if self.fused_field
+                        && self.fused_hash_replay
+                        && self.fused_feature_replay
+                        && !self.recompute_parameter_gradients =>
+                {
+                    replay_features = true;
+                    replay_hash = true;
+                    crate::diagnostics::count("field.fused_hash_replay_points", n);
+                    // Backward writes f and consumes h directly in registers.
+                    // No forward SDF or [N,64] preactivation allocation is needed.
+                    (
+                        Tensor::empty([padded_n, 31], &self.device),
+                        Tensor::empty([1, 64], &self.device),
+                    )
                 }
                 _ => {
                     crate::diagnostics::count("field.recomputed_points", n);
@@ -1306,15 +1360,16 @@ impl Field {
                     .expect("cached forward packs weights")
                     .clone();
                 let table_grad = accumulated.params.remove("encoding.packed").unwrap();
-                let [updated, dh, dw1] = crate::kernels::field_backward(
+                let [updated, dh, dw1, backward_feat] = crate::kernels::field_backward(
                     [
                         preactivation,
                         ds_tensor.clone(),
                         weights,
                         chunk.pts_tensor.clone(),
                         metadata.clone(),
-                        feat.clone(),
+                        feat,
                         table_grad,
+                        tables.clone(),
                     ],
                     n,
                     active_levels,
@@ -1328,7 +1383,9 @@ impl Field {
                     replay_features,
                     adjoint_offset,
                     self.selective_backward_weights,
+                    replay_hash,
                 );
+                feat = backward_feat;
                 accumulated.params.insert("encoding.packed".into(), updated);
                 (
                     dh,

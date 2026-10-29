@@ -1130,12 +1130,192 @@ fn field_feature_index(slot: usize, feature: usize, #[comptime] local_hash: bool
     }
 }
 
+// Identical interpolation and reduction order for forward and backward replay.
+// All callers use a complete 256-thread group and uniform barriers.
+#[cube]
+fn field_hash_tile(
+    points: &Tensor<f32>,
+    tables: &Tensor<f32>,
+    metadata: &Tensor<f32>,
+    shared_features: &mut Shared<[f32]>,
+    partials: &mut Shared<[f32]>,
+    unit: usize,
+    group: usize,
+    n_valid: usize,
+    active: u32,
+    #[comptime] local_hash: bool,
+    #[comptime] corner_parallel: bool,
+) {
+    let lane = unit % 64;
+    let slot = unit / 64;
+    let point_idx = group * 4 + slot;
+    let valid = point_idx < n_valid;
+    if lane < 32 {
+        shared_features[field_feature_index(slot, lane, local_hash)] = 0.0_f32;
+    }
+    sync_cube();
+    if valid {
+        let p0 = points[point_idx * 3];
+        let p1 = points[point_idx * 3 + 1];
+        let p2 = points[point_idx * 3 + 2];
+        if lane == 0 {
+            shared_features[field_feature_index(slot, 0, local_hash)] = p0;
+            shared_features[field_feature_index(slot, 1, local_hash)] = p1;
+            shared_features[field_feature_index(slot, 2, local_hash)] = p2;
+        }
+    }
+    if corner_parallel {
+        // Map 256 threads to (hash_slot in 0..4, corner_pair in 0..4, level in 0..16).
+        // Up to 4 * 4 * 14 = 224 threads concurrently fetch 2 corners each (448 lookups
+        // in flight per workgroup), then reduce the 4 corner-pairs in shared memory.
+        let hash_slot = unit & 3usize;
+        let corner_pair = (unit >> 2) & 3usize;
+        let level = unit >> 4;
+        let hash_point = group * 4 + hash_slot;
+        let mut feat0 = 0.0_f32;
+        let mut feat1 = 0.0_f32;
+        if hash_point < n_valid && level < usize::cast_from(active) {
+            let p0 = points[hash_point * 3];
+            let p1 = points[hash_point * 3 + 1];
+            let p2 = points[hash_point * 3 + 2];
+            let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
+            let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
+            let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
+            let res = u32::cast_from(metadata[level * 2]);
+            let offset = u32::cast_from(metadata[level * 2 + 1]);
+            let c0 = norm0 * f32::cast_from(res);
+            let c1 = norm1 * f32::cast_from(res);
+            let c2 = norm2 * f32::cast_from(res);
+            let b0 = f32::floor(c0);
+            let b1 = f32::floor(c1);
+            let b2 = f32::floor(c2);
+            let w0 = c0 - b0;
+            let w1 = c1 - b1;
+            let w2 = c2 - b2;
+            let base0 = u32::cast_from(b0);
+            let base1 = u32::cast_from(b1);
+            let base2 = u32::cast_from(b2);
+            let r1 = res + 1;
+            let dense = r1 * r1 * r1 <= 524288;
+            for c_sub in 0..2u32 {
+                let corner = u32::cast_from(corner_pair) * 2 + c_sub;
+                let bit0 = corner & 1;
+                let bit1 = (corner >> 1) & 1;
+                let bit2 = (corner >> 2) & 1;
+                let v0 = base0 + bit0;
+                let v1 = base1 + bit1;
+                let v2 = base2 + bit2;
+                let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
+                let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
+                let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
+                let weight = kw0 * kw1 * kw2;
+                let idx = if dense {
+                    v0 + v1 * r1 + v2 * r1 * r1
+                } else {
+                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                };
+                let entry = usize::cast_from(offset + idx) * 2;
+                feat0 += weight * tables[entry];
+                feat1 += weight * tables[entry + 1];
+            }
+        }
+        partials[unit * 2] = feat0;
+        partials[unit * 2 + 1] = feat1;
+        sync_cube();
+        let red_slot = unit & 3usize;
+        let red_level = unit >> 2;
+        if red_level < usize::cast_from(active) {
+            let base_p = (red_level * 16 + red_slot) * 2;
+            let sum0 = (partials[base_p] + partials[base_p + 8])
+                + (partials[base_p + 16] + partials[base_p + 24]);
+            let sum1 = (partials[base_p + 1] + partials[base_p + 9])
+                + (partials[base_p + 17] + partials[base_p + 25]);
+            shared_features[field_feature_index(red_slot, 3 + red_level * 2, local_hash)] = sum0;
+            shared_features[field_feature_index(red_slot, 4 + red_level * 2, local_hash)] = sum1;
+        }
+    } else {
+        // Legacy 56-thread hash evaluation: one thread loops over all 8 corners.
+        let hash_slot = if local_hash { unit % 4 } else { slot };
+        let level = if local_hash { unit / 4 } else { lane };
+        let hash_point = group * 4 + hash_slot;
+        if hash_point < n_valid && level < usize::cast_from(active) {
+            let p0 = points[hash_point * 3];
+            let p1 = points[hash_point * 3 + 1];
+            let p2 = points[hash_point * 3 + 2];
+            let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
+            let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
+            let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
+            let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
+            let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
+            let c0 = norm0 * f32::cast_from(res);
+            let c1 = norm1 * f32::cast_from(res);
+            let c2 = norm2 * f32::cast_from(res);
+            let b0 = f32::floor(c0);
+            let b1 = f32::floor(c1);
+            let b2 = f32::floor(c2);
+            let w0 = c0 - b0;
+            let w1 = c1 - b1;
+            let w2 = c2 - b2;
+            let base0 = u32::cast_from(b0);
+            let base1 = u32::cast_from(b1);
+            let base2 = u32::cast_from(b2);
+            let r1 = res + 1;
+            let dense = r1 * r1 * r1 <= 524288;
+            let mut feat0 = 0.0_f32;
+            let mut feat1 = 0.0_f32;
+            for corner in 0..8u32 {
+                let bit0 = corner & 1;
+                let bit1 = (corner >> 1) & 1;
+                let bit2 = (corner >> 2) & 1;
+                let v0 = base0 + bit0;
+                let v1 = base1 + bit1;
+                let v2 = base2 + bit2;
+                let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
+                let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
+                let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
+                let weight = kw0 * kw1 * kw2;
+                let idx = if dense {
+                    v0 + v1 * r1 + v2 * r1 * r1
+                } else {
+                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                };
+                let entry = usize::cast_from(offset + idx) * 2;
+                feat0 += weight * tables[entry];
+                feat1 += weight * tables[entry + 1];
+            }
+            shared_features[field_feature_index(hash_slot, 3 + level * 2, local_hash)] = feat0;
+            shared_features[field_feature_index(hash_slot, 4 + level * 2, local_hash)] = feat1;
+        }
+    }
+    sync_cube();
+}
+
+// Occupancy cell IDs are unique; each selected cell has exactly one writer.
+#[cube]
+fn field_store_result(
+    output: &mut Tensor<f32>,
+    selected_ids: &Tensor<f32>,
+    point: usize,
+    sdf: f32,
+    #[comptime] occupancy: bool,
+) {
+    if occupancy {
+        let cell = usize::cast_from(selected_ids[point]);
+        let density = 1.0_f32 / (1.0_f32 + f32::exp(80.0_f32 * sdf));
+        output[cell] = f32::max(output[cell] * 0.95_f32, density);
+    } else {
+        output[point] = sdf;
+    }
+}
+
 #[cube(launch)]
 fn fused_field_kernel(
     points: &Tensor<f32>,
     tables: &Tensor<f32>,
     metadata: &Tensor<f32>,
     weights: &Tensor<f32>,
+    count_prefix: &Tensor<f32>,
+    selected_ids: &Tensor<f32>,
     output: &mut Tensor<f32>,
     features: &mut Tensor<f32>,
     preactivation: &mut Tensor<f32>,
@@ -1147,6 +1327,8 @@ fn fused_field_kernel(
     #[comptime] corner_parallel: bool,
     #[comptime] point_tiles: usize,
     #[comptime] subgroup_width: usize,
+    #[comptime] selective_weights: bool,
+    #[comptime] occupancy: bool,
 ) {
     // CubeCL workgroup coordinates are u32; tensor/shared indices are usize.
     let mut unit = usize::cast_from(UNIT_POS);
@@ -1155,220 +1337,136 @@ fn fused_field_kernel(
         // assume the backend maps local invocation IDs to subgroups linearly.
         unit = usize::cast_from(PLANE_POS) * subgroup_width + usize::cast_from(UNIT_POS_PLANE);
     }
+    let group_base = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * point_tiles;
+    let mut n_valid = usize::cast_from(valid_n);
+    if occupancy {
+        n_valid = usize::cast_from(count_prefix[count_prefix.shape(0) - 1]);
+    }
+    // Uniform workgroup exit before any barrier, weights or point reads.
+    // Occupancy uses a bounded grid; the actual workload remains device-resident.
+    if group_base * 4 >= n_valid {
+        terminate!();
+    }
     let mut shared_weights = Shared::new_slice(2113usize);
     for tile in 0..9usize {
         let index = unit + tile * 256;
         if index < 2113 {
-            shared_weights[index] = weights[index];
+            if !selective_weights || index >= 1984 || index / 64 < 3 + usize::cast_from(active) * 2
+            {
+                shared_weights[index] = weights[index];
+            }
         }
     }
     sync_cube();
-    // Reuse the staged weights for several bounded four-point tiles.
-    for point_tile in 0..point_tiles {
-        let lane = unit % 64;
-        let slot = unit / 64;
-        let group =
-            usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * point_tiles + point_tile;
-        let point_idx = group * 4 + slot;
-        let n_valid = usize::cast_from(valid_n);
-        let valid = point_idx < n_valid;
-        let mut shared_features = Shared::new_slice(128usize);
-        let mut partials = Shared::new_slice(if corner_parallel { 512usize } else { 256usize });
-        if lane < 32 {
-            shared_features[field_feature_index(slot, lane, local_hash)] = 0.0_f32;
-        }
-        sync_cube();
-        if valid {
-            let p0 = points[point_idx * 3];
-            let p1 = points[point_idx * 3 + 1];
-            let p2 = points[point_idx * 3 + 2];
-            if lane == 0 {
-                shared_features[field_feature_index(slot, 0, local_hash)] = p0;
-                shared_features[field_feature_index(slot, 1, local_hash)] = p1;
-                shared_features[field_feature_index(slot, 2, local_hash)] = p2;
-            }
-        }
-        if corner_parallel {
-            // Map 256 threads to (hash_slot in 0..4, corner_pair in 0..4, level in 0..16).
-            // Up to 4 * 4 * 14 = 224 threads concurrently fetch 2 corners each (448 lookups
-            // in flight per workgroup), then reduce the 4 corner-pairs in shared memory.
-            let hash_slot = unit & 3usize;
-            let corner_pair = (unit >> 2) & 3usize;
-            let level = unit >> 4;
-            let hash_point = group * 4 + hash_slot;
-            let mut feat0 = 0.0_f32;
-            let mut feat1 = 0.0_f32;
-            if hash_point < n_valid && level < usize::cast_from(active) {
-                let p0 = points[hash_point * 3];
-                let p1 = points[hash_point * 3 + 1];
-                let p2 = points[hash_point * 3 + 2];
-                let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
-                let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
-                let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
-                let res = u32::cast_from(metadata[level * 2]);
-                let offset = u32::cast_from(metadata[level * 2 + 1]);
-                let c0 = norm0 * f32::cast_from(res);
-                let c1 = norm1 * f32::cast_from(res);
-                let c2 = norm2 * f32::cast_from(res);
-                let b0 = f32::floor(c0);
-                let b1 = f32::floor(c1);
-                let b2 = f32::floor(c2);
-                let w0 = c0 - b0;
-                let w1 = c1 - b1;
-                let w2 = c2 - b2;
-                let base0 = u32::cast_from(b0);
-                let base1 = u32::cast_from(b1);
-                let base2 = u32::cast_from(b2);
-                let r1 = res + 1;
-                let dense = r1 * r1 * r1 <= 524288;
-                for c_sub in 0..2u32 {
-                    let corner = u32::cast_from(corner_pair) * 2 + c_sub;
-                    let bit0 = corner & 1;
-                    let bit1 = (corner >> 1) & 1;
-                    let bit2 = (corner >> 2) & 1;
-                    let v0 = base0 + bit0;
-                    let v1 = base1 + bit1;
-                    let v2 = base2 + bit2;
-                    let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
-                    let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
-                    let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
-                    let weight = kw0 * kw1 * kw2;
-                    let idx = if dense {
-                        v0 + v1 * r1 + v2 * r1 * r1
-                    } else {
-                        (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
-                    };
-                    let entry = usize::cast_from(offset + idx) * 2;
-                    feat0 += weight * tables[entry];
-                    feat1 += weight * tables[entry + 1];
+    // Occupancy uses a bounded persistent grid: stage weights once, then consume
+    // as many compacted tiles as the device count requires. No capacity-sized
+    // field dispatch and no CPU count readback are necessary.
+    let group_stride =
+        usize::cast_from(CUBE_COUNT_X) * usize::cast_from(CUBE_COUNT_Y) * point_tiles;
+    let mut wave_base = group_base;
+    while wave_base * 4 < n_valid {
+        // Reuse the staged weights for several bounded four-point tiles.
+        for point_tile in 0..point_tiles {
+            let lane = unit % 64;
+            let slot = unit / 64;
+            let group = wave_base + point_tile;
+            let point_idx = group * 4 + slot;
+            let valid = point_idx < n_valid;
+            let mut shared_features = Shared::new_slice(128usize);
+            let mut partials = Shared::new_slice(if corner_parallel { 512usize } else { 256usize });
+            field_hash_tile(
+                points,
+                tables,
+                metadata,
+                &mut shared_features,
+                &mut partials,
+                unit,
+                group,
+                n_valid,
+                active,
+                local_hash,
+                corner_parallel,
+            );
+            let mut contribution = 0.0_f32;
+            if valid {
+                let mut h = 0.0_f32;
+                // Packed input-major weights give adjacent lanes adjacent reads.
+                for k in 0..(3 + usize::cast_from(active) * 2) {
+                    h += shared_features[field_feature_index(slot, k, local_hash)]
+                        * shared_weights[k * 64 + lane];
                 }
-            }
-            partials[unit * 2] = feat0;
-            partials[unit * 2 + 1] = feat1;
-            sync_cube();
-            let red_slot = unit & 3usize;
-            let red_level = unit >> 2;
-            if red_level < usize::cast_from(active) {
-                let base_p = (red_level * 16 + red_slot) * 2;
-                let sum0 = (partials[base_p] + partials[base_p + 8])
-                    + (partials[base_p + 16] + partials[base_p + 24]);
-                let sum1 = (partials[base_p + 1] + partials[base_p + 9])
-                    + (partials[base_p + 17] + partials[base_p + 25]);
-                shared_features[field_feature_index(red_slot, 3 + red_level * 2, local_hash)] =
-                    sum0;
-                shared_features[field_feature_index(red_slot, 4 + red_level * 2, local_hash)] =
-                    sum1;
-            }
-        } else {
-            // Legacy 56-thread hash evaluation: one thread loops over all 8 corners.
-            let hash_slot = if local_hash { unit % 4 } else { slot };
-            let level = if local_hash { unit / 4 } else { lane };
-            let hash_point = group * 4 + hash_slot;
-            if hash_point < n_valid && level < usize::cast_from(active) {
-                let p0 = points[hash_point * 3];
-                let p1 = points[hash_point * 3 + 1];
-                let p2 = points[hash_point * 3 + 2];
-                let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
-                let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
-                let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
-                let res = u32::cast_from(metadata[usize::cast_from(level) * 2]);
-                let offset = u32::cast_from(metadata[usize::cast_from(level) * 2 + 1]);
-                let c0 = norm0 * f32::cast_from(res);
-                let c1 = norm1 * f32::cast_from(res);
-                let c2 = norm2 * f32::cast_from(res);
-                let b0 = f32::floor(c0);
-                let b1 = f32::floor(c1);
-                let b2 = f32::floor(c2);
-                let w0 = c0 - b0;
-                let w1 = c1 - b1;
-                let w2 = c2 - b2;
-                let base0 = u32::cast_from(b0);
-                let base1 = u32::cast_from(b1);
-                let base2 = u32::cast_from(b2);
-                let r1 = res + 1;
-                let dense = r1 * r1 * r1 <= 524288;
-                let mut feat0 = 0.0_f32;
-                let mut feat1 = 0.0_f32;
-                for corner in 0..8u32 {
-                    let bit0 = corner & 1;
-                    let bit1 = (corner >> 1) & 1;
-                    let bit2 = (corner >> 2) & 1;
-                    let v0 = base0 + bit0;
-                    let v1 = base1 + bit1;
-                    let v2 = base2 + bit2;
-                    let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
-                    let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
-                    let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
-                    let weight = kw0 * kw1 * kw2;
-                    let idx = if dense {
-                        v0 + v1 * r1 + v2 * r1 * r1
-                    } else {
-                        (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
-                    };
-                    let entry = usize::cast_from(offset + idx) * 2;
-                    feat0 += weight * tables[entry];
-                    feat1 += weight * tables[entry + 1];
+                h += shared_weights[1984 + lane];
+                if cache_preactivation {
+                    preactivation[point_idx * 64 + lane] = h;
                 }
-                shared_features[field_feature_index(hash_slot, 3 + level * 2, local_hash)] = feat0;
-                shared_features[field_feature_index(hash_slot, 4 + level * 2, local_hash)] = feat1;
-            }
-        }
-        sync_cube();
-        let mut contribution = 0.0_f32;
-        if valid {
-            let mut h = 0.0_f32;
-            // Packed input-major weights give adjacent lanes adjacent reads.
-            for k in 0..(3 + usize::cast_from(active) * 2) {
-                h += shared_features[field_feature_index(slot, k, local_hash)]
-                    * shared_weights[k * 64 + lane];
-            }
-            h += shared_weights[1984 + lane];
-            if cache_preactivation {
-                preactivation[point_idx * 64 + lane] = h;
-            }
-            if cache {
-                if lane < 31 {
-                    features[point_idx * 31 + lane] =
-                        shared_features[field_feature_index(slot, lane, local_hash)];
+                if cache {
+                    if lane < 31 {
+                        features[point_idx * 31 + lane] =
+                            shared_features[field_feature_index(slot, lane, local_hash)];
+                    }
                 }
+                let scaled = h * 100.;
+                let soft = f32::ln(1. + f32::exp(f32::min(scaled, 20.))) / 100.;
+                let activated = if scaled > 20. { h } else { soft };
+                contribution = activated * shared_weights[2048 + lane];
             }
-            let scaled = h * 100.;
-            let soft = f32::ln(1. + f32::exp(f32::min(scaled, 20.))) / 100.;
-            let activated = if scaled > 20. { h } else { soft };
-            contribution = activated * shared_weights[2048 + lane];
-        }
-        if subgroup_width > 0 {
-            let sum = plane_sum(contribution);
-            if subgroup_width == 64 {
-                if valid && lane == 0 {
-                    output[point_idx] = sum + shared_weights[2112];
+            if subgroup_width > 0 {
+                let sum = plane_sum(contribution);
+                if subgroup_width == 64 {
+                    if valid && lane == 0 {
+                        field_store_result(
+                            output,
+                            selected_ids,
+                            point_idx,
+                            sum + shared_weights[2112],
+                            occupancy,
+                        );
+                    }
+                } else {
+                    partials[unit] = sum;
+                    sync_cube();
+                    if valid && lane == 0 {
+                        field_store_result(
+                            output,
+                            selected_ids,
+                            point_idx,
+                            partials[slot * 64] + partials[slot * 64 + 32] + shared_weights[2112],
+                            occupancy,
+                        );
+                    }
                 }
             } else {
-                partials[unit] = sum;
+                partials[unit] = contribution;
                 sync_cube();
+                // Fixed tree reduction, no float atomics and no subgroup-size assumptions.
+                for stage in 0..6usize {
+                    let width = 32usize >> stage;
+                    if lane < width {
+                        partials[unit] += partials[unit + width];
+                    }
+                    sync_cube();
+                }
                 if valid && lane == 0 {
-                    output[point_idx] =
-                        partials[slot * 64] + partials[slot * 64 + 32] + shared_weights[2112];
+                    field_store_result(
+                        output,
+                        selected_ids,
+                        point_idx,
+                        partials[slot * 64] + shared_weights[2112],
+                        occupancy,
+                    );
                 }
             }
-        } else {
-            partials[unit] = contribution;
-            sync_cube();
-            // Fixed tree reduction, no float atomics and no subgroup-size assumptions.
-            for stage in 0..6usize {
-                let width = 32usize >> stage;
-                if lane < width {
-                    partials[unit] += partials[unit + width];
-                }
+            // The next hash tile reuses partials after every lane has consumed them.
+            if point_tiles > 1 {
                 sync_cube();
-            }
-            if valid && lane == 0 {
-                output[point_idx] = partials[slot * 64] + shared_weights[2112];
             }
         }
-        // The next hash tile reuses partials after every lane has consumed them.
-        if point_tiles > 1 {
+        if occupancy {
+            // Every lane must finish its final tile before shared storage is reused.
             sync_cube();
+            wave_base += group_stride;
+        } else {
+            break;
         }
     }
 }
@@ -1490,7 +1588,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([p, t, m, w, y, f, h], [oy, of, oh]) = self.desc.as_fixed();
+        let ([p, t, m, w, c, i, y, f, h], [oy, of, oh]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(active),
             ScalarIr::UInt(valid_n),
@@ -1500,14 +1598,37 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             ScalarIr::UInt(corner_parallel),
             ScalarIr::UInt(point_tiles),
             ScalarIr::UInt(subgroup_reduce),
+            ScalarIr::UInt(selective_weights),
+            ScalarIr::UInt(occupancy),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid fused field arguments")
         };
-        let [points, tables, metadata, weights, output, features, hidden] =
-            [p, t, m, w, y, f, h].map(|ir| handles.get_float_tensor::<CubeBackend>(ir));
+        let [
+            points,
+            tables,
+            metadata,
+            weights,
+            prefix,
+            ids,
+            output,
+            features,
+            hidden,
+        ] = [p, t, m, w, c, i, y, f, h].map(|ir| handles.get_float_tensor::<CubeBackend>(ir));
+        let output = if *occupancy != 0 && !output.can_mut() {
+            output.copy()
+        } else {
+            output
+        };
         let client = points.client.clone();
-        let _timing = crate::diagnostics::start(&client, "field_forward");
+        let _timing = crate::diagnostics::start(
+            &client,
+            if *occupancy != 0 {
+                "occupancy.fused_field_apply"
+            } else {
+                "field_forward"
+            },
+        );
         let props = client.properties();
         let hw = &props.hardware;
         let subgroup_width = if *subgroup_reduce != 0
@@ -1525,7 +1646,10 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
         let point_tiles = (*point_tiles as usize).clamp(1, 4);
         static NOTICE: std::sync::Once = std::sync::Once::new();
         NOTICE.call_once(|| eprintln!("Field forward: {} points/group; subgroup reduction width {} (0 = portable shared tree)", point_tiles * 4, subgroup_width));
-        let groups = (*valid_n as usize).div_ceil(4 * point_tiles).max(1);
+        let mut groups = (*valid_n as usize).div_ceil(4 * point_tiles).max(1);
+        if *occupancy != 0 {
+            groups = groups.min(4096);
+        }
         let gx = groups.min(65535).max(1);
         fused_field_kernel::launch(
             &client,
@@ -1535,6 +1659,8 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             tables.into_tensor_arg(),
             metadata.into_tensor_arg(),
             weights.into_tensor_arg(),
+            prefix.into_tensor_arg(),
+            ids.into_tensor_arg(),
             output.clone().into_tensor_arg(),
             features.clone().into_tensor_arg(),
             hidden.clone().into_tensor_arg(),
@@ -1546,6 +1672,8 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             *corner_parallel != 0,
             point_tiles,
             subgroup_width,
+            *selective_weights != 0,
+            *occupancy != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&oy.id, output);
         handles.register_float_tensor::<CubeBackend>(&of.id, features);
@@ -1564,6 +1692,7 @@ pub fn fused_field(
     corner_parallel: bool,
     point_tiles: usize,
     subgroup_reduce: bool,
+    selective_weights: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     let n = inputs[0].dims()[0];
     let device = inputs[0].device();
@@ -1575,13 +1704,83 @@ pub fn fused_field(
         burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 31], &device),
         burn::tensor::Tensor::<2>::empty([if cache_preactivation { n } else { 1 }, 64], &device),
     ];
+    let [points, tables, metadata, weights] = inputs;
+    let dummy = points.clone();
+    fused_field_op(
+        [points, tables, metadata, weights, dummy.clone(), dummy],
+        buffers,
+        valid_n,
+        active,
+        cache,
+        cache_preactivation,
+        local_hash,
+        corner_parallel,
+        point_tiles,
+        subgroup_reduce,
+        selective_weights,
+        false,
+    )
+}
+
+/// Capacity-bounded occupancy evaluation + EMA, without an SDF buffer or count readback.
+/// Inputs: compact points, hash table, metadata, MLP, count prefix, unique cell IDs, values.
+pub fn fused_occupancy_field(
+    inputs: [burn::tensor::Tensor<2>; 7],
+    active: usize,
+    local_hash: bool,
+    corner_parallel: bool,
+    point_tiles: usize,
+    subgroup_reduce: bool,
+    selective_weights: bool,
+) -> burn::tensor::Tensor<2> {
+    use burn::tensor::Tensor as BT;
+    let [points, tables, metadata, weights, prefix, ids, values] = inputs;
+    let cap = points.dims()[0];
+    assert!(cap == values.dims()[0] && ids.dims()[0] >= cap);
+    assert!(prefix.dims()[0] > 0 && prefix.dims()[1] == 1);
+    let device = points.device();
+    let [values, _, _] = fused_field_op(
+        [points, tables, metadata, weights, prefix, ids],
+        [
+            values,
+            BT::empty([1, 31], &device),
+            BT::empty([1, 64], &device),
+        ],
+        cap,
+        active,
+        false,
+        false,
+        local_hash,
+        corner_parallel,
+        point_tiles,
+        subgroup_reduce,
+        selective_weights,
+        true,
+    );
+    values
+}
+
+fn fused_field_op(
+    inputs: [burn::tensor::Tensor<2>; 6],
+    buffers: [burn::tensor::Tensor<2>; 3],
+    valid_n: usize,
+    active: usize,
+    cache: bool,
+    cache_preactivation: bool,
+    local_hash: bool,
+    corner_parallel: bool,
+    point_tiles: usize,
+    subgroup_reduce: bool,
+    selective_weights: bool,
+    occupancy: bool,
+) -> [burn::tensor::Tensor<2>; 3] {
     let inputs: Vec<_> = inputs
         .into_iter()
         .chain(buffers)
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = inputs[4..]
+    let outputs: Vec<_> = inputs[6..]
         .iter()
         .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
         .collect();
@@ -1598,6 +1797,8 @@ pub fn fused_field(
             ScalarIr::UInt(corner_parallel as u64),
             ScalarIr::UInt(point_tiles as u64),
             ScalarIr::UInt(subgroup_reduce as u64),
+            ScalarIr::UInt(selective_weights as u64),
+            ScalarIr::UInt(occupancy as u64),
         ],
     );
     let result: [_; 3] = client
@@ -2009,21 +2210,22 @@ pub fn composite_gpu(
 }
 
 // Shared memory is 2,821 floats plus the optional 128-float replay tile
-// (11,796 bytes < 12 KiB); actual residency also depends on register allocation
-// and device limits.
+// (11,796 bytes); hash replay adds 64 scratch floats (12,052 bytes < 12 KiB).
+// Actual residency also depends on register allocation and device limits.
 // Both the 64-neuron `dh * W0` feature-gradient dot product (16 iterations per
 // thread across 224 threads) and the 8-corner trilinear hash scatter (2 corners
 // per thread across 224 threads) execute across 87.5% of the workgroup.
 #[cube(launch)]
 fn field_backward_kernel(
     pre: &Tensor<f32>,
-    features: &Tensor<f32>,
+    features: &mut Tensor<f32>,
     ds: &Tensor<f32>,
     weights: &Tensor<f32>,
     dh: &mut Tensor<f32>,
     dw1: &mut Tensor<f32>,
     points: &Tensor<f32>,
     metadata: &Tensor<f32>,
+    tables: &Tensor<f32>,
     table_grad: &Tensor<Atomic<u32>>,
     active: u32,
     valid_n: u32,
@@ -2037,6 +2239,7 @@ fn field_backward_kernel(
     #[comptime] write_dh: bool,
     #[comptime] replay_features: bool,
     #[comptime] selective_weights: bool,
+    #[comptime] replay_hash: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -2068,10 +2271,40 @@ fn field_backward_kernel(
     let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
     let point = group * 4 + slot;
     let n_valid = usize::cast_from(valid_n);
+    // Hash interpolation scratch is reused by output/feature gradients below.
+    // Cache hits retain their original allocation; misses add only 64 floats.
+    let mut partials = Shared::new_slice(if replay_hash && corner_parallel {
+        512usize
+    } else if corner_parallel {
+        448usize
+    } else if compact_gradients || replay_hash {
+        256usize
+    } else {
+        1usize
+    });
     // Only replay variants need this 512-byte tile. Stage each feature once for
     // all 64 neurons; no full preactivation buffer is written or read.
     let mut replay = Shared::new_slice(if replay_features { 128usize } else { 1usize });
-    if replay_features {
+    if replay_hash {
+        field_hash_tile(
+            points,
+            tables,
+            metadata,
+            &mut replay,
+            &mut partials,
+            unit,
+            group,
+            n_valid,
+            active,
+            local_hash,
+            corner_parallel,
+        );
+        // Parameter gradients consume these features after this dispatch.
+        // All 31 columns are initialized, including inactive hash levels.
+        if point < n_valid && lane < 31 {
+            features[point * 31 + lane] = replay[field_feature_index(slot, lane, local_hash)];
+        }
+    } else if replay_features {
         if unit < 128 {
             let p = group * 4 + unit / 32;
             let col = unit % 32;
@@ -2087,13 +2320,6 @@ fn field_backward_kernel(
     let mut shared = Shared::new_slice(256usize);
     // Reused first for `output_grads` `[256]` and then for 224-thread partial
     // feature gradients `[448]`, keeping shared memory under 12 KB per block.
-    let mut partials = Shared::new_slice(if corner_parallel {
-        448usize
-    } else if compact_gradients {
-        256usize
-    } else {
-        1usize
-    });
     let mut slot_ds = Shared::new_slice(4usize);
     let mut output_grad = 0.0_f32;
     let mut v = 0.0_f32;
@@ -2109,7 +2335,12 @@ fn field_backward_kernel(
                     } else {
                         col * 64 + lane
                     };
-                    h += replay[slot * 32 + col] * shared_weights[wi];
+                    let fi = if replay_hash {
+                        field_feature_index(slot, col, local_hash)
+                    } else {
+                        slot * 32 + col
+                    };
+                    h += replay[fi] * shared_weights[wi];
                 }
                 h += shared_weights[1984 + lane];
             } else {
@@ -2453,7 +2684,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([p, d, w, x, m, f, t, h, g], [ot, oh, og]) = self.desc.as_fixed();
+        let ([p, d, w, x, m, f, t, e, h, g], [ot, oh, og, of]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(active),
             ScalarIr::UInt(valid_n),
@@ -2467,12 +2698,13 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
             ScalarIr::UInt(replay_features),
             ScalarIr::UInt(adjoint_offset),
             ScalarIr::UInt(selective_weights),
+            ScalarIr::UInt(replay_hash),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid backward scalars")
         };
-        let [p, d, w, x, m, f, t, h, g] =
-            [p, d, w, x, m, f, t, h, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [p, d, w, x, m, f, t, e, h, g] =
+            [p, d, w, x, m, f, t, e, h, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let t = if t.can_mut() {
             t
         } else {
@@ -2481,6 +2713,11 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 t.meta.shape().dims::<2>().iter().product::<usize>() * 4,
             );
             t.copy()
+        };
+        let f = if *replay_hash != 0 && !f.can_mut() {
+            f.copy()
+        } else {
+            f
         };
         let client = p.client.clone();
         let _timing = crate::diagnostics::start(&client, "field_backward");
@@ -2522,13 +2759,14 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 CubeCount::Static(gx as u32, groups.div_ceil(gx) as u32, 1),
                 CubeDim::new_1d(256),
                 p.into_tensor_arg(),
-                f.into_tensor_arg(),
+                f.clone().into_tensor_arg(),
                 d.into_tensor_arg(),
                 w.into_tensor_arg(),
                 h.clone().into_tensor_arg(),
                 g.clone().into_tensor_arg(),
                 x.into_tensor_arg(),
                 m.into_tensor_arg(),
+                e.into_tensor_arg(),
                 t.clone().into_tensor_arg(),
                 *active as u32,
                 *valid_n as u32,
@@ -2542,6 +2780,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *write_dh != 0,
                 *replay_features != 0,
                 *selective_weights != 0,
+                *replay_hash != 0,
             );
         } else {
             field_backward_kernel::launch(
@@ -2549,13 +2788,14 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 CubeCount::Static(gx as u32, groups.div_ceil(gx) as u32, 1),
                 CubeDim::new_1d(256),
                 p.into_tensor_arg(),
-                f.into_tensor_arg(),
+                f.clone().into_tensor_arg(),
                 d.into_tensor_arg(),
                 w.into_tensor_arg(),
                 h.clone().into_tensor_arg(),
                 g.clone().into_tensor_arg(),
                 x.into_tensor_arg(),
                 m.into_tensor_arg(),
+                e.into_tensor_arg(),
                 t.clone().into_tensor_arg(),
                 *active as u32,
                 *valid_n as u32,
@@ -2569,16 +2809,18 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *write_dh != 0,
                 *replay_features != 0,
                 *selective_weights != 0,
+                *replay_hash != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
         handles.register_float_tensor::<CubeBackend>(&oh.id, h);
         handles.register_float_tensor::<CubeBackend>(&og.id, g);
+        handles.register_float_tensor::<CubeBackend>(&of.id, f);
         Ok(())
     }
 }
 pub fn field_backward(
-    inputs: [burn::tensor::Tensor<2>; 7],
+    inputs: [burn::tensor::Tensor<2>; 8],
     valid_n: usize,
     active: usize,
     local_hash: bool,
@@ -2591,13 +2833,16 @@ pub fn field_backward(
     replay_features: bool,
     adjoint_offset: usize,
     selective_weights: bool,
-) -> [burn::tensor::Tensor<2>; 3] {
+    replay_hash: bool,
+) -> [burn::tensor::Tensor<2>; 4] {
     use burn::tensor::Tensor as BT;
     assert!(
         adjoint_offset <= inputs[1].dims()[0] && valid_n <= inputs[1].dims()[0] - adjoint_offset
     );
     assert!(adjoint_offset <= u32::MAX as usize);
-    let n = inputs[0].dims()[0];
+    assert!(!replay_hash || (replay_features && write_dh));
+    let n = inputs[3].dims()[0];
+    assert!(valid_n <= n && valid_n <= inputs[5].dims()[0]);
     let device = inputs[0].device();
     let dw1_rows = if compact_gradients {
         valid_n.div_ceil(4).max(1)
@@ -2613,8 +2858,9 @@ pub fn field_backward(
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = inputs[6..]
-        .iter()
+    let outputs: Vec<_> = [6usize, 8, 9, 5]
+        .into_iter()
+        .map(|i| &inputs[i])
         .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
         .collect();
     let desc = CustomOpIr::with_scalars(
@@ -2634,9 +2880,10 @@ pub fn field_backward(
             ScalarIr::UInt(replay_features as u64),
             ScalarIr::UInt(adjoint_offset as u64),
             ScalarIr::UInt(selective_weights as u64),
+            ScalarIr::UInt(replay_hash as u64),
         ],
     );
-    let result: [_; 3] = client
+    let result: [_; 4] = client
         .register(
             StreamId::current(),
             OperationIr::Custom(desc.clone()),
@@ -3057,13 +3304,14 @@ pub fn visibility(
 #[cube(launch)]
 fn field_backward_native_kernel(
     pre: &Tensor<f32>,
-    features: &Tensor<f32>,
+    features: &mut Tensor<f32>,
     ds: &Tensor<f32>,
     weights: &Tensor<f32>,
     dh: &mut Tensor<f32>,
     dw1: &mut Tensor<f32>,
     points: &Tensor<f32>,
     metadata: &Tensor<f32>,
+    tables: &Tensor<f32>,
     table_grad: &Tensor<Atomic<f32>>,
     active: u32,
     valid_n: u32,
@@ -3077,6 +3325,7 @@ fn field_backward_native_kernel(
     #[comptime] write_dh: bool,
     #[comptime] replay_features: bool,
     #[comptime] selective_weights: bool,
+    #[comptime] replay_hash: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -3108,10 +3357,40 @@ fn field_backward_native_kernel(
     let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
     let point = group * 4 + slot;
     let n_valid = usize::cast_from(valid_n);
+    // Hash interpolation scratch is reused by output/feature gradients below.
+    // Cache hits retain their original allocation; misses add only 64 floats.
+    let mut partials = Shared::new_slice(if replay_hash && corner_parallel {
+        512usize
+    } else if corner_parallel {
+        448usize
+    } else if compact_gradients || replay_hash {
+        256usize
+    } else {
+        1usize
+    });
     // Only replay variants need this 512-byte tile. Stage each feature once for
     // all 64 neurons; no full preactivation buffer is written or read.
     let mut replay = Shared::new_slice(if replay_features { 128usize } else { 1usize });
-    if replay_features {
+    if replay_hash {
+        field_hash_tile(
+            points,
+            tables,
+            metadata,
+            &mut replay,
+            &mut partials,
+            unit,
+            group,
+            n_valid,
+            active,
+            local_hash,
+            corner_parallel,
+        );
+        // Parameter gradients consume these features after this dispatch.
+        // All 31 columns are initialized, including inactive hash levels.
+        if point < n_valid && lane < 31 {
+            features[point * 31 + lane] = replay[field_feature_index(slot, lane, local_hash)];
+        }
+    } else if replay_features {
         if unit < 128 {
             let p = group * 4 + unit / 32;
             let col = unit % 32;
@@ -3127,13 +3406,6 @@ fn field_backward_native_kernel(
     let mut shared = Shared::new_slice(256usize);
     // Reused first for `output_grads` `[256]` and then for 224-thread partial
     // feature gradients `[448]`, keeping shared memory under 12 KB per block.
-    let mut partials = Shared::new_slice(if corner_parallel {
-        448usize
-    } else if compact_gradients {
-        256usize
-    } else {
-        1usize
-    });
     let mut slot_ds = Shared::new_slice(4usize);
     let mut output_grad = 0.0_f32;
     let mut v = 0.0_f32;
@@ -3149,7 +3421,12 @@ fn field_backward_native_kernel(
                     } else {
                         col * 64 + lane
                     };
-                    h += replay[slot * 32 + col] * shared_weights[wi];
+                    let fi = if replay_hash {
+                        field_feature_index(slot, col, local_hash)
+                    } else {
+                        slot * 32 + col
+                    };
+                    h += replay[fi] * shared_weights[wi];
                 }
                 h += shared_weights[1984 + lane];
             } else {
