@@ -21,10 +21,6 @@ pub struct Occupancy {
     pub device_flags: Option<burn::tensor::Tensor<2>>,
     #[serde(skip)]
     pub cpu_update: bool,
-    #[serde(skip)]
-    pub est_marched: usize,
-    #[serde(skip)]
-    pub est_endpoints: usize,
 }
 
 impl Occupancy {
@@ -36,8 +32,6 @@ impl Occupancy {
             device_values: None,
             device_flags: None,
             cpu_update: false,
-            est_marched: 0,
-            est_endpoints: 0,
         }
     }
 
@@ -98,7 +92,7 @@ impl Occupancy {
                         valid_n,
                         r,
                         start,
-                        seed.wrapping_add(start as u32),
+                        seed,
                         &field.device,
                     );
                     let sdf = field.evaluate_device_tensor_valid(pts, valid_n, query);
@@ -121,13 +115,14 @@ impl Occupancy {
                 });
                 let num_blocks = 2048usize.min(n.max(1));
                 let cells_per_thread = n.div_ceil(num_blocks);
-                let prefix = crate::sampling_gpu::occupancy_count(
+                let counts = crate::sampling_gpu::occupancy_count(
                     flags.clone(),
                     num_blocks,
                     n,
                     cells_per_thread,
                     seed,
                 );
+                let prefix = counts.cumsum(0);
                 // Bound temporary capacity to 32 MiB (IDs + XYZ at 128^3).
                 // Compaction emits each cell at most once, so N slots cannot overflow.
                 // Larger grids and explicit chunked evaluation retain the old path.
@@ -1384,11 +1379,6 @@ pub fn composite_device(
         reverse[slot] = occurrence as f32;
     }
     let vis_cap = crate::sampling_gpu::bucket_capacity(count);
-    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
-        10. * inv
-    } else {
-        0.
-    };
     let [adjoints, stats] = crate::kernels::composite_gpu(
         [
             sdf,
@@ -1406,8 +1396,14 @@ pub fn composite_device(
         coalesced_scratch,
         compact_cache,
         reuse_endpoints,
-        vscale,
     );
+    let stats = stats.sum_dim(0);
+    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
+        10. * inv
+    } else {
+        0.
+    };
+    let stats = stats * tensor(vec![1., 1., 1., vscale, 1.], [1, 5], &device);
     (adjoints, stats)
 }
 
@@ -1466,11 +1462,6 @@ pub fn composite_device_tables(
         tensor(packed, [patches.len(), 123], &device)
     };
     let vis_cap = crate::sampling_gpu::bucket_capacity(visible_count.max(1));
-    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
-        10. * inv
-    } else {
-        0.
-    };
     let [adjoints, stats] = crate::kernels::composite_gpu(
         [
             sdf,
@@ -1488,8 +1479,14 @@ pub fn composite_device_tables(
         coalesced_scratch,
         compact_cache,
         reuse_endpoints,
-        vscale,
     );
+    let stats = stats.sum_dim(0);
+    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
+        10. * inv
+    } else {
+        0.
+    };
+    let stats = stats * tensor(vec![1., 1., 1., vscale, 1.], [1, 5], &device);
     (adjoints, stats)
 }
 
@@ -1606,6 +1603,89 @@ pub fn march_and_filter_device(
     let march_started = std::time::Instant::now();
     let device = &field.device;
     let n_patches = coords.map(|c| c.len()).unwrap_or_else(|| patches.len());
+    let mut rays = Vec::with_capacity(n_patches * 12);
+    let mut coords_flat = Vec::with_capacity(if coords.is_some() { n_patches * 39 } else { 0 });
+    let mut capacity = 0usize;
+    let r_f32 = occ.resolution as f32;
+    if let Some(coord_slice) = coords {
+        for &(v, x, y) in coord_slice {
+            let view = &dataset.views[v];
+            let o: [f32; 3] = view.origin.into();
+            let d = view.cached_dirs[y * view.width + x];
+            let a = dot(d, d);
+            let b = 2. * dot(o, d);
+            let c = dot(o, o) - 1.;
+            let disc = b * b - 4. * a * c;
+            let (near, far, count) = if disc > 0. {
+                let s_disc = disc.sqrt();
+                let inv_2a = 1.0 / (2. * a);
+                let near = (-b - s_disc) * inv_2a + rng.random::<f32>() * step_size;
+                let far = (-b + s_disc) * inv_2a;
+                (
+                    near,
+                    far,
+                    ((far - near) / step_size).ceil().max(0.) as usize,
+                )
+            } else {
+                (0., 0., 0)
+            };
+            rays.extend(o);
+            rays.extend(d);
+            rays.extend([near, far, step_size, capacity as f32, count as f32, r_f32]);
+            coords_flat.extend([v as f32, x as f32, y as f32]);
+            for py in 0..3 {
+                let row_off = (y + py - 1) * view.width;
+                for px in 0..3 {
+                    let idx = row_off + (x + px - 1);
+                    coords_flat.extend(view.normals[idx].map(half::f16::to_f32));
+                    coords_flat.push(if view.mask[idx] { 1.0_f32 } else { 0.0_f32 });
+                }
+            }
+            capacity = capacity
+                .checked_add(count)
+                .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
+        }
+    } else {
+        for patch in patches {
+            let d = patch.dirs[4];
+            let o = patch.origin;
+            let a = dot(d, d);
+            let b = 2. * dot(o, d);
+            let c = dot(o, o) - 1.;
+            let disc = b * b - 4. * a * c;
+            let (near, far, count) = if disc > 0. {
+                let s_disc = disc.sqrt();
+                let inv_2a = 1.0 / (2. * a);
+                let near = (-b - s_disc) * inv_2a + rng.random::<f32>() * step_size;
+                let far = (-b + s_disc) * inv_2a;
+                (
+                    near,
+                    far,
+                    ((far - near) / step_size).ceil().max(0.) as usize,
+                )
+            } else {
+                (0., 0., 0)
+            };
+            rays.extend(o);
+            rays.extend(d);
+            rays.extend([near, far, step_size, capacity as f32, count as f32, r_f32]);
+            capacity = capacity
+                .checked_add(count)
+                .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
+        }
+    }
+    anyhow::ensure!(
+        capacity < (1 << 24),
+        "march batch exceeds exact index range; reduce batch size"
+    );
+    if capacity == 0 {
+        anyhow::bail!("empty march capacity");
+    }
+    let coords_tensor = if coords.is_some() {
+        Some(tensor(coords_flat, [n_patches, 39], device))
+    } else {
+        None
+    };
     let flags = occ
         .device_flags
         .get_or_insert_with(|| {
@@ -1616,202 +1696,15 @@ pub fn march_and_filter_device(
             )
         })
         .clone();
-
-    let (rays, samples, march_prefix, coords_tensor, capacity) =
-        if let Some(coord_slice) = coords {
-            let max_ray_steps = ((2.0_f32 / step_size).ceil().max(1.0_f32) as usize) + 2;
-            let cap = n_patches
-                .checked_mul(max_ray_steps)
-                .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
-            anyhow::ensure!(
-                cap < (1 << 24),
-                "march batch exceeds exact index range; reduce batch size"
-            );
-            let mut coords_flat = Vec::with_capacity(n_patches * 4);
-            for &(v, x, y) in coord_slice {
-                coords_flat.extend([v as f32, x as f32, y as f32, rng.random::<f32>()]);
-            }
-            let c_tensor = tensor(coords_flat, [n_patches, 4], device);
-            let dev_ds = dataset.device_dataset(device);
-            let [r_buf, s_buf, mp_buf] = crate::sampling_gpu::march_from_coords(
-                c_tensor.clone(),
-                dev_ds.view_meta,
-                flags,
-                step_size,
-                max_ray_steps,
-                occ.resolution,
-            );
-            (r_buf, s_buf, mp_buf, Some(c_tensor), cap)
-        } else {
-            let mut rays_host = Vec::with_capacity(n_patches * 12);
-            let mut cap = 0usize;
-            let r_f32 = occ.resolution as f32;
-            for patch in patches {
-                let d = patch.dirs[4];
-                let o = patch.origin;
-                let a = dot(d, d);
-                let b = 2. * dot(o, d);
-                let c = dot(o, o) - 1.;
-                let disc = b * b - 4. * a * c;
-                let (near, far, count) = if disc > 0. {
-                    let s_disc = disc.sqrt();
-                    let inv_2a = 1.0 / (2. * a);
-                    let near = (-b - s_disc) * inv_2a + rng.random::<f32>() * step_size;
-                    let far = (-b + s_disc) * inv_2a;
-                    (
-                        near,
-                        far,
-                        ((far - near) / step_size).ceil().max(0.) as usize,
-                    )
-                } else {
-                    (0., 0., 0)
-                };
-                rays_host.extend(o);
-                rays_host.extend(d);
-                rays_host.extend([near, far, step_size, cap as f32, count as f32, r_f32]);
-                cap = cap
-                    .checked_add(count)
-                    .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
-            }
-            anyhow::ensure!(
-                cap < (1 << 24),
-                "march batch exceeds exact index range; reduce batch size"
-            );
-            if cap == 0 {
-                anyhow::bail!("empty march capacity");
-            }
-            let r_buf = tensor(rays_host, [n_patches, 12], device);
-            let sample_cap = crate::sampling_gpu::bucket_capacity(cap);
-            let [s_buf, mp_buf] = crate::sampling_gpu::march([
-                r_buf.clone(),
-                flags,
-                Tensor::empty([sample_cap, 2], device),
-                Tensor::empty([n_patches, 2], device),
-            ]);
-            (r_buf, s_buf, mp_buf, None, cap)
-        };
-
-    // Single-readback speculative march + visibility pipeline: when `est_marched`
-    // is available (all steps after step 0), enqueue compaction, visibility SDF
-    // evaluation, visibility filtering, and prefix scan in a single uninterrupted
-    // GPU submission, eliminating the mid-step march_prefix CPU-GPU stall.
-    if field.fused_field
-        && !field.chunked_eval
-        && group_size >= n_patches
-        && occ.est_marched > 0
-        && occ.est_endpoints > 0
-    {
-        let pred_m = (occ.est_marched + (occ.est_marched >> 1))
-            .max(32768)
-            .min(capacity);
-        let pred_ep = (occ.est_endpoints + (occ.est_endpoints >> 1))
-            .max(32768)
-            .min((capacity * 2).min((1 << 24) - 1));
-        let m_cap_alloc = crate::sampling_gpu::bucket_capacity(pred_m);
-        let padded_ep_cap = Field::padded_point_capacity(pred_ep, query);
-        let [mut marched, unique_pts, pairs, ranges] =
-            crate::sampling_gpu::compact_and_center_endpoints(
-                rays.clone(),
-                samples.clone(),
-                march_prefix.clone(),
-                pred_m,
-                padded_ep_cap,
-            );
-        let vis_out = field.visibility_device_speculative(
-            unique_pts,
-            march_prefix.clone(),
-            pairs,
-            ranges,
-        );
-        let has_prev = prev_stats.is_some();
-        let [mut vis_prefix, meta_out] = crate::sampling_gpu::scan_vis_and_pack_meta(
-            vis_out,
-            march_prefix.clone(),
-            prev_stats,
-            n_patches,
-        );
-        let meta = meta_out.try_into_vec_as::<f32>()?;
-        let total_marched = meta[0] as usize;
-        let unique_ep_count = meta[1] as usize;
-        let mut total_visible = meta[2] as usize;
-        let mut total_visible_endpoints = meta[3] as usize;
-        field.variance_host = meta[4];
-        let prev_loss = if has_prev {
-            Some(Loss {
-                normal: meta[5] as f64,
-                mask: meta[6] as f64,
-                eikonal: meta[7] as f64,
-            })
-        } else {
-            None
-        };
-        anyhow::ensure!(total_marched <= capacity, "invalid compacted sample count");
-        if total_marched == 0 {
-            return Ok((
-                DeviceVisibleBatch {
-                    marched: Tensor::empty([1, 3], device),
-                    march_prefix,
-                    vis_prefix: Tensor::zeros([n_patches, 2], device),
-                    vis_prefix_host: vec![0; n_patches],
-                    vis_ep_prefix_host: vec![0; n_patches],
-                    total_visible: 0,
-                    total_visible_endpoints: 0,
-                    coords_tensor,
-                },
-                prev_loss,
-                march_started.elapsed().as_secs_f64(),
-                0.0,
-            ));
-        }
-        anyhow::ensure!(
-            unique_ep_count < (1 << 24) && total_marched < (1 << 24),
-            "visibility indices exceed f32 range"
-        );
-        occ.est_marched = total_marched;
-        occ.est_endpoints = unique_ep_count;
-        if total_marched > m_cap_alloc || unique_ep_count > padded_ep_cap {
-            let exact_ep_cap = Field::padded_point_capacity(unique_ep_count, query);
-            let [m_exact, u_exact, p_exact, r_exact] =
-                crate::sampling_gpu::compact_and_center_endpoints(
-                    rays,
-                    samples,
-                    march_prefix.clone(),
-                    total_marched,
-                    exact_ep_cap,
-                );
-            marched = m_exact;
-            let vis_out_exact =
-                field.visibility_device(u_exact, unique_ep_count, p_exact, r_exact, query);
-            let [vp_exact, mo_exact] = crate::sampling_gpu::scan_vis_and_pack_meta(
-                vis_out_exact,
-                march_prefix.clone(),
-                None,
-                n_patches,
-            );
-            vis_prefix = vp_exact;
-            let meta_exact = mo_exact.try_into_vec_as::<f32>()?;
-            total_visible = meta_exact[2] as usize;
-            total_visible_endpoints = meta_exact[3] as usize;
-            field.variance_host = meta_exact[4];
-        }
-        let total_elapsed = march_started.elapsed().as_secs_f64();
-        return Ok((
-            DeviceVisibleBatch {
-                marched,
-                march_prefix,
-                vis_prefix,
-                vis_prefix_host: vec![],
-                vis_ep_prefix_host: vec![],
-                total_visible,
-                total_visible_endpoints,
-                coords_tensor,
-            },
-            prev_loss,
-            total_elapsed * 0.5,
-            total_elapsed * 0.5,
-        ));
-    }
-
+    let rays = tensor(rays, [n_patches, 12], device);
+    let sample_cap = crate::sampling_gpu::bucket_capacity(capacity);
+    let [samples, counts] = crate::sampling_gpu::march([
+        rays.clone(),
+        flags,
+        Tensor::empty([sample_cap, 2], device),
+        Tensor::empty([n_patches, 2], device),
+    ]);
+    let march_prefix = counts.cumsum(0);
     let tail_totals = march_prefix.clone().slice([n_patches - 1..n_patches, 0..2]);
     let (total_marched, unique_ep_count, prev_loss) = if let Some(ps) = prev_stats {
         let loss_slice = ps.slice([0..1, 0..3]).reshape([3, 1]);
@@ -1852,8 +1745,6 @@ pub fn march_and_filter_device(
         unique_ep_count < (1 << 24) && total_marched < (1 << 24),
         "visibility indices exceed f32 range"
     );
-    occ.est_marched = total_marched;
-    occ.est_endpoints = unique_ep_count;
     let padded_ep_cap = Field::padded_point_capacity(unique_ep_count, query);
     let [marched, unique_pts, pairs, ranges] = crate::sampling_gpu::compact_and_center_endpoints(
         rays,
@@ -1866,22 +1757,19 @@ pub fn march_and_filter_device(
 
     let vis_started = std::time::Instant::now();
     let vis_out = field.visibility_device(unique_pts, unique_ep_count, pairs, ranges, query);
-    let [vis_prefix, meta_out] = crate::sampling_gpu::scan_vis_and_pack_meta(
-        vis_out.clone(),
-        march_prefix.clone(),
-        None,
-        n_patches,
-    );
+    let vis_counts = vis_out.clone().slice([0..n_patches, 0..2]);
+    let vis_prefix = vis_counts.cumsum(0);
+    let var_row = vis_out.slice([n_patches..n_patches + 1, 0..2]);
 
     let (vis_prefix_host, vis_ep_prefix_host, total_visible, total_visible_endpoints) =
         if group_size >= n_patches {
-            let meta = meta_out.try_into_vec_as::<f32>()?;
-            let tot_s = meta[2] as usize;
-            let tot_ep = meta[3] as usize;
-            field.variance_host = meta[4];
+            let tail = vis_prefix.clone().slice([n_patches - 1..n_patches, 0..2]);
+            let meta = Tensor::cat(vec![tail, var_row], 0).try_into_vec_as::<f32>()?;
+            let tot_s = meta[0] as usize;
+            let tot_ep = meta[1] as usize;
+            field.variance_host = meta[2];
             (vec![], vec![], tot_s, tot_ep)
         } else {
-            let var_row = vis_out.slice([n_patches..n_patches + 1, 0..2]);
             let meta =
                 Tensor::cat(vec![vis_prefix.clone(), var_row], 0).try_into_vec_as::<f32>()?;
             field.variance_host = meta[n_patches * 2];
@@ -1982,16 +1870,22 @@ pub fn prepare_geometry_from_device_batch(
     let (geom_rays, packed_patches) = if let Some(coords_tensor) = &vis_batch.coords_tensor {
         let dev_ds = dataset.device_dataset(device);
         let inv = (variance * 10.).exp().clamp(1e-6, 1e6);
+        let params = tensor(
+            vec![
+                start as f32,
+                s_begin as f32,
+                inv,
+                normal_den,
+                pixel_den,
+                sample_den,
+            ],
+            [6, 1],
+            device,
+        );
         let [gr, pp] = crate::sampling_gpu::gather_patch_tables(
             coords_tensor.clone(),
             dev_ds.view_meta,
-            dev_ds.pixel_banks,
-            start,
-            s_begin,
-            inv,
-            normal_den,
-            pixel_den,
-            sample_den,
+            params,
             patch_count,
         );
         (gr, Some(pp))

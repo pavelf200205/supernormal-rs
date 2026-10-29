@@ -45,35 +45,42 @@ pub fn extract(
     let mut z_edges = vec![u32::MAX; plane_size];
     let inv_res_m1 = 1.0_f32 / (res - 1) as f32;
 
-    // Enqueue a slab evaluation directly on the GPU without uploading 12 MB of
-    // host coordinates per slab; negate on the GPU so the host receives `-sdf`.
-    let enqueue_slab = |z: usize| -> burn::tensor::Tensor<2> {
-        let pts = crate::sampling_gpu::mesh_slab_points(res, z, &field.device);
+    const BATCH_SLABS: usize = 4;
+    let enqueue_batch = |z_start: usize| -> Option<(usize, burn::tensor::Tensor<2>)> {
+        if z_start >= res {
+            return None;
+        }
+        let count = (res - z_start).min(BATCH_SLABS);
+        let pts = crate::sampling_gpu::mesh_slab_points_batch(res, z_start, count, &field.device);
         let sdf = field.evaluate_device_tensor(pts, query);
-        -sdf
+        let neg_sdf = -sdf;
+        let _ = field.device.flush();
+        Some((count, neg_sdf))
     };
 
-    let pending_slab = enqueue_slab(0);
+    let first_slab = crate::sampling_gpu::mesh_slab_points(res, 0, &field.device);
+    let first_sdf = -field.evaluate_device_tensor(first_slab, query);
     let _ = field.device.flush();
-    let mut lower = pending_slab.try_into_vec_as::<f32>()?;
-    let mut next_slab = if res > 1 {
-        let s = enqueue_slab(1);
-        let _ = field.device.flush();
-        Some(s)
-    } else {
-        None
-    };
+    let mut next_batch = enqueue_batch(1);
+    let mut lower = first_sdf.try_into_vec_as::<f32>()?;
+    let mut batch_buf: Vec<f32> = Vec::new();
+    let mut batch_offset = 0usize;
+    let mut batch_count = 0usize;
+    let mut next_z_to_enqueue = 1 + BATCH_SLABS;
 
     for z in 0..res - 1 {
-        let upper_tensor = next_slab.take().expect("queued upper slab");
-        // Enqueue slab `z + 2` before waiting on `upper_tensor` so the GPU
-        // evaluates `z + 2` in parallel while the CPU extracts triangles on `z`!
-        if z + 2 < res {
-            let s = enqueue_slab(z + 2);
-            let _ = field.device.flush();
-            next_slab = Some(s);
+        if batch_offset >= batch_count {
+            let (count, tensor) = next_batch.take().expect("queued slab batch");
+            if next_z_to_enqueue < res {
+                next_batch = enqueue_batch(next_z_to_enqueue);
+                next_z_to_enqueue += BATCH_SLABS;
+            }
+            batch_buf = tensor.try_into_vec_as::<f32>()?;
+            batch_offset = 0;
+            batch_count = count;
         }
-        let upper = upper_tensor.try_into_vec_as::<f32>()?;
+        let upper = &batch_buf[batch_offset * plane_size..(batch_offset + 1) * plane_size];
+        batch_offset += 1;
 
         for y in 0..res - 1 {
             let row0 = y * res;
@@ -148,7 +155,7 @@ pub fn extract(
                 }
             }
         }
-        lower = upper;
+        lower.copy_from_slice(upper);
         std::mem::swap(&mut xy_lower, &mut xy_upper);
         xy_upper.fill(u32::MAX);
         z_edges.fill(u32::MAX);

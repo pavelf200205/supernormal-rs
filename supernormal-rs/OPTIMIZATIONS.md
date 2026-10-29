@@ -14,10 +14,10 @@ This update resolves the root causes of both bottlenecks across `src/kernels.rs`
 
 | Optimization Area | Previous Bottleneck | Update 3 Implementation | CLI A/B Flag to Revert | 
 | ----- | ----- | ----- | ----- | 
-| **1. 256-Thread Corner-Parallel Hash Forward & Backward** | Only `4 * active` (`<= 56`) of `256` threads in each workgroup executed hash-grid lookups/scatters, looping sequentially over `8` corners while `200+` threads sat idle behind `sync_cube()`. | Maps `256` threads across `(point_slot in 0..4, corner_pair in 0..4, level in 0..16)`. Up to `224` threads (`87.5%` of workgroup) issue `2` corners each in parallel (`4×` higher memory-level parallelism), reducing partial pairs in shared memory. | `--legacy-corner-loop` | 
+| **1. 256-Thread Corner-Parallel Hash Forward & Backward** | Only `4 * active` (`<= 56`) of `256` threads in each workgroup executed hash-grid lookups/scatters, looping sequentially over `8` corners while `200+` threads sat idle behind `sync_cube()`. | Maps `256` threads across `(point_slot in 0..4, corner_pair in 0..4, level in 0..16)`. Up to `224` threads (`87.5%` of workgroup) issue `2` corners each in parallel (`4Г—` higher memory-level parallelism), reducing partial pairs in shared memory. | `--legacy-corner-loop` | 
 | **2. Device-Resident March, Visibility & Geometry Tables** | Every step forced 3 synchronous GPU-to-CPU stalls and multi-megabyte host-to-device uploads (`marched` download, CPU `unique_pts` upload, `visibility` download, CPU `mapping` `[count, 18]` and `reverse` `[n, 2]` construction & upload). | Fuses endpoint counting into `march_kernel` and `visibility_kernel`, generates center-ray endpoints on device (`compact_and_center_endpoints_kernel`), builds `endpoints`, `descriptors`, `mapping`, and `reverse` on the GPU without atomics (`build_visible_geometry_tables_kernel`), and reads per-patch ranges from `vis_prefix` in `composite_kernel`. | `--host-sample-compaction` | 
 | **3. Uninitialized Output Allocations & SFU Deduplication** | `Tensor::zeros` dispatched \~10 buffer-clearing kernels per step for buffers immediately overwritten by custom ops; `field_backward_kernel` computed `exp()` twice per neuron. | Replaces write-only `Tensor::zeros` buffers with `Tensor::empty` across all custom ops and reuses a single `exp(min(scaled, 20.0))` evaluation for both sigmoid derivative and softplus activation in backward. | Always active | 
-| **4. Precomputed Pixel Ray Bases & Analytical Inverses** | `View::patch` normalized `18,432` rays and ran `18,432` general 3×3 matrix inversions (`basis.try_inverse()`) on the CPU every step. | Precomputes world-space ray directions and closed-form orthonormal cross-product inverses for all pixels during `Dataset::load`, turning `View::patch` into a direct memory lookup. | Always active | 
+| **4. Precomputed Pixel Ray Bases & Analytical Inverses** | `View::patch` normalized `18,432` rays and ran `18,432` general 3Г—3 matrix inversions (`basis.try_inverse()`) on the CPU every step. | Precomputes world-space ray directions and closed-form orthonormal cross-product inverses for all pixels during `Dataset::load`, turning `View::patch` into a direct memory lookup. | Always active | 
 
 ## Detailed Technical Breakdown
 
@@ -26,7 +26,7 @@ This update resolves the root causes of both bottlenecks across `src/kernels.rs`
 In both `fused_field_kernel` and `field_backward_kernel` / `field_backward_native_kernel`, each workgroup has `256` threads (`CubeDim::new_1d(256)`) processing `4` points (`slot in 0..4`, `lane in 0..64`).
 
 * **Why power was capped at 85 W and speed dropped with `active_levels`**:
-  During the MLP phase, all `256` threads are active (`4` points × `64` hidden neurons). However, during the hash-grid phase, work was mapped by `(slot, level)`, which meant at most `4 * 14 = 56` threads (`21.8%` of the workgroup) were active while `200` threads waited at `sync_cube()`. Worse, as `active_levels` grew from `1` to `14` (every 2,000 steps), levels `5..13` each span `524,288 × 2` floats (`4 MB` per level, `36 MB` total), exceeding the GPU's L2 cache. Because each of the 56 active threads executed a sequential `for corner in 0..8` loop, DRAM latency could not be hidden by warp-level concurrency.
+  During the MLP phase, all `256` threads are active (`4` points Г— `64` hidden neurons). However, during the hash-grid phase, work was mapped by `(slot, level)`, which meant at most `4 * 14 = 56` threads (`21.8%` of the workgroup) were active while `200` threads waited at `sync_cube()`. Worse, as `active_levels` grew from `1` to `14` (every 2,000 steps), levels `5..13` each span `524,288 Г— 2` floats (`4 MB` per level, `36 MB` total), exceeding the GPU's L2 cache. Because each of the 56 active threads executed a sequential `for corner in 0..8` loop, DRAM latency could not be hidden by warp-level concurrency.
 
 * **How Update 3 fixes it**:
 
@@ -37,7 +37,7 @@ In both `fused_field_kernel` and `field_backward_kernel` / `field_backward_nativ
     * `corner_pair = (unit >> 2) & 3` (`4` pairs of trilinear cube corners)
 
     * `level = unit >> 4` (`16` level slots, covering all `0..14` levels)
-      Now `4 × 4 × active` threads (up to `224` threads at `active = 14`) issue memory loads simultaneously—putting `448` trilinear corner lookups in flight per workgroup instead of `112`. Each thread accumulates its 2 corners and writes `[feat0, feat1]` to `partials[unit * 2 .. unit * 2 + 2]`. After `sync_cube()`, threads `0..56` sum the 4 corner-pairs in shared memory and write `shared_features`.
+      Now `4 Г— 4 Г— active` threads (up to `224` threads at `active = 14`) issue memory loads simultaneouslyвЂ”putting `448` trilinear corner lookups in flight per workgroup instead of `112`. Each thread accumulates its 2 corners and writes `[feat0, feat1]` to `partials[unit * 2 .. unit * 2 + 2]`. After `sync_cube()`, threads `0..56` sum the 4 corner-pairs in shared memory and write `shared_features`.
 
   * **Backward (`field_backward_kernel` & `field_backward_native_kernel`)**:
 
@@ -78,7 +78,7 @@ Burn's `Tensor::zeros` allocates a buffer and enqueues a GPU fill kernel. Across
 
 ### 4. Precomputed Analytical Camera Ray Bases (`src/data.rs`)
 
-For every pixel $(x, y)$ in a view, the ray direction $\mathbf{d}$ and the 3×3 basis matrix
+For every pixel $(x, y)$ in a view, the ray direction $\mathbf{d}$ and the 3Г—3 basis matrix
 
 $$
 B = \begin{bmatrix} \mathbf{d}^\top \\ \mathbf{u}^\top \\ \mathbf{v}^\top \end{bmatrix}
@@ -113,8 +113,6 @@ cargo build --release --locked
 .\target\release\supernormal.exe train --data ..\data\own_objects_normals\horse_960 --model runs\checkpoint_025000 --out runs\bench_update2_baseline --steps 500 --save-freq 0 --legacy-corner-loop --host-sample-compaction
 
 
-
-
 ```
 
 ## Update 4 Optimizations: Eliminating Per-Step Pipeline Drains, PCIe Uploads, and Chunk Overhead
@@ -123,8 +121,8 @@ While Update 3 parallelized the 256-thread hash kernels and kept sample compacti
 
 | Optimization Area | Previous Bottleneck (Update 3) | Update 4 Implementation | CLI A/B Flag to Revert | 
 | ----- | ----- | ----- | ----- | 
-| **1. Unchunked Single-Dispatch Device Evaluation & Backward** | `evaluate_device_tensor`, `enqueue_cached_device`, and `accumulate_gradients_device` split GPU-resident point buffers into `65,536`-point chunks, zero-padded the tail chunk (`Tensor::cat`), and sliced/concatenated outputs (`Tensor::cat`). | Evaluates all device-resident points (`<= 16.7M`) in a single unpadded `fused_field`, `field_backward`, and `parameter_gradients` dispatch, eliminating 3–5× kernel launch and concatenation overhead per step. | `--chunked-eval` | 
-| **2. Device-Resident View Tables & GPU Patch Gathering** | Every step gathered 2,048 `Patch` structs (`~1 MB`) on the CPU and uploaded `geom_rays` (`[2048, 39]` = 319 KB) and `packed_patches` (`[2048, 123]` = 1.01 MB) over PCIe. | Uploads all view camera metadata and pixel `[dir(3), inv(9), normal(3), mask(1)]` tables to the GPU once at startup (`Dataset::device_dataset`), computes `normal_den` in O(1) via precomputed 3×3 `patch_mask_sums`, and gathers `geom_rays` + `packed_patches` on the GPU from compact `[2048, 3]` `(view, x, y)` coordinates (`gather_patch_tables_kernel`). | `--cpu-patch-upload` | 
+| **1. Unchunked Single-Dispatch Device Evaluation & Backward** | `evaluate_device_tensor`, `enqueue_cached_device`, and `accumulate_gradients_device` split GPU-resident point buffers into `65,536`-point chunks, zero-padded the tail chunk (`Tensor::cat`), and sliced/concatenated outputs (`Tensor::cat`). | Evaluates all device-resident points (`<= 16.7M`) in a single unpadded `fused_field`, `field_backward`, and `parameter_gradients` dispatch, eliminating 3вЂ“5Г— kernel launch and concatenation overhead per step. | `--chunked-eval` | 
+| **2. Device-Resident View Tables & GPU Patch Gathering** | Every step gathered 2,048 `Patch` structs (`~1 MB`) on the CPU and uploaded `geom_rays` (`[2048, 39]` = 319 KB) and `packed_patches` (`[2048, 123]` = 1.01 MB) over PCIe. | Uploads all view camera metadata and pixel `[dir(3), inv(9), normal(3), mask(1)]` tables to the GPU once at startup (`Dataset::device_dataset`), computes `normal_den` in O(1) via precomputed 3Г—3 `patch_mask_sums`, and gathers `geom_rays` + `packed_patches` on the GPU from compact `[2048, 3]` `(view, x, y)` coordinates (`gather_patch_tables_kernel`). | `--cpu-patch-upload` | 
 | **3. Deferred Loss Readback (Continuous Async Step Overlap)** | At the end of every step, `stats.slice([0..1, 0..3]).try_into_vec_as::<f32>()` forced a synchronous GPU pipeline drain immediately after `device.flush()`, preventing the CPU from preparing step `N+1` while the GPU executed step `N` backward + Adam. | Piggybacks step `N`'s 3 loss scalars onto step `N+1`'s `march_prefix` tail readback (`5` floats in a single transfer), allowing the GPU to execute `geometry -> fused_field -> composite -> backward -> Adam -> next step march` continuously without an end-of-step stall. | `--sync-loss` | 
 | **4. Zero-Recompute Compositor Reverse Pass & O(1) Stencil Gather** | `composite_kernel` recomputed `f32::exp(-s0 * inv)` and `f32::exp(-s1 * inv)` and re-read global `ids` and `sdf` in the reverse loop; `composite_gather_kernel` looped over all `j in 0..9` pixels to check 4 stencil neighbors. | Caches `c0`, `c1`, `s0`, `s1` in unused forward scratch slots `scratch[sb + 5..9]` (saving `2 * S * 9` `exp()` calls and `4 * S * 9` global memory reads per step) and replaces the 9-iteration gather loop with direct O(1) neighbor indexing. | Always active | 
 | **5. Persistent Hash-Gradient Buffer with In-Place Adam Zeroing** | `accumulate_gradients_device` allocated and zero-filled a new `[entries, 2]` tensor (`up to 1.4M floats` = 5.6 MB) every step. | `packed_adam_kernel` clears `gradient[index] = 0.0` in-place immediately after reading `g`, and `Field` reuses the persistent zeroed buffer across steps. | Always active | 
@@ -142,21 +140,26 @@ cargo build --release --locked
 .\target\release\supernormal.exe train --data ..\data\own_objects_normals\horse_960 --model runs\checkpoint_025000 --out runs\bench_update3_equiv --steps 500 --save-freq 0 --chunked-eval --cpu-patch-upload --sync-loss
 
 
-
-
 ```
 
 ## Update 5 Optimizations: Porting 3DGS Micro-Architectural Techniques (`grgkopanas.github.io/3dgs_cuda_blog`)
 
-Inspired by George Kopanas's *What the 3DGS Literature Left on the Table: Five Self-Contained CUDA Optimizations for 3D Gaussian Splatting* (`s01_literature` through `s06_multirow_and_pipe_math`), Update 5 ports the exact hardware-level mechanisms from those progressive CUDA diffs into SuperNormal-RS's CubeCL kernels (`src/kernels.rs`):
+**Current-source audit (2026-10-29):** This section records historical Update 5
+experiments, some of which were superseded. In particular, the current kernels
+have neither the voxel-leader hash aggregation nor the single-warp cooperative
+SDF compositor described below. See [KOPANAS_AUDIT.md](KOPANAS_AUDIT.md) for the
+stage-by-stage comparison. These are adaptations of selected principles, not a
+complete port of all article mechanisms or verified machine-code effects.
+
+Inspired by George Kopanas's *What the 3DGS Literature Left on the Table: Five Self-Contained CUDA Optimizations for 3D Gaussian Splatting* (`s01_literature` through `s06_multirow_and_pipe_math`), Update 5 explored the following adaptations in SuperNormal-RS's CubeCL kernels (`src/kernels.rs`):
 
 | 3DGS Blog Diff Stage | SuperNormal-RS Bottleneck Solved | Update 5 Implementation | 
 | ----- | ----- | ----- | 
-| **`s02_reduce_scatter`** | 4 adjacent patch points in a workgroup (`~0.002` world units apart) fall into the **exact same voxel cell** across levels `0..11`, causing 4 threads in the same warp to issue 4 colliding global `atomic_add` / `fetch_add` calls to the same `table_grad[entry]` address. | **Cooperative Voxel-Leader Hash Gradient Reduction**: Stages `(base0, base1, base2)` and `(w0, w1, w2)` for the 4 slots in shared memory (`base_staging`, `w_staging`). For each `(level, corner, channel)` lane, the first slot with a given voxel `(base0, base1, base2)` sums `wg_sum` across all matching slots `k >= s` in registers and emits **1 combined global atomic add** (\~1.8× fewer global atomics, eliminating intra-workgroup L2 atomic collisions). | 
+| **`s02_reduce_scatter`** | 4 adjacent patch points in a workgroup (`~0.002` world units apart) fall into the **exact same voxel cell** across levels `0..11`, causing 4 threads in the same warp to issue 4 colliding global `atomic_add` / `fetch_add` calls to the same `table_grad[entry]` address. | **Cooperative Voxel-Leader Hash Gradient Reduction**: Stages `(base0, base1, base2)` and `(w0, w1, w2)` for the 4 slots in shared memory (`base_staging`, `w_staging`). For each `(level, corner, channel)` lane, the first slot with a given voxel `(base0, base1, base2)` sums `wg_sum` across all matching slots `k >= s` in registers and emits **1 combined global atomic add** (\~1.8Г— fewer global atomics, eliminating intra-workgroup L2 atomic collisions). | 
 | **`s03_sh_streaming`** | Bulk `cudaMemsetAsync` / `Tensor::zeros` zero-fill dispatches and redundant global reads across neighboring lanes. | **In-Place Adam Gradient Zeroing & Cooperative Staging**: `packed_adam_kernel` zeroes active hash-table gradient entries in-place as they are consumed (`gradient[index] = 0.0`), and `composite_kernel` cooperatively stages 18 unique endpoint SDFs per patch in shared memory. | 
 | **`s04_raster_pruning`** | Points with `ds[point] == 0.0` (e.g. unshared endpoints or zero-gradient samples) still executed `f32::exp`, `f32::ln`, the 64-step hidden-weight loop, and 14-level hash coordinate math; occluded samples beyond transmittance saturation still ran through backward. | **Zero-Adjoint Backward Pruning & Visibility Compaction**: `visibility_kernel` truncates ray sample ranges at transmittance saturation (`trans < 1e-8`) before field evaluation, while `field_backward_kernel` skips `exp`/`ln` and the 64-neuron dot product when `ds[point] == 0.0` and terminates the entire 256-thread workgroup (`terminate!()`) when all 4 slots have `ds == 0.0`. | 
 | **`s05_branchless_predication`** | In `composite_kernel`'s reverse transmittance loop, a conditional `if raw >= 0.0 && raw <= 1.0` block with global stores (`scratch[sb + 8..10]`) caused SIMT `BSSY`/`BSYNC` reconvergence stalls across the 27 active pixel lanes of the warp and issued two global writes per slot when `raw` was in bounds. | **Branchless Reverse-Pass Predication**: Computes `z0` and `z1` via branchless register selection (`if active_raw { z0_raw } else { 0.0 }`) and issues a single unconditional global write to `scratch[sb + 8]` and `scratch[sb + 9]`, eliminating inner-loop warp reconvergence barriers and duplicate global stores. | 
-| **`s06_multirow_and_pipe_math`** | `composite_kernel` previously launched 256-thread blocks (\~28 patches per block) where every pixel independently gathered `s0`, `s1`, `sdf[l]`, `sdf[r]`, `sdf[u]`, and `sdf[d]` from global memory (`54` global `ids` + `sdf` reads per sample instead of `18`) and synchronized all 8 warps at block-wide barriers. | **32-Thread Single-Warp Cooperative Shared-SDF Compositor**: Launches `CubeDim::new_1d(32)` (1 warp = 3 patches = 27 active pixel lanes) with partitioned per-patch shared memory (`shared_sdf[lp * 18 .. +18]`), cutting global `ids`/`sdf` reads by **3×**, eliminating multi-warp barrier stalls, and caching `(c0, c1, s0, s1)` in forward scratch to eliminate `2 * S * 9` `exp` calls in reverse. | 
+| **`s06_multirow_and_pipe_math`** | `composite_kernel` previously launched 256-thread blocks (\~28 patches per block) where every pixel independently gathered `s0`, `s1`, `sdf[l]`, `sdf[r]`, `sdf[u]`, and `sdf[d]` from global memory (`54` global `ids` + `sdf` reads per sample instead of `18`) and synchronized all 8 warps at block-wide barriers. | **32-Thread Single-Warp Cooperative Shared-SDF Compositor**: Launches `CubeDim::new_1d(32)` (1 warp = 3 patches = 27 active pixel lanes) with partitioned per-patch shared memory (`shared_sdf[lp * 18 .. +18]`), cutting global `ids`/`sdf` reads by **3Г—**, eliminating multi-warp barrier stalls, and caching `(c0, c1, s0, s1)` in forward scratch to eliminate `2 * S * 9` `exp` calls in reverse. | 
 
 ### High-speed 1024-resolution mesh extraction (`src/mesh.rs`, `src/sampling_gpu.rs`)
 
@@ -170,57 +173,104 @@ Mesh extraction now uses:
 
 3. $O(1)$ **Rolling Flat-Array Edge Tables (`xy_lower`, `xy_upper`, `z_edges`)**: Replaces `std::collections::HashMap<(usize, usize), u32>` and `edges.retain(...)` with three flat `Vec<u32>` buffers (`20 MB` total at `res = 1024`) swapped per slab, plus an immediate `if case == 0 || case == 255 { continue; }` fast path and vectorized `bytemuck::cast_slice` binary PLY writes.
 
+
 ## Update 6 Optimizations: Telemetry-Driven Fixes for `Occupancy::update`, Compositor Barriers, and the >4 GB Early VRAM Spike
 
-Analysis of the 30,000-step `metrics.csv` (`1,038.91s` total step time) and Windows Task Manager GPU telemetry uncovered the exact root causes of both the remaining iteration time and the early `> 4 GB` VRAM spike on steps 1–3,000:
+Analysis of the 30,000-step `metrics.csv` (`1,038.91s` total step time) and Windows Task Manager GPU telemetry uncovered the exact root causes of both the remaining iteration time and the early `> 4 GB` VRAM spike on steps 1вЂ“3,000:
 
 ### Telemetry Breakdown from `metrics.csv`
 
-| Component in `metrics.csv` | Measured Time | Share of Run | Root Cause | 
-| ----- | ----- | ----- | ----- | 
-| **1. `Occupancy::update` Overhead (`step % 8 == 0`, 3,750 steps)** | **296.4 s (4.94 min)** | **28.5%** | Regular steps averaged `23.4 ms`, while every 8th step averaged `100.8 ms` (`+77.4 ms` overhead per update). Every 8 steps, the CPU generated `0.6M–2.1M` jittered 3D points on a single thread (`1.8M–6.3M` RNG calls), built an `8.4 MB` linked list (`heads`/`next`) in RAM, uploaded `~22 MB` over PCIe, and downloaded `8.4 MB` (`flags`) back to the host while the GPU sat idle. | 
-| **2. Per-Sample Level-Independent Cost (`0.311 ms / 1k samples`)** | **412.6 s (6.88 min)** | **39.7%** | (a) Update 5's 32-thread 1-warp `composite_kernel` grouped 3 patches with `2 * max_len` `sync_cube()` barriers, capping Ampere SM occupancy at 33% (`16 blocks/SM`) and forcing the 70–80% background rays (`0` samples) to loop through `50–150` barrier iterations whenever grouped with a foreground ray. (b) `build_visible_geometry_tables_kernel` ran a 9-pixel inner loop writing `36` floats per sample (`mapping` `[vis_count, 18]` and `reverse` `[ep_count * 9, 2]`). | 
-| **3. Early Sample Spike (`steps 1–900`, up to `215,025` samples = `1.95M` points) & Unbucketed Pool Thrashing** | **66.6 s + >4 GB VRAM** | **6.4%** | Disabling chunking (`chunked_eval = false`) in Update 4 caused `Field` to allocate single giant `[1.95M, 64]` (`preactivation` = `500 MB`), `[1.95M, 31]` (`feat` = `242 MB`), and `[1.95M, 64]` (`dh` = `500 MB`) tensors (`~1.25 GB` per step) with a different exact row count on every step. Because `wgpu`'s memory pool cannot reuse a smaller buffer when the next step's point count increases, multiple multi-hundred-megabyte buffers accumulated in the pool (`> 4 GB` VRAM) until `step % 200` cleanup. | 
-| **4. `field_backward_kernel` Shared Memory Cliff (`> 12 KB`) & 56-Thread Dot Product** | **156.0 s (2.60 min)** | **15.0%** | Adding `base_staging` (`672 B`) + `w_staging` (`672 B`) pushed shared memory to `12,308 B` (`4 * 12,308 = 49,232 > 48 KB`), dropping RTX 3060 occupancy from 4 to 3 blocks/SM (`-25%`), while only 56 of 256 threads computed the 64-neuron `dh * W0` dot product. | 
+| Component in `metrics.csv` | Measured Time | Share of Run | Root Cause |
+| --- | --- | --- | --- |
+| **1. `Occupancy::update` Overhead (`step % 8 == 0`, 3,750 steps)** | **296.4 s (4.94 min)** | **28.5%** | Regular steps averaged `23.4 ms`, while every 8th step averaged `100.8 ms` (`+77.4 ms` overhead per update). Every 8 steps, the CPU generated `0.6MвЂ“2.1M` jittered 3D points on a single thread (`1.8MвЂ“6.3M` RNG calls), built an `8.4 MB` linked list (`heads`/`next`) in RAM, uploaded `~22 MB` over PCIe, and downloaded `8.4 MB` (`flags`) back to the host while the GPU sat idle. |
+| **2. Per-Sample Level-Independent Cost (`0.311 ms / 1k samples`)** | **412.6 s (6.88 min)** | **39.7%** | (a) Update 5's 32-thread 1-warp `composite_kernel` grouped 3 patches with `2 * max_len` `sync_cube()` barriers, capping Ampere SM occupancy at 33% (`16 blocks/SM`) and forcing the 70вЂ“80% background rays (`0` samples) to loop through `50вЂ“150` barrier iterations whenever grouped with a foreground ray. (b) `build_visible_geometry_tables_kernel` ran a 9-pixel inner loop writing `36` floats per sample (`mapping` `[vis_count, 18]` and `reverse` `[ep_count * 9, 2]`). |
+| **3. Early Sample Spike (`steps 1вЂ“900`, up to `215,025` samples = `1.95M` points) & Unbucketed Pool Thrashing** | **66.6 s + >4 GB VRAM** | **6.4%** | Disabling chunking (`chunked_eval = false`) in Update 4 caused `Field` to allocate single giant `[1.95M, 64]` (`preactivation` = `500 MB`), `[1.95M, 31]` (`feat` = `242 MB`), and `[1.95M, 64]` (`dh` = `500 MB`) tensors (`~1.25 GB` per step) with a different exact row count on every step. Because `wgpu`'s memory pool cannot reuse a smaller buffer when the next step's point count increases, multiple multi-hundred-megabyte buffers accumulated in the pool (`> 4 GB` VRAM) until `step % 200` cleanup. |
+| **4. `field_backward_kernel` Shared Memory Cliff (`> 12 KB`) & 56-Thread Dot Product** | **156.0 s (2.60 min)** | **15.0%** | Adding `base_staging` (`672 B`) + `w_staging` (`672 B`) pushed shared memory to `12,308 B` (`4 * 12,308 = 49,232 > 48 KB`), dropping RTX 3060 occupancy from 4 to 3 blocks/SM (`-25%`), while only 56 of 256 threads computed the 64-neuron `dh * W0` dot product. |
 
 ### Update 6 Architectural Fixes
 
 1. **100% GPU-Resident `Occupancy::update` (`src/sampling_gpu.rs`, `src/render.rs`)**:
-
-   * Eliminates all CPU point generation, CPU linked lists (`heads`/`next`), PCIe point uploads, and PCIe `flags` downloads during training (`flags` and `values` are only synced to the host when saving a checkpoint).
-
-   * During warmup (`step < 256`), `occupancy_grid_points_kernel` and `occupancy_apply_slice_kernel` generate jittered 3D cell coordinates via PCG32 hashing and update `device_values` in-place on the GPU in reusable `chunk`-sized slices.
-
-   * After warmup (`step >= 256`), `occupancy_count_kernel` and `occupancy_compact_points_kernel` select 100% of occupied cells plus 1 stratified random cell per 4-cell block (`n / 4` unoccupied cells) directly on the GPU without duplicates or linked lists, cutting `Occupancy::update` from `~79 ms` to `~2.5 ms` (**saving \~4.7 minutes over 30,000 steps**).
-
-2. **Flat \~1.6–1.8 GB VRAM from Step 1 via Bucketed Capacities & `MAX_CACHED_CHUNKS = 3` (`src/field.rs`, `src/sampling_gpu.rs`, `src/render.rs`)**:
-
-   * All transient per-step buffers (`samples`, `marched`, `pairs`, `endpoints`, `descriptors`, `mapping`, `reverse`, `geometry`, `scratch`) use `bucket_capacity(n)` (at most 4 bucket steps per power-of-two octave), and `unique_points` is allocated at `Field::padded_point_capacity(valid_points, query)` so every chunk slice already has exact static power-of-two shape `[padded_n, 3]` with **zero `Tensor::zeros` + `Tensor::cat` padding copies**.
-
-   * `Field` caps simultaneously resident cached `(feat, preactivation)` chunks in VRAM at `MAX_CACHED_CHUNKS = 3` (`<= 149 MB` at `--query 131072`). During the step 1–900 warmup spike (`up to 1.95M points`), any chunk beyond the first 3 streams through a single pooled `[131072, 31]` / `[131072, 64]` buffer pair in `accumulate_gradients_device`, preventing the `> 4 GB` early VRAM spike and releasing warmup high-water buffers at `step == 1000`.
-
+   - Eliminates all CPU point generation, CPU linked lists (`heads`/`next`), PCIe point uploads, and PCIe `flags` downloads during training (`flags` and `values` are only synced to the host when saving a checkpoint).
+   - During warmup (`step < 256`), `occupancy_grid_points_kernel` and `occupancy_apply_slice_kernel` generate jittered 3D cell coordinates via PCG32 hashing and update `device_values` in-place on the GPU in reusable `chunk`-sized slices.
+   - After warmup (`step >= 256`), `occupancy_count_kernel` and `occupancy_compact_points_kernel` select 100% of occupied cells plus 1 stratified random cell per 4-cell block (`n / 4` unoccupied cells) directly on the GPU without duplicates or linked lists, cutting `Occupancy::update` from `~79 ms` to `~2.5 ms` (**saving ~4.7 minutes over 30,000 steps**).
+2. **Flat ~1.6вЂ“1.8 GB VRAM from Step 1 via Bucketed Capacities & `MAX_CACHED_CHUNKS = 3` (`src/field.rs`, `src/sampling_gpu.rs`, `src/render.rs`)**:
+   - All transient per-step buffers (`samples`, `marched`, `pairs`, `endpoints`, `descriptors`, `mapping`, `reverse`, `geometry`, `scratch`) use `bucket_capacity(n)` (at most 4 bucket steps per power-of-two octave), and `unique_points` is allocated at `Field::padded_point_capacity(valid_points, query)` so every chunk slice already has exact static power-of-two shape `[padded_n, 3]` with **zero `Tensor::zeros` + `Tensor::cat` padding copies**.
+   - `Field` caps simultaneously resident cached `(feat, preactivation)` chunks in VRAM at `MAX_CACHED_CHUNKS = 3` (`<= 149 MB` at `--query 131072`). During the step 1вЂ“900 warmup spike (`up to 1.95M points`), any chunk beyond the first 3 streams through a single pooled `[131072, 31]` / `[131072, 64]` buffer pair in `accumulate_gradients_device`, preventing the `> 4 GB` early VRAM spike and releasing warmup high-water buffers at `step == 1000`.
 3. **Barrier-Free Compositor & Compact Contiguous Endpoint Indexing (`src/kernels.rs`, `src/sampling_gpu.rs`)**:
-
-   * Because `end_ep` is always `start_ep + 1` in `build_visible_geometry_tables_kernel`, all 18 points of sample `s` are contiguous at `sdf[start_ep * 9 .. start_ep * 9 + 18]`.
-
-   * `mapping` is shrunk **18×** (`[vis_cap, 1]` storing `start_ep * 9`), `reverse` is shrunk **9×** (`[ep_cap, 2]` storing endpoint-level occurrence codes), and the 9-iteration inner pixel loop in `build_visible_geometry_tables_kernel` is completely eliminated.
-
-   * `composite_kernel` launches 1 thread per pixel ray at full SM warp occupancy with **zero `sync_cube()` barriers**, allowing the 70–80% background rays (`begin == end`) to exit immediately while foreground rays read contiguous SDFs from L1 cache.
-
+   - Because `end_ep` is always `start_ep + 1` in `build_visible_geometry_tables_kernel`, all 18 points of sample `s` are contiguous at `sdf[start_ep * 9 .. start_ep * 9 + 18]`.
+   - `mapping` is shrunk **18Г—** (`[vis_cap, 1]` storing `start_ep * 9`), `reverse` is shrunk **9Г—** (`[ep_cap, 2]` storing endpoint-level occurrence codes), and the 9-iteration inner pixel loop in `build_visible_geometry_tables_kernel` is completely eliminated.
+   - `composite_kernel` launches 1 thread per pixel ray at full SM warp occupancy with **zero `sync_cube()` barriers**, allowing the 70вЂ“80% background rays (`begin == end`) to exit immediately while foreground rays read contiguous SDFs from L1 cache.
 4. **Restored 4 Blocks/SM Occupancy (`< 12 KB` Shared Memory) & 224-Thread Parallel MLP Dot Product in `field_backward_kernel` (`src/kernels.rs`)**:
-
-   * Reuses a single `448`-float `partials` shared buffer for both `output_grads` and `grad_staging`, reducing shared memory from `12,308 B` to `11,284 B` (`< 12 KB`, restoring 4 blocks/SM = 1,024 threads/SM on Ampere).
-
-   * Splits the 64-neuron `dh * W0` dot product across all **224 threads** (`16` iterations per thread instead of `64` on 56 threads), followed by 224-thread parallel trilinear corner scatter.
+   - Reuses a single `448`-float `partials` shared buffer for both `output_grads` and `grad_staging`, reducing shared memory from `12,308 B` to `11,284 B` (`< 12 KB`, restoring 4 blocks/SM = 1,024 threads/SM on Ampere).
+   - Splits the 64-neuron `dh * W0` dot product across all **224 threads** (`16` iterations per thread instead of `64` on 56 threads), followed by 224-thread parallel trilinear corner scatter.
 
 
-## Update 7 Optimizations: Eliminating Per-Step CPU Bottlenecks & Mid-Step GPU Pipeline Drains (Targeting >85% GPU Load on Older CPUs)
+## George Kopanas upgrades part 2 (2026-10-29)
 
-After reaching `< 11 minutes` total reconstruction time, Task Manager telemetry showed **50–60% GPU 3D load** alongside noticeable **per-step CPU utilization**. Inspecting the step lifecycle revealed four remaining CPU-to-GPU bottlenecks that starved the RTX 3060 on an older CPU:
+- Implemented local same-address aggregation for four neighboring points at
+  each level/corner in both native-float and CAS corner-parallel backward paths.
+  Unlike the historical voxel-leader proposal, comparison uses actual table
+  addresses. MLP weight shared storage is repurposed after all readers finish;
+  no extra shared allocation or global buffer is introduced. Two extra uniform
+  barriers and leader/reduction work require performance comparison. The
+  legacy sequential-corner path is unchanged.
+- Changed compositor scratch from `[sample][pixel][component]` to
+  `[sample][component][pixel]`. Both compositor passes and the reverse-index
+  gather use matching indexing. This improves adjacent-pixel access locality
+  without bringing back the superseded shared-SDF compositor. Buffer size and
+  sample order are unchanged.
+- Independent fallback switches: `--no-hash-aggregation` and
+  `--legacy-composite-scratch`. Pass both to compare with part 1.
 
-| Bottleneck | Why It Capped GPU Load at 50–60% & Loaded the CPU | Update 7 Implementation |
-| ----- | ----- | ----- |
-| **1. Per-Step Single-Threaded CPU Ray-Sphere & 18,432-Pixel `f16` Normal/Mask Gathering (`src/render.rs`, `src/data.rs`, `src/sampling_gpu.rs`)** | Every step ran a single-threaded CPU loop over all 2,048 patches that: (a) read `view.cached_dirs` across `442 MB` of host RAM (2,048 L3 cache misses/step), (b) solved 2,048 ray-sphere intersections on the CPU, (c) looped over `2,048 × 9 = 18,432` pixels across 40 views in scattered DRAM, (d) executed **`55,296` `half::f16::to_f32` conversions per step (`1.66 billion` over 30,000 steps)**, and (e) uploaded **`418 KB` (`104,448` floats: `[2048, 12]` + `[2048, 39]`)** over PCIe every step (`12.5 GB` total). Startup also allocated `1.76 GB` of host RAM for `cached_dirs` + `cached_inverses` and `147 MB` for `f32` `patch_mask_sums`. | **Cropped Lossless `f16` GPU Pixel Banks & `march_from_coords_kernel`**: Uploads per-view tight mask-bounding-box normals & masks once at startup into `DeviceDataset::pixel_banks` using a NaN/FTZ-immune 24-bit integer float encoding (`f0 = -1.0` when unmasked; exact `nx, ny, nz` `f16` bitfields in `f0, f1` when masked, unpacked on the GPU via `unpack_f16_to_f32` in `gather_patch_tables_kernel`). The CPU now uploads only **`[2048, 4]` (`[v, x, y, jitter]` = `32 KB`, 13× smaller)** and `march_from_coords_kernel` computes center ray directions, ray-sphere intersections, and occupancy ray marching directly on the GPU. `cached_rays` (`1.76 GB`) is now lazy (`OnceLock`) and `patch_mask_sums` is shrunk **4×** (`Vec<u8>`, `36.8 MB`), fitting in CPU L3 cache. |
-| **2. Two Synchronous GPU-to-CPU Pipeline Drains Per Step (`src/render.rs`, `src/sampling_gpu.rs`, `src/kernels.rs`)** | Every step drained the WDDM GPU queue to idle **twice**: first after `march_kernel` (`march_prefix` tail readback for `total_marched` and `unique_ep_count`), and a second time ~1.5 ms later after `visibility_kernel` (`vis_prefix` tail readback for `total_visible`, `total_visible_endpoints`, and `variance`). Each WDDM staging-buffer map + OS thread wake-up on an older CPU left a `1–2 ms` GPU idle gap (`0%` 3D load). | **Single-Readback Speculative March + Visibility Pipeline (`visibility_device_speculative`)**: Tracks adaptive capacities (`1.5×` previous step's `total_marched` and `unique_ep_count`, floor `32,768`). `compact_and_center_endpoints_kernel` and `fused_visibility_field` read `total_marched` and `unique_ep_count` **directly from `march_prefix` on the GPU**, executing `march_from_coords -> scan_2d_pairs -> compact_and_center_endpoints -> fused_visibility_field -> visibility -> scan_vis_and_pack_meta` in **one continuous GPU submission** with **only 1 CPU-GPU readback per step** (cutting 30,000 full GPU pipeline stalls out of training). |
-| **3. 11 Multi-Dispatch `cumsum` / `slice` / `reshape` / `cat` Chains Around Readbacks (`src/sampling_gpu.rs`, `src/render.rs`)** | Before each readback, Burn launched generic axis-0 `.cumsum(0)` kernels followed by `.slice()`, `.reshape()`, and `Tensor::cat()` copy kernels (11 small kernel dispatches per step on the critical sync path). | **Fused Single-Workgroup Shared-Memory Scans (`scan_2d_pairs_kernel`, `scan_1d_counts_kernel`, `scan_vis_and_pack_meta_kernel`)**: Scans all 2,048 `[count, ep_count]` pairs in shared memory inside a single 256-thread workgroup (`< 2 µs`) and packs `[total_marched, unique_ep_count, total_visible, total_visible_endpoints, variance, loss_normal, loss_mask, loss_eikonal]` into `[1, 8]` in one launch. |
-| **4. ~124 Per-Step CPU Burn Tensor Graph Ops & ~16 Small Kernel Launches in MLP Weight-Norm + Adam + Weight Packing (`src/kernels.rs`, `src/field.rs`, `src/sampling_gpu.rs`)** | Every step constructed ~124 Burn tensor ops on the CPU (`3.7M` ops over 30,000 steps): 4 ops to reduce/slice `parameter_gradients`, 2 ops + a CPU tensor upload to reduce/scale `composite_gpu` stats, 1 op for `dw1.sum_dim(0)`, 22 ops for `weight_gradients(0)` & `weight_gradients(1)`, 4 ops to slice `variance`/`lin1.bias` grads, 84 ops for the 7-parameter Adam loop, and 12 ops + `pack_mlp_weights_kernel` for `effective_weight(0/1)`. | **Fused Reductions & 1-Workgroup `fused_mlp_adam_and_pack_kernel`**: `ParameterOp`, `CompositeOp`, and `FieldBackwardOp` now fuse `reduce_parameter_partials_kernel`, `reduce_composite_stats_kernel` (with scalar `vscale`), and `reduce_dw1_kernel`. Then a **single 1-workgroup (256-thread) kernel (`fused_mlp_adam_and_pack_kernel`)** computes Layer 0 & Layer 1 WeightNorm backward gradients, updates all `2,179` floats of the 7 MLP/variance parameters via Adam in-place, normalizes the updated weights, and writes the transposed `packed_mlp` `[1, 2113]` + updated `variance` `[1, 1]` in one `< 5 µs` launch. |
+These are the remaining applicable adaptations identified in the audit, not
+literal ports of Gaussian SH, sorting, ellipse bounds, opacity math, fixed
+half-warp shuffles, or CUDA-specific approximate instructions. No precision or
+loss changes are introduced. Speed and parity remain unmeasured for part 2;
+rebuild and test on the target GPUs. The latest power-interrupted reconstruction
+is incomplete and is not used here as completed-run performance evidence.
+
+
+## Follow-up: kernel scheduling and measured attribution
+
+See the final section of README.md and NEXT_COMMIT_ANALYSIS.md for flags and
+scope. Added level-indexed Adam, exact endpoint reuse, safe subgroup reduction,
+optional forward weight reuse and derivative recomputation, selectable
+aggregation scope, a local microbatch dispatch fix, and full-run timing output.
+Optional diagnostics use the installed CubeCL profiling-window API and distinguish
+system/device timing from unavailable measurements. They count conditional copy
+bytes and sample address reuse without claiming hardware atomic/cache counters.
+No build or tests were run; default and experimental paths need user validation.
+
+
+## Budgeted feature-only cache
+
+Large fused training batches now retain features without preactivations and
+rebuild only the first MLP layer during backward, avoiding repeated hash reads
+for cached chunks. Smaller batches keep the full cache. The previous three-chunk
+activation budget is preserved with a reservation for one rebuilt preactivation
+tile; this typically permits seven full feature-only chunks instead of three
+full chunks at the same logical cache/workspace budget. Overflow still streams
+through the original full-recomputation fallback. Add
+`--legacy-activation-cache` for A/B comparison. See README.md for memory caveats,
+diagnostic counters and validation requirements. No build or tests were run.
+
+---
+
+## Update 7 — Silhouette Fringe Mask Fix, Expanded Feature-Only Cache (`MAX_CACHED_CHUNKS = 6`), Backward Shared-Memory Barrier Fix, and 4-Slab Batched Marching Cubes
+
+### 1. Root Cause of Mesh Quality Regression on Anti-Aliased Masks (`src/data.rs`)
+- **Finding**: In `horse_960` (`mask/*.png`), there are `10,428–11,938` anti-aliased boundary pixels per view (`~440,000` pixels across 40 views) with grayscale values `1 <= p[0] <= 127`. Because `SDM-UniPS` / `unimsps-rs` thresholds `mask > 127` when predicting normals, **95.24% of those `1..=127` fringe pixels store a literal `[0.0, 0.0, 0.0]` normal vector in `normal_world_space_sdmunips/*.exr`**.
+- **Mechanism**: Using `p[0] != 0` instead of `p[0] > 127` in `Dataset::load` treated all ~440,000 fringe pixels as foreground (`mask = 1.0`) with target normal `[0, 0, 0]`, pulling the rendered normal toward zero along the entire silhouette boundary, fighting the Eikonal unit-norm constraint (`||∇s|| = 1`), and causing the 30k-step mask loss to plateau at `0.01545` (vs. `0.00687` in the reference run).
+- **Fix**: Threshold `mask.pixels().map(|p| p[0] > 127)` in `src/data.rs`. A bit-exact `ChaCha8Rng(42)` Step 1 simulation confirmed this shifts Step 1 losses from `normal = 0.477793, mask = 7.411328` to `normal = 0.450947, mask = 7.547480` (matching the `full_reconstruction_30k_res1024_run1` reference `0.450946, 7.547479` to 6 decimal places), while remaining identical on binary `{0, 255}` masks.
+
+### 2. Eliminating Backward Hash-Grid Recomputation (`MAX_CACHED_CHUNKS = 6`, `src/field.rs`)
+- **Finding**: In `Run 12` (`591.8s` training / `654.5s` total), `MAX_CACHED_CHUNKS = 3` (`393,216` points) fell short of the `450,000–750,000` unique points evaluated per 2,048-patch batch (`80,000–92,000` visible samples), forcing `field_backward` to re-run 14-level trilinear hash-grid lookups (`replay_hash = true`) on chunks 3..5 of every training step.
+- **Fix**: Increased `MAX_CACHED_CHUNKS` from `3` to `6` in `src/field.rs`. With `feature_only_cache = true` (`31` floats = `124 B/point`), caching all 6 chunks (`786,432` points) requires at most `97.5 MB` of feature cache — eliminating `replay_hash` on 100% of training steps without increasing peak VRAM.
+
+### 3. Workgroup Synchronization & Occupancy Jitter Fixes (`src/kernels.rs`, `src/sampling_gpu.rs`, `src/render.rs`)
+- **Backward Shared-Memory Barrier (`src/kernels.rs`)**: Added `if replay_features { sync_cube(); }` before reusing `shared` and `partials` in `field_backward_kernel` and `field_backward_native_kernel` so warps that finish reading `replay` early cannot overwrite shared scratch while another warp is still accumulating `h`.
+- **Independent 3D Occupancy Jitter (`src/sampling_gpu.rs`, `src/render.rs`)**: Hashed `(cell * 3 + axis) ^ seed` per axis in `occupancy_grid_points_kernel` and `occupancy_compact_points_kernel`, and passed unshifted `seed` in `Occupancy::update`.
+
+### 4. 4-Slab Batched GPU Marching Cubes (`src/mesh.rs`, `src/sampling_gpu.rs`)
+- **Fix**: Extended `mesh_slab_points_kernel` (`mesh_slab_points_batch`) and `mesh::extract` to evaluate and read back `BATCH_SLABS = 4` slabs (`4 * res * res` points) per GPU dispatch with double-buffered lookahead (`enqueue_batch`), reducing GPU-to-host synchronization barriers during `1024^3` Marching Cubes extraction by **4x** (`256` readbacks instead of `1,024`).
+

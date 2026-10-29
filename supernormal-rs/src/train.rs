@@ -807,18 +807,14 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         // Keep the two optimizer scalars device-resident. Reading loss before
         // Adam used to force an idle gap between backward and the update.
         if let Some(stats) = &device_stats {
-            if gradients.mlp_raw.is_some() && variance_grad == 0.0 && sdf_bias_grad == 0.0 {
-                gradients.device_stats = Some(stats.clone());
-            } else {
-                gradients.insert(
-                    "variance".into(),
-                    stats.clone().slice([0..1, 3..4]) + variance_grad,
-                );
-                gradients.insert(
-                    "lin1.bias".into(),
-                    stats.clone().slice([0..1, 4..5]) + sdf_bias_grad as f32,
-                );
-            }
+            gradients.insert(
+                "variance".into(),
+                stats.clone().slice([0..1, 3..4]) + variance_grad,
+            );
+            gradients.insert(
+                "lin1.bias".into(),
+                stats.clone().slice([0..1, 4..5]) + sdf_bias_grad as f32,
+            );
         } else {
             gradients.insert(
                 "variance".into(),
@@ -966,8 +962,6 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     device_values: None,
                     device_flags: None,
                     cpu_update: false,
-                    est_marched: 0,
-                    est_endpoints: 0,
                 },
                 args: args.clone(),
             };
