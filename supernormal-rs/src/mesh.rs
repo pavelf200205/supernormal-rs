@@ -1,7 +1,6 @@
 use crate::{field::Field, mc_table::TRIANGLES};
 use anyhow::{Result, ensure};
 use std::{
-    collections::HashMap,
     io::{BufWriter, Write},
     path::Path,
 };
@@ -40,46 +39,93 @@ pub fn extract(
     ensure!(res >= 2 && query > 0, "invalid mesh resolution/query size");
     let mut vertices: Vec<[f32; 3]> = vec![];
     let mut faces: Vec<[u32; 3]> = vec![];
-    let mut edges: HashMap<(usize, usize), u32> = HashMap::new();
-    let layer = |z: usize| -> Result<Vec<f32>> {
-        let pts: Vec<_> = (0..res * res)
-            .map(|i| [i % res, i / res, z].map(|v| -1. + 2. * v as f32 / (res - 1) as f32))
-            .collect();
-        Ok(field
-            .evaluate(&pts, query)?
-            .into_iter()
-            .map(|v| -v)
-            .collect())
+    let plane_size = res * res;
+    let mut xy_lower = vec![u32::MAX; 2 * plane_size];
+    let mut xy_upper = vec![u32::MAX; 2 * plane_size];
+    let mut z_edges = vec![u32::MAX; plane_size];
+    let inv_res_m1 = 1.0_f32 / (res - 1) as f32;
+
+    // Enqueue a slab evaluation directly on the GPU without uploading 12 MB of
+    // host coordinates per slab; negate on the GPU so the host receives `-sdf`.
+    let enqueue_slab = |z: usize| -> burn::tensor::Tensor<2> {
+        let pts = crate::sampling_gpu::mesh_slab_points(res, z, &field.device);
+        let sdf = field.evaluate_device_tensor(pts, query);
+        -sdf
     };
-    let mut lower = layer(0)?;
+
+    let pending_slab = enqueue_slab(0);
+    let _ = field.device.flush();
+    let mut lower = pending_slab.try_into_vec_as::<f32>()?;
+    let mut next_slab = if res > 1 {
+        let s = enqueue_slab(1);
+        let _ = field.device.flush();
+        Some(s)
+    } else {
+        None
+    };
+
     for z in 0..res - 1 {
-        let upper = layer(z + 1)?;
+        let upper_tensor = next_slab.take().expect("queued upper slab");
+        // Enqueue slab `z + 2` before waiting on `upper_tensor` so the GPU
+        // evaluates `z + 2` in parallel while the CPU extracts triangles on `z`!
+        if z + 2 < res {
+            let s = enqueue_slab(z + 2);
+            let _ = field.device.flush();
+            next_slab = Some(s);
+        }
+        let upper = upper_tensor.try_into_vec_as::<f32>()?;
+
         for y in 0..res - 1 {
+            let row0 = y * res;
+            let row1 = (y + 1) * res;
             for x in 0..res - 1 {
+                let v0 = lower[row0 + x];
+                let v1 = lower[row0 + x + 1];
+                let v2 = lower[row1 + x + 1];
+                let v3 = lower[row1 + x];
+                let v4 = upper[row0 + x];
+                let v5 = upper[row0 + x + 1];
+                let v6 = upper[row1 + x + 1];
+                let v7 = upper[row1 + x];
+                let case = (if v0 < 0.0 { 1usize } else { 0 })
+                    | (if v1 < 0.0 { 2 } else { 0 })
+                    | (if v2 < 0.0 { 4 } else { 0 })
+                    | (if v3 < 0.0 { 8 } else { 0 })
+                    | (if v4 < 0.0 { 16 } else { 0 })
+                    | (if v5 < 0.0 { 32 } else { 0 })
+                    | (if v6 < 0.0 { 64 } else { 0 })
+                    | (if v7 < 0.0 { 128 } else { 0 });
+                if case == 0 || case == 255 {
+                    continue;
+                }
+                let values = [v0, v1, v2, v3, v4, v5, v6, v7];
                 let coords = CORNERS.map(|c| [x + c[0], y + c[1], z + c[2]]);
-                let values = CORNERS.map(|c| {
-                    if c[2] == 0 {
-                        lower[(y + c[1]) * res + x + c[0]]
-                    } else {
-                        upper[(y + c[1]) * res + x + c[0]]
-                    }
-                });
-                let case = (0..8).fold(0usize, |bits, i| {
-                    bits | if values[i] < 0. { 1 << i } else { 0 }
-                });
                 for tri in TRIANGLES[case].chunks_exact(3) {
                     if tri[0] < 0 {
                         break;
                     }
-                    let mut face = [0; 3];
+                    let mut face = [0u32; 3];
                     for j in 0..3 {
-                        let [a, b] = EDGES[tri[j] as usize];
-                        let ca = coords[a];
-                        let cb = coords[b];
-                        let ia = (ca[2] * res + ca[1]) * res + ca[0];
-                        let ib = (cb[2] * res + cb[1]) * res + cb[0];
-                        let key = (ia.min(ib), ia.max(ib));
-                        face[j] = *edges.entry(key).or_insert_with(|| {
+                        let e_id = tri[j] as usize;
+                        let [a, b] = EDGES[e_id];
+                        let entry = if e_id < 4 {
+                            let axis = if e_id == 0 || e_id == 2 { 0 } else { 1 };
+                            let ex = x + if e_id == 1 { 1 } else { 0 };
+                            let ey = y + if e_id == 2 { 1 } else { 0 };
+                            &mut xy_lower[(ey * res + ex) * 2 + axis]
+                        } else if e_id < 8 {
+                            let axis = if e_id == 4 || e_id == 6 { 0 } else { 1 };
+                            let ex = x + if e_id == 5 { 1 } else { 0 };
+                            let ey = y + if e_id == 6 { 1 } else { 0 };
+                            &mut xy_upper[(ey * res + ex) * 2 + axis]
+                        } else {
+                            let ex = x + if e_id == 9 || e_id == 10 { 1 } else { 0 };
+                            let ey = y + if e_id == 10 || e_id == 11 { 1 } else { 0 };
+                            &mut z_edges[ey * res + ex]
+                        };
+                        if *entry == u32::MAX {
+                            let ca = coords[a];
+                            let cb = coords[b];
                             let t = if (values[b] - values[a]).abs() < 1e-20 {
                                 0.5
                             } else {
@@ -88,22 +134,24 @@ pub fn extract(
                             let v = std::array::from_fn(|d| {
                                 ((-1.
                                     + 2. * (ca[d] as f32 + (cb[d] as f32 - ca[d] as f32) * t)
-                                        / (res - 1) as f32)
+                                        * inv_res_m1)
                                     * scale)
                                     + offset[d]
                             });
                             let id = vertices.len() as u32;
                             vertices.push(v);
-                            id
-                        });
+                            *entry = id;
+                        }
+                        face[j] = *entry;
                     }
                     faces.push(face);
                 }
             }
         }
         lower = upper;
-        // Keep only edges that may be reused by the next slab.
-        edges.retain(|&(a, b), _| a / (res * res) >= z + 1 && b / (res * res) >= z + 1);
+        std::mem::swap(&mut xy_lower, &mut xy_upper);
+        xy_upper.fill(u32::MAX);
+        z_edges.fill(u32::MAX);
         if z % 32 == 0 {
             println!(
                 "mesh slab {}/{} vertices={} faces={}",
@@ -131,13 +179,17 @@ pub fn extract(
                 parent[b] = a;
             }
         }
-        let mut counts = HashMap::new();
+        let mut counts = vec![0usize; vertices.len()];
+        let mut largest = 0usize;
+        let mut max_count = 0usize;
         for f in &faces {
-            *counts
-                .entry(root(&mut parent, f[0] as usize))
-                .or_insert(0usize) += 1;
+            let r = root(&mut parent, f[0] as usize);
+            counts[r] += 1;
+            if counts[r] > max_count {
+                max_count = counts[r];
+                largest = r;
+            }
         }
-        let largest = *counts.iter().max_by_key(|(_, n)| **n).unwrap().0;
         faces.retain(|f| root(&mut parent, f[0] as usize) == largest);
         let mut remap = vec![u32::MAX; vertices.len()];
         let mut compact = vec![];
@@ -160,17 +212,13 @@ pub fn extract(
         vertices.len(),
         faces.len()
     )?;
-    for v in &vertices {
-        for x in v {
-            out.write_all(&x.to_le_bytes())?;
-        }
-    }
+    out.write_all(bytemuck::cast_slice(&vertices))?;
+    let mut face_buf = Vec::with_capacity(faces.len() * 13);
     for f in &faces {
-        out.write_all(&[3])?;
-        for i in f {
-            out.write_all(&i.to_le_bytes())?;
-        }
+        face_buf.push(3u8);
+        face_buf.extend_from_slice(bytemuck::cast_slice(f));
     }
+    out.write_all(&face_buf)?;
     out.flush()?;
     println!(
         "Wrote {} vertices, {} triangles to {}",

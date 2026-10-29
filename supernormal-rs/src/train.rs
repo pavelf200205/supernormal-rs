@@ -74,6 +74,18 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub host_sample_compaction: bool,
+    /// Split device-resident forward/backward queries into `--query` chunks instead of single-dispatch evaluation.
+    #[arg(long)]
+    #[serde(default)]
+    pub chunked_eval: bool,
+    /// Gather 3x3 patch ray/normal/inverse structs on the CPU instead of device-resident view tables.
+    #[arg(long)]
+    #[serde(default)]
+    pub cpu_patch_upload: bool,
+    /// Read loss statistics synchronously at the end of every step instead of piggybacking on the next step's march readback.
+    #[arg(long)]
+    #[serde(default)]
+    pub sync_loss: bool,
     #[arg(long, default_value_t = 65536)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
@@ -115,23 +127,42 @@ struct PreparedBatch {
     pending: Option<crate::field::PendingEvaluation>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_batch(
     field: &Field,
+    dataset: &Dataset,
     patches: &[crate::data::Patch],
+    total_patches: usize,
     samples: &[render::Sample],
     device_vis: Option<&render::DeviceVisibleBatch>,
     start: usize,
     size: usize,
     query: usize,
+    variance: f32,
+    normal_den: f32,
+    pixel_den: f32,
+    sample_den: f32,
     cpu_composite: bool,
 ) -> PreparedBatch {
-    let end = (start + size).min(patches.len());
+    let end = (start + size).min(total_patches);
     if let Some(vis_batch) = device_vis {
-        if let Some(prep) =
-            render::prepare_geometry_from_device_batch(patches, vis_batch, start, end, &field.device)
-        {
-            let count = prep.unique_points.dims()[0];
-            let pending = field.enqueue_cached_device(prep.unique_points.clone(), query);
+        if let Some(prep) = render::prepare_geometry_from_device_batch(
+            dataset,
+            patches,
+            total_patches,
+            vis_batch,
+            start,
+            end,
+            query,
+            variance,
+            normal_den,
+            pixel_den,
+            sample_den,
+            &field.device,
+        ) {
+            let count = prep.valid_points;
+            let pending =
+                field.enqueue_cached_device_valid(prep.unique_points.clone(), count, query);
             return PreparedBatch {
                 start,
                 end,
@@ -174,10 +205,9 @@ fn prepare_batch(
         let pending = field.enqueue_cached(&unique, query);
         (points, indices, unique.len(), None, Some(pending))
     } else {
-        let (unique, indices, geometry) =
-            render::prepare_geometry_device(&patches[start..end], &samples, &field.device);
-        let count = unique.dims()[0];
-        let pending = field.enqueue_cached_device(unique, query);
+        let (unique, count, indices, geometry) =
+            render::prepare_geometry_device(&patches[start..end], &samples, query, &field.device);
+        let pending = field.enqueue_cached_device_valid(unique, count, query);
         (Vec::new(), indices, count, Some(geometry), Some(pending))
     };
     PreparedBatch {
@@ -198,6 +228,15 @@ struct State {
     rng: ChaCha8Rng,
     occupancy: Occupancy,
     args: TrainArgs,
+}
+
+struct DeferredStepMetric {
+    step: usize,
+    samples: usize,
+    secs: f64,
+    active: usize,
+    report: bool,
+    stats: burn::tensor::Tensor<2>,
 }
 
 pub fn train(args: TrainArgs, device: Device) -> Result<()> {
@@ -234,6 +273,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.compact_gradients = !args.legacy_output_gradients;
     field.wide_gradient_tiles = !args.legacy_gradient_tiles;
     field.corner_parallel = !args.legacy_corner_loop;
+    field.chunked_eval = args.chunked_eval;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
     let mut restored_state = false;
@@ -265,27 +305,79 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         serde_json::to_vec_pretty(&args)?,
     )?;
 
+    let use_device_pipeline = !args.cpu_march
+        && !args.cpu_visibility
+        && !args.cpu_composite
+        && !args.host_sample_compaction;
+    let use_gpu_patch_gather = use_device_pipeline && !args.cpu_patch_upload;
+    if use_gpu_patch_gather {
+        let _ = dataset.device_dataset(&field.device);
+    }
+
     let mut progress = crate::progress::TrainingProgress::new(final_step);
     let mut first = true;
+    let mut deferred_metric: Option<DeferredStepMetric> = None;
+
+    let flush_deferred = |dm: DeferredStepMetric,
+                          loss_override: Option<Loss>,
+                          progress: &mut crate::progress::TrainingProgress,
+                          metrics: &mut std::io::BufWriter<std::fs::File>|
+     -> Result<()> {
+        let loss = if let Some(l) = loss_override {
+            l
+        } else {
+            let values = dm.stats.slice([0..1, 0..3]).try_into_vec_as::<f32>()?;
+            Loss {
+                normal: values[0] as f64,
+                mask: values[1] as f64,
+                eikonal: values[2] as f64,
+            }
+        };
+        progress.update(dm.step, dm.secs, loss.total(), dm.report);
+        writeln!(
+            metrics,
+            "{},{},{},{},{},{},{},{}",
+            dm.step,
+            loss.normal,
+            loss.mask,
+            loss.eikonal,
+            loss.total(),
+            dm.samples,
+            dm.secs,
+            dm.active
+        )?;
+        if dm.report {
+            metrics.flush()?;
+        }
+        Ok(())
+    };
+
     while field.step < final_step {
         let started = std::time::Instant::now();
         let step = field.step;
         if (first && !restored_state) || step % 8 == 0 {
             occ.update(
                 &field,
-                if first && !occ.flags.iter().any(|x| *x) {
-                    0
-                } else {
-                    step
-                },
+                if first && !restored_state { 0 } else { step },
                 args.query,
                 &mut rng,
             )?;
+            if args.cpu_march && !occ.cpu_update {
+                occ.sync_values()?;
+            }
         }
         first = false;
         let occupancy_seconds = started.elapsed().as_secs_f64();
         field.active = (step / 2000 + 1).min(14);
-        let patches = dataset.random_patches(args.batch, &mut rng);
+        let (patches, patch_coords, normal_den) = if use_gpu_patch_gather {
+            let (coords, nd) = dataset.random_patch_coords(args.batch, &mut rng);
+            (Vec::new(), Some(coords), nd)
+        } else {
+            let p = dataset.random_patches(args.batch, &mut rng);
+            let nd = p.iter().flat_map(|patch| patch.mask).sum::<f32>() + 1e-5;
+            (p, None, nd)
+        };
+        let total_patches = args.batch;
         let step_size = 10f32.powf(-2. - step as f32 / args.end_iter as f32);
 
         let group_size = if args.pipeline_patches == 0 {
@@ -293,25 +385,31 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         } else {
             args.microbatch.min(args.pipeline_patches)
         };
-        let use_device_pipeline = !args.cpu_march
-            && !args.cpu_visibility
-            && !args.cpu_composite
-            && !args.host_sample_compaction;
 
         let (samples, device_vis, visible_count, march_seconds, visibility_seconds) =
             if use_device_pipeline {
-                let (vis_batch, m_sec, v_sec) = render::march_and_filter_device(
+                let prev_stats = deferred_metric.as_ref().map(|dm| dm.stats.clone());
+                let (vis_batch, prev_loss, m_sec, v_sec) = render::march_and_filter_device(
                     &mut field,
+                    &dataset,
+                    patch_coords.as_deref(),
                     &patches,
                     &mut occ,
                     step_size,
                     args.query,
                     group_size,
+                    prev_stats,
                     &mut rng,
                 )?;
+                if let Some(dm) = deferred_metric.take() {
+                    flush_deferred(dm, prev_loss, &mut progress, &mut metrics)?;
+                }
                 let count = vis_batch.total_visible;
                 (Vec::new(), Some(vis_batch), count, m_sec, v_sec)
             } else {
+                if let Some(dm) = deferred_metric.take() {
+                    flush_deferred(dm, None, &mut progress, &mut metrics)?;
+                }
                 let march_started = std::time::Instant::now();
                 let marched = if args.cpu_march {
                     render::march(&patches, &occ, step_size, &mut rng)
@@ -333,9 +431,8 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 "empty occupancy batch at step {step}; checkpoint/config requires investigation"
             );
         }
-        let normal_den = patches.iter().flat_map(|p| p.mask).sum::<f32>() + 1e-5;
         let sampling_seconds = started.elapsed().as_secs_f64() - occupancy_seconds;
-        let pixel_den = (patches.len() * 9) as f32;
+        let pixel_den = (total_patches * 9) as f32;
         let sample_den = (visible_count * 9) as f32;
 
         let mut gradients = crate::field::Gradients::default();
@@ -352,12 +449,18 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         let t0 = std::time::Instant::now();
         let mut prepared = Some(prepare_batch(
             &field,
+            &dataset,
             &patches,
+            total_patches,
             &samples,
             device_vis.as_ref(),
             0,
             group_size,
             args.query,
+            variance,
+            normal_den,
+            pixel_den,
+            sample_den,
             args.cpu_composite,
         ));
         t_points += t0.elapsed().as_secs_f64();
@@ -373,19 +476,30 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 device_tables,
                 pending,
             } = batch;
-            let pp = &patches[start..end];
+            let patch_count = end - start;
+            let pp = if patches.is_empty() {
+                &[][..]
+            } else {
+                &patches[start..end]
+            };
             let t0 = std::time::Instant::now();
             if !args.cpu_composite && unique_count == 0 {
-                if end < patches.len() {
+                if end < total_patches {
                     let tp = std::time::Instant::now();
                     prepared = Some(prepare_batch(
                         &field,
+                        &dataset,
                         &patches,
+                        total_patches,
                         &samples,
                         device_vis.as_ref(),
                         end,
                         group_size,
                         args.query,
+                        variance,
+                        normal_den,
+                        pixel_den,
+                        sample_den,
                         args.cpu_composite,
                     ));
                     t_points += tp.elapsed().as_secs_f64();
@@ -399,10 +513,12 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 let (adjoints, stats) = if let Some(tables) = device_tables {
                     render::composite_device_tables(
                         pp,
+                        patch_count,
                         tables.patch_start,
                         tables.s_base,
                         tables.visible_count,
                         tables.vis_prefix,
+                        tables.packed_patches,
                         tables.geometry,
                         tables.mapping,
                         tables.reverse,
@@ -439,16 +555,22 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("profiling sync failed: {e:?}"))?;
                 }
                 t_bwd += t2.elapsed().as_secs_f64();
-                if end < patches.len() {
+                if end < total_patches {
                     let tp = std::time::Instant::now();
                     prepared = Some(prepare_batch(
                         &field,
+                        &dataset,
                         &patches,
+                        total_patches,
                         &samples,
                         device_vis.as_ref(),
                         end,
                         group_size,
                         args.query,
+                        variance,
+                        normal_den,
+                        pixel_den,
+                        sample_den,
                         args.cpu_composite,
                     ));
                     t_points += tp.elapsed().as_secs_f64();
@@ -458,15 +580,21 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             let (unique_sdf, cache) = pending.expect("CPU pending evaluation").finish()?;
             // Submit the next forward before CPU compositing. Only two groups'
             // activations are live, and all groups use the same model weights.
-            if end < patches.len() && args.pipeline_patches > 0 {
+            if end < total_patches && args.pipeline_patches > 0 {
                 prepared = Some(prepare_batch(
                     &field,
+                    &dataset,
                     &patches,
+                    total_patches,
                     &samples,
                     device_vis.as_ref(),
                     end,
                     group_size,
                     args.query,
+                    variance,
+                    normal_den,
+                    pixel_den,
+                    sample_den,
                     args.cpu_composite,
                 ));
                 field
@@ -507,15 +635,21 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("profiling sync failed: {e:?}"))?;
             }
             t_bwd += t2.elapsed().as_secs_f64();
-            if end < patches.len() && prepared.is_none() {
+            if end < total_patches && prepared.is_none() {
                 prepared = Some(prepare_batch(
                     &field,
+                    &dataset,
                     &patches,
+                    total_patches,
                     &samples,
                     device_vis.as_ref(),
                     end,
                     group_size,
                     args.query,
+                    variance,
+                    normal_den,
+                    pixel_den,
+                    sample_den,
                     args.cpu_composite,
                 ));
             }
@@ -552,7 +686,12 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         field.apply_gradients_packed(gradients, 5e-4 * factor);
         field.step += 1;
 
-        if field.step % 200 == 0 {
+        if field.step == 1000 {
+            // Release early warmup high-water buffers once the initial 1-900 step
+            // sample spike subsides so VRAM stays at its steady low baseline.
+            let _ = field.device.sync();
+            field.device.memory_cleanup();
+        } else if field.step % 200 == 0 {
             field.trim_memory();
         } else if args.profile_stages || field.step == final_step {
             field
@@ -569,25 +708,19 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         }
         let t_adam = t_adam_start.elapsed().as_secs_f64();
 
-        // Read metrics only after submitting the optimizer, so the CPU cannot
-        // delay the update while waiting for compositor statistics.
-        if let Some(stats) = device_stats {
-            let values = stats.slice([0..1, 0..3]).try_into_vec_as::<f32>()?;
-            total.normal += values[0] as f64;
-            total.mask += values[1] as f64;
-            total.eikonal += values[2] as f64;
-        }
         let secs = started.elapsed().as_secs_f64();
         let report =
             args.profile_stages || field.step % args.log_every == 0 || field.step == final_step;
+        let will_checkpoint =
+            args.save_freq > 0 && field.step % args.save_freq == 0 || field.step == final_step;
+        let will_mesh = args.mesh_freq > 0 && field.step % args.mesh_freq == 0;
+
         if args.profile_stages {
             progress.clear();
             println!(
                 "step={} occupancy={occupancy_seconds:.3}s sampling={sampling_seconds:.3}s (march={march_seconds:.3}s visible={visibility_seconds:.3}s) points={t_points:.3}s eval={t_eval:.3}s composite={t_comp:.3}s bwd={t_bwd:.3}s adam={t_adam:.3}s",
                 field.step,
             );
-        }
-        if args.profile_stages {
             println!(
                 "Burn memory pool (not total driver/process usage): {:?}",
                 field.device.memory_pool_usage()
@@ -597,23 +730,70 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 field.peak_reserved_bytes.get()
             );
         }
-        progress.update(field.step, secs, total.total(), report);
-        writeln!(
-            metrics,
-            "{},{},{},{},{},{},{},{}",
-            field.step,
-            total.normal,
-            total.mask,
-            total.eikonal,
-            total.total(),
-            visible_count,
-            secs,
-            field.active
-        )?;
-        if report {
-            metrics.flush()?;
+
+        // Defer reading `device_stats` until the next iteration's march readback
+        // so the GPU executes forward + composite + backward + Adam asynchronously
+        // while the CPU immediately prepares the next iteration's patches.
+        if let Some(stats) = device_stats {
+            if use_device_pipeline
+                && !args.sync_loss
+                && !args.profile_stages
+                && !will_checkpoint
+                && !will_mesh
+            {
+                deferred_metric = Some(DeferredStepMetric {
+                    step: field.step,
+                    samples: visible_count,
+                    secs,
+                    active: field.active,
+                    report,
+                    stats,
+                });
+            } else {
+                let values = stats.slice([0..1, 0..3]).try_into_vec_as::<f32>()?;
+                total.normal += values[0] as f64;
+                total.mask += values[1] as f64;
+                total.eikonal += values[2] as f64;
+                progress.update(field.step, secs, total.total(), report);
+                writeln!(
+                    metrics,
+                    "{},{},{},{},{},{},{},{}",
+                    field.step,
+                    total.normal,
+                    total.mask,
+                    total.eikonal,
+                    total.total(),
+                    visible_count,
+                    secs,
+                    field.active
+                )?;
+                if report {
+                    metrics.flush()?;
+                }
+            }
+        } else {
+            progress.update(field.step, secs, total.total(), report);
+            writeln!(
+                metrics,
+                "{},{},{},{},{},{},{},{}",
+                field.step,
+                total.normal,
+                total.mask,
+                total.eikonal,
+                total.total(),
+                visible_count,
+                secs,
+                field.active
+            )?;
+            if report {
+                metrics.flush()?;
+            }
         }
-        if args.save_freq > 0 && field.step % args.save_freq == 0 || field.step == final_step {
+
+        if will_checkpoint {
+            if let Some(dm) = deferred_metric.take() {
+                flush_deferred(dm, None, &mut progress, &mut metrics)?;
+            }
             progress.clear();
             metrics.flush()?;
             let dest = args.out.join(format!("checkpoint_{:06}", field.step));
@@ -638,7 +818,10 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             std::fs::write(temp.join("training.json"), serde_json::to_vec(&state)?)?;
             std::fs::rename(temp, dest)?;
         }
-        if args.mesh_freq > 0 && field.step % args.mesh_freq == 0 {
+        if will_mesh {
+            if let Some(dm) = deferred_metric.take() {
+                flush_deferred(dm, None, &mut progress, &mut metrics)?;
+            }
             progress.clear();
             crate::mesh::extract(
                 &field,
@@ -648,7 +831,12 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 dataset.scale,
                 dataset.offset,
             )?;
+            let _ = field.device.sync();
+            field.device.memory_cleanup();
         }
+    }
+    if let Some(dm) = deferred_metric.take() {
+        flush_deferred(dm, None, &mut progress, &mut metrics)?;
     }
     Ok(())
 }

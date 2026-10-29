@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use burn::tensor::{Device, Tensor};
 use nalgebra::{Matrix3, Vector3};
 use ndarray::Array2;
 use ndarray_npy::NpzReader;
@@ -30,12 +31,26 @@ pub struct View {
     /// a zero-compute table lookup.
     pub cached_dirs: Vec<[f32; 3]>,
     pub cached_inverses: Vec<[[f32; 3]; 3]>,
+    /// Precomputed sum of 9 pixel masks in the 3x3 neighborhood centered at `(x, y)`
+    /// (`[height * width]`), enabling O(1) `normal_den` accumulation without
+    /// constructing 2,048 `Patch` structs on the host.
+    pub patch_mask_sums: Vec<f32>,
+}
+
+/// Device-resident view tables uploaded once at startup so the GPU can gather
+/// `march_rays` `[N, 12]`, `geom_rays` `[N, 39]`, and `packed_patches` `[N, 123]`
+/// from compact `[N, 5]` patch coordinates without per-step 1.4 MB host uploads.
+#[derive(Clone)]
+pub struct DeviceDataset {
+    /// `[num_views, 24]`: `[origin(3), plane(3), u_col(3), v_col(3), w_col(3), inv_k(9)]`
+    pub view_meta: Tensor<2>,
 }
 
 pub struct Dataset {
     pub views: Vec<View>,
     pub scale: f32,
     pub offset: [f32; 3],
+    pub device_cache: std::sync::OnceLock<DeviceDataset>,
 }
 
 fn read_matrix(npz: &mut NpzReader<File>, name: &str) -> Result<Array2<f64>> {
@@ -159,6 +174,26 @@ impl Dataset {
                 })
                 .unzip::<[f32; 3], [[f32; 3]; 3], Vec<[f32; 3]>, Vec<[[f32; 3]; 3]>>();
 
+            let patch_mask_sums: Vec<f32> = (0..width * height)
+                .into_par_iter()
+                .map(|idx| {
+                    let xx = idx % width;
+                    let yy = idx / width;
+                    if xx == 0 || xx + 1 >= width || yy == 0 || yy + 1 >= height {
+                        return 0.0_f32;
+                    }
+                    let mut sum = 0.0_f32;
+                    for py in 0..3 {
+                        for px in 0..3 {
+                            if masks[(yy + py - 1) * width + (xx + px - 1)] {
+                                sum += 1.0_f32;
+                            }
+                        }
+                    }
+                    sum
+                })
+                .collect();
+
             views.push(View {
                 width,
                 height,
@@ -169,13 +204,64 @@ impl Dataset {
                 inv_k,
                 cached_dirs,
                 cached_inverses,
+                patch_mask_sums,
             });
         }
         Ok(Self {
             views,
             scale,
             offset,
+            device_cache: std::sync::OnceLock::new(),
         })
+    }
+
+    pub fn device_dataset(&self, device: &Device) -> DeviceDataset {
+        self.device_cache
+            .get_or_init(|| {
+                use crate::field::tensor;
+                let mut meta = Vec::with_capacity(self.views.len() * 24);
+                for v in &self.views {
+                    let origin: [f32; 3] = v.origin.into();
+                    let u_col = v.rotation.column(0).into_owned();
+                    let v_col = v.rotation.column(1).into_owned();
+                    let plane = v.rotation.column(2).into_owned();
+                    let w_col = u_col.cross(&v_col);
+                    meta.extend(origin);
+                    meta.extend([plane[0], plane[1], plane[2]]);
+                    meta.extend([u_col[0], u_col[1], u_col[2]]);
+                    meta.extend([v_col[0], v_col[1], v_col[2]]);
+                    meta.extend([w_col[0], w_col[1], w_col[2]]);
+                    for r in 0..3 {
+                        for c in 0..3 {
+                            meta.push(v.inv_k[(r, c)]);
+                        }
+                    }
+                }
+                DeviceDataset {
+                    view_meta: tensor(meta, [self.views.len(), 24], device),
+                }
+            })
+            .clone()
+    }
+
+    /// Sample `count` random patch coordinates `(v, x, y)` and return both the
+    /// coordinate list and the exact `normal_den` without materializing `Vec<Patch>`.
+    pub fn random_patch_coords(
+        &self,
+        count: usize,
+        rng: &mut impl Rng,
+    ) -> (Vec<(usize, usize, usize)>, f32) {
+        let mut coords = Vec::with_capacity(count);
+        let mut mask_sum = 0.0_f32;
+        for _ in 0..count {
+            let v = rng.random_range(0..self.views.len());
+            let view = &self.views[v];
+            let x = rng.random_range(1..view.width - 2);
+            let y = rng.random_range(1..view.height - 2);
+            mask_sum += view.patch_mask_sums[y * view.width + x];
+            coords.push((v, x, y));
+        }
+        (coords, mask_sum + 1e-5)
     }
 
     pub fn random_patches(&self, count: usize, rng: &mut impl Rng) -> Vec<Patch> {
@@ -191,9 +277,10 @@ impl Dataset {
             })
             .collect();
 
+        let views = &self.views;
         coords
             .into_par_iter()
-            .map(|(v, x, y)| self.views[v].patch(x, y))
+            .map(|(v, x, y)| views[v].patch(x, y))
             .collect()
     }
 }

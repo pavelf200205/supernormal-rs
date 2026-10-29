@@ -268,9 +268,10 @@ pub fn hash_grid_packed_backward_kernel(
     metadata: &Tensor<f32>,
     table_grad: &Tensor<Atomic<u32>>,
     active: u32,
+    valid_n: u32,
 ) {
     let point_idx = ABSOLUTE_POS;
-    if point_idx >= points.shape(0) {
+    if point_idx >= usize::cast_from(valid_n) {
         terminate!();
     }
 
@@ -354,11 +355,12 @@ fn packed_adam_kernel(
     value: &mut Tensor<f32>,
     first: &mut Tensor<f32>,
     second: &mut Tensor<f32>,
-    gradient: &Tensor<f32>,
+    gradient: &mut Tensor<f32>,
     corrections: &Tensor<f32>,
+    active_elems: u32,
 ) {
     let index = ABSOLUTE_POS;
-    if index >= gradient.shape(0) * 2 {
+    if index >= usize::cast_from(active_elems) {
         terminate!();
     }
     let row = index / 2;
@@ -373,6 +375,7 @@ fn packed_adam_kernel(
     let step_scale = corrections[level * 3 + 1];
     let inv_bc2_sqrt = corrections[level * 3 + 2];
     let g = gradient[index];
+    gradient[index] = 0.0_f32;
     let m = first[index] * 0.9 + g * 0.1;
     let v = second[index] * 0.999 + g * g * 0.001;
     value[index] = value[index] - m * step_scale / (f32::sqrt(v) * inv_bc2_sqrt + 1e-8);
@@ -390,7 +393,10 @@ impl Operation<FusionCubeRuntime> for PackedAdamOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([v_ir, m_ir, s_ir, g_ir, c_ir], [ov_ir, om_ir, os_ir]) = self.desc.as_fixed();
+        let ([v_ir, m_ir, s_ir, g_ir, c_ir], [ov_ir, om_ir, os_ir, og_ir]) = self.desc.as_fixed();
+        let [ScalarIr::UInt(active_rows)] = self.desc.scalars.as_slice() else {
+            panic!("Invalid scalar arguments for packed_adam")
+        };
         let value = handles.get_float_tensor::<CubeBackend>(v_ir);
         let first = handles.get_float_tensor::<CubeBackend>(m_ir);
         let second = handles.get_float_tensor::<CubeBackend>(s_ir);
@@ -405,8 +411,13 @@ impl Operation<FusionCubeRuntime> for PackedAdamOp {
         } else {
             second.copy()
         };
+        let gradient = if gradient.can_mut() {
+            gradient
+        } else {
+            gradient.copy()
+        };
         let client = value.client.clone();
-        let n = gradient.meta.shape().dims::<2>()[0] * 2;
+        let n = (*active_rows as usize) * 2;
         let cube_dim = CubeDim::new(&client, n);
         let cube_count = cubecl::calculate_cube_count_elemwise(&client, n, cube_dim);
         packed_adam_kernel::launch(
@@ -416,12 +427,14 @@ impl Operation<FusionCubeRuntime> for PackedAdamOp {
             value.clone().into_tensor_arg(),
             first.clone().into_tensor_arg(),
             second.clone().into_tensor_arg(),
-            gradient.into_tensor_arg(),
+            gradient.clone().into_tensor_arg(),
             corrections.into_tensor_arg(),
+            n as u32,
         );
         handles.register_float_tensor::<CubeBackend>(&ov_ir.id, value);
         handles.register_float_tensor::<CubeBackend>(&om_ir.id, first);
         handles.register_float_tensor::<CubeBackend>(&os_ir.id, second);
+        handles.register_float_tensor::<CubeBackend>(&og_ir.id, gradient);
         Ok(())
     }
 }
@@ -432,11 +445,12 @@ pub fn adam_packed(
     second: burn::tensor::Tensor<2>,
     gradient: burn::tensor::Tensor<2>,
     corrections: burn::tensor::Tensor<2>,
-) -> [burn::tensor::Tensor<2>; 3] {
+    active_rows: usize,
+) -> [burn::tensor::Tensor<2>; 4] {
     let [v, m, s, g, c] = [value, first, second, gradient, corrections]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = v.client.clone();
-    let outputs = [&v, &m, &s]
+    let outputs = [&v, &m, &s, &g]
         .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype));
     let desc = CustomOpIr::with_scalars(
         "supernormal_packed_adam",
@@ -448,9 +462,9 @@ pub fn adam_packed(
             c.into_ir(),
         ],
         &outputs,
-        vec![],
+        vec![ScalarIr::UInt(active_rows as u64)],
     );
-    let result: [_; 3] = client
+    let result: [_; 4] = client
         .register(
             StreamId::current(),
             OperationIr::Custom(desc.clone()),
@@ -722,7 +736,7 @@ impl Operation<FusionCubeRuntime> for HashGridPackedBackwardOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([p_ir, df_ir, m_ir, tg_ir], [out_ir]) = self.desc.as_fixed();
-        let [ScalarIr::UInt(active)] = self.desc.scalars.as_slice() else {
+        let [ScalarIr::UInt(active), ScalarIr::UInt(valid_n)] = self.desc.scalars.as_slice() else {
             panic!("Invalid scalar arguments for hash_grid_packed_backward")
         };
         let points = handles.get_float_tensor::<CubeBackend>(p_ir);
@@ -730,7 +744,7 @@ impl Operation<FusionCubeRuntime> for HashGridPackedBackwardOp {
         let metadata = handles.get_float_tensor::<CubeBackend>(m_ir);
         let table_grad = handles.get_float_tensor::<CubeBackend>(tg_ir);
         let client = points.client.clone();
-        let n = points.meta.shape().dims::<2>()[0];
+        let n = (*valid_n as usize).max(1);
         let cube_dim = CubeDim::new(&client, n);
         let cube_count = cubecl::calculate_cube_count_elemwise(&client, n, cube_dim);
         hash_grid_packed_backward_kernel::launch(
@@ -742,6 +756,7 @@ impl Operation<FusionCubeRuntime> for HashGridPackedBackwardOp {
             metadata.into_tensor_arg(),
             table_grad.clone().into_tensor_arg(),
             *active as u32,
+            *valid_n as u32,
         );
         handles.register_float_tensor::<CubeBackend>(&out_ir.id, table_grad);
         Ok(())
@@ -754,6 +769,7 @@ pub fn backward_packed(
     metadata: burn::tensor::Tensor<2>,
     table_grad: burn::tensor::Tensor<2>,
     active: usize,
+    valid_n: usize,
 ) -> burn::tensor::Tensor<2> {
     let p_prim = points.inner().try_into_primitive::<GpuBackend>().unwrap();
     let df_prim = d_features
@@ -778,7 +794,10 @@ pub fn backward_packed(
             tg_prim.into_ir(),
         ],
         &[out_ir],
-        vec![ScalarIr::UInt(active as u64)],
+        vec![
+            ScalarIr::UInt(active as u64),
+            ScalarIr::UInt(valid_n as u64),
+        ],
     );
     let [out] = client
         .register(
@@ -1046,6 +1065,7 @@ fn fused_field_kernel(
     features: &mut Tensor<f32>,
     preactivation: &mut Tensor<f32>,
     active: u32,
+    valid_n: u32,
     #[comptime] cache: bool,
     #[comptime] local_hash: bool,
     #[comptime] corner_parallel: bool,
@@ -1064,7 +1084,8 @@ fn fused_field_kernel(
     let slot = unit / 64;
     let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
     let point_idx = group * 4 + slot;
-    let valid = point_idx < points.shape(0);
+    let n_valid = usize::cast_from(valid_n);
+    let valid = point_idx < n_valid;
     let mut shared_features = Shared::new_slice(128usize);
     let mut partials = Shared::new_slice(if corner_parallel { 512usize } else { 256usize });
     if lane < 32 {
@@ -1091,7 +1112,7 @@ fn fused_field_kernel(
         let hash_point = group * 4 + hash_slot;
         let mut feat0 = 0.0_f32;
         let mut feat1 = 0.0_f32;
-        if hash_point < points.shape(0) && level < usize::cast_from(active) {
+        if hash_point < n_valid && level < usize::cast_from(active) {
             let p0 = points[hash_point * 3];
             let p1 = points[hash_point * 3 + 1];
             let p2 = points[hash_point * 3 + 2];
@@ -1155,7 +1176,7 @@ fn fused_field_kernel(
         let hash_slot = if local_hash { unit % 4 } else { slot };
         let level = if local_hash { unit / 4 } else { lane };
         let hash_point = group * 4 + hash_slot;
-        if hash_point < points.shape(0) && level < usize::cast_from(active) {
+        if hash_point < n_valid && level < usize::cast_from(active) {
             let p0 = points[hash_point * 3];
             let p1 = points[hash_point * 3 + 1];
             let p2 = points[hash_point * 3 + 2];
@@ -1254,6 +1275,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
         let ([p, t, m, w, y, f, h], [oy, of, oh]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(active),
+            ScalarIr::UInt(valid_n),
             ScalarIr::UInt(cache),
             ScalarIr::UInt(local_hash),
             ScalarIr::UInt(corner_parallel),
@@ -1264,7 +1286,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
         let [points, tables, metadata, weights, output, features, hidden] =
             [p, t, m, w, y, f, h].map(|ir| handles.get_float_tensor::<CubeBackend>(ir));
         let client = points.client.clone();
-        let groups = points.meta.shape().dims::<2>()[0].div_ceil(4);
+        let groups = (*valid_n as usize).div_ceil(4).max(1);
         let gx = groups.min(65535).max(1);
         fused_field_kernel::launch(
             &client,
@@ -1278,6 +1300,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             features.clone().into_tensor_arg(),
             hidden.clone().into_tensor_arg(),
             *active as u32,
+            *valid_n as u32,
             *cache != 0,
             *local_hash != 0,
             *corner_parallel != 0,
@@ -1291,6 +1314,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
 
 pub fn fused_field(
     inputs: [burn::tensor::Tensor<2>; 4],
+    valid_n: usize,
     active: usize,
     cache: bool,
     local_hash: bool,
@@ -1298,16 +1322,12 @@ pub fn fused_field(
 ) -> [burn::tensor::Tensor<2>; 3] {
     let n = inputs[0].dims()[0];
     let device = inputs[0].device();
-    // Use uninitialized buffers instead of zero-filling before full overwrite;
-    // when caching features, active < 14 still requires zeroed inactive columns.
-    let feat_buf = if cache && active < 14 {
-        burn::tensor::Tensor::<2>::zeros([n, 31], &device)
-    } else {
-        burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 31], &device)
-    };
+    // `fused_field_kernel` zeroes all 32 `shared_features` slots and writes all
+    // 31 columns of `features` for every valid point, so `Tensor::empty` is safe
+    // regardless of `active`.
     let buffers = [
-        burn::tensor::Tensor::<2>::empty([n, 1], &device),
-        feat_buf,
+        burn::tensor::Tensor::<2>::empty([valid_n.max(1), 1], &device),
+        burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 31], &device),
         burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 64], &device),
     ];
     let inputs: Vec<_> = inputs
@@ -1326,6 +1346,7 @@ pub fn fused_field(
         &outputs,
         vec![
             ScalarIr::UInt(active as u64),
+            ScalarIr::UInt(valid_n as u64),
             ScalarIr::UInt(cache as u64),
             ScalarIr::UInt(local_hash as u64),
             ScalarIr::UInt(corner_parallel as u64),
@@ -1341,8 +1362,17 @@ pub fn fused_field(
     result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
-// Each invocation owns one pixel ray. A separate gather combines stencil
-// derivatives, so nine pixels run independently without float atomics.
+// Barrier-free per-pixel ray compositor:
+// 1. Background rays (`begin == end`, ~70-80% of random patches) immediately
+//    evaluate their mask loss and exit in a few cycles without waiting at
+//    multi-patch `sync_cube()` barriers.
+// 2. When `compact_ids` is true (device-resident pipeline), `ids` has shape
+//    `[vis_cap, 1]` storing `base_pt = start_ep * 9`. Because `end_ep` is
+//    always `start_ep + 1`, all 18 points of sample `s` are contiguous at
+//    `sdf[base_pt .. base_pt + 18]`, reducing index loads by 6x and turning all
+//    4 stencil neighbor lookups (`l, r, u, d`) into contiguous L1 cache hits.
+// 3. Forward caches `(c0, c1, s0, s1)` in `scratch[sb + 5..9]` so the reverse
+//    pass executes zero `exp()` calls and uses branchless predication.
 #[cube(launch)]
 fn composite_kernel(
     sdf: &Tensor<f32>,
@@ -1352,13 +1382,14 @@ fn composite_kernel(
     vis_prefix: &Tensor<f32>,
     scratch: &mut Tensor<f32>,
     stats: &mut Tensor<f32>,
+    #[comptime] compact_ids: bool,
 ) {
     let ray = ABSOLUTE_POS;
-    let p = ray / 9;
-    let pixel = ray % 9;
-    if p >= patches.shape(0) {
+    if ray >= patches.shape(0) * 9 {
         terminate!();
     }
+    let p = ray / 9;
+    let pixel = ray % 9;
     let pb = p * 123;
     let begin = if patches[pb] < 0.0_f32 {
         let g_ray = usize::cast_from(-patches[pb] - 1.0_f32);
@@ -1383,6 +1414,7 @@ fn composite_kernel(
     let normal_den = patches[pb + 3];
     let pixel_den = patches[pb + 4];
     let sample_den = patches[pb + 5];
+
     let mut normals = Array::<f32>::new(3usize);
     let mut dn = Array::<f32>::new(3usize);
     let mut masks = 0.0_f32;
@@ -1391,112 +1423,152 @@ fn composite_kernel(
     let mut future = 0.0_f32;
     for i in 0..3usize {
         normals[i] = 0.0_f32;
+        dn[i] = 0.0_f32;
     }
+
+    let col = pixel % 3;
+    let row = pixel / 3;
+    let l = if col == 0 { pixel } else { pixel - 1 };
+    let r = if col == 2 { pixel } else { pixel + 1 };
+    let u = if row == 0 { pixel } else { pixel - 3 };
+    let d = if row == 2 { pixel } else { pixel + 3 };
+
     for s in begin..end {
-        for i in pixel..pixel + 1 {
-            let col = i % 3;
-            let row = i / 3;
-            let l = if col == 0 { i } else { i - 1 };
-            let r = if col == 2 { i } else { i + 1 };
-            let u = if row == 0 { i } else { i - 3 };
-            let d = if row == 2 { i } else { i + 3 };
-            let s0 = sdf[usize::cast_from(ids[s * 18 + i])];
-            let s1 = sdf[usize::cast_from(ids[s * 18 + 9 + i])];
-            let dt = (s1 - s0) * geometry[s * 27 + i * 3];
-            let dx = (sdf[usize::cast_from(ids[s * 18 + r])]
-                - sdf[usize::cast_from(ids[s * 18 + l])])
-                * geometry[s * 27 + i * 3 + 1];
-            let dy = (sdf[usize::cast_from(ids[s * 18 + d])]
-                - sdf[usize::cast_from(ids[s * 18 + u])])
-                * geometry[s * 27 + i * 3 + 2];
-            let c0 = 1.0_f32 / (1.0_f32 + f32::exp(-s0 * inv));
-            let c1 = 1.0_f32 / (1.0_f32 + f32::exp(-s1 * inv));
-            let a = f32::clamp((c0 - c1 + 1e-5_f32) / (c0 + 1e-5_f32), 0.0_f32, 1.0_f32);
-            let w = trans * a;
-            let sb = (s * 9 + i) * 10;
-            scratch[sb + 3] = trans;
-            scratch[sb + 4] = a;
-            trans *= f32::max(1.0_f32 - a, 1e-10_f32);
-            masks += w;
-            for j in 0..3usize {
-                let vb = pb + 6 + i * 13 + j * 3;
-                let g = patches[vb] * dt + patches[vb + 1] * dx + patches[vb + 2] * dy;
-                scratch[sb + j] = g;
-                normals[j] += w * g;
-            }
+        let mut base_pt = 0usize;
+        if compact_ids {
+            base_pt = usize::cast_from(ids[s]);
+        }
+        let ib = s * 18;
+        let i0 = if compact_ids {
+            base_pt + pixel
+        } else {
+            usize::cast_from(ids[ib + pixel])
+        };
+        let i1 = if compact_ids {
+            base_pt + 9 + pixel
+        } else {
+            usize::cast_from(ids[ib + 9 + pixel])
+        };
+        let il = if compact_ids {
+            base_pt + l
+        } else {
+            usize::cast_from(ids[ib + l])
+        };
+        let ir = if compact_ids {
+            base_pt + r
+        } else {
+            usize::cast_from(ids[ib + r])
+        };
+        let iu = if compact_ids {
+            base_pt + u
+        } else {
+            usize::cast_from(ids[ib + u])
+        };
+        let id = if compact_ids {
+            base_pt + d
+        } else {
+            usize::cast_from(ids[ib + d])
+        };
+        let s0 = sdf[i0];
+        let s1 = sdf[i1];
+        let sl = sdf[il];
+        let sr = sdf[ir];
+        let su = sdf[iu];
+        let sd = sdf[id];
+        let gb = s * 27 + pixel * 3;
+        let dt = (s1 - s0) * geometry[gb];
+        let dx = (sr - sl) * geometry[gb + 1];
+        let dy = (sd - su) * geometry[gb + 2];
+        let c0 = 1.0_f32 / (1.0_f32 + f32::exp(-s0 * inv));
+        let c1 = 1.0_f32 / (1.0_f32 + f32::exp(-s1 * inv));
+        let a = f32::clamp((c0 - c1 + 1e-5_f32) / (c0 + 1e-5_f32), 0.0_f32, 1.0_f32);
+        let w = trans * a;
+        let sb = (s * 9 + pixel) * 10;
+        scratch[sb + 3] = trans;
+        scratch[sb + 4] = a;
+        scratch[sb + 5] = c0;
+        scratch[sb + 6] = c1;
+        scratch[sb + 7] = s0;
+        scratch[sb + 8] = s1;
+        trans *= f32::max(1.0_f32 - a, 1e-10_f32);
+        masks += w;
+        for j in 0..3usize {
+            let vb = pb + 6 + pixel * 13 + j * 3;
+            let g = patches[vb] * dt + patches[vb + 1] * dx + patches[vb + 2] * dy;
+            scratch[sb + j] = g;
+            normals[j] += w * g;
         }
     }
+
     let mut nl = 0.0_f32;
     let mut ml = 0.0_f32;
     let mut el = 0.0_f32;
     let mut dinv = 0.0_f32;
     let mut bias = 0.0_f32;
-    for i in pixel..pixel + 1 {
-        let mask = patches[pb + 6 + i * 13 + 12];
-        for j in 0..3usize {
-            let err = (normals[j] - patches[pb + 6 + i * 13 + 9 + j]) * mask;
-            nl += err * err / normal_den;
-            dn[j] = 2.0_f32 * err * mask / normal_den;
-        }
-        let m = f32::clamp(masks, 1e-5_f32, 1.0_f32 - 1e-5_f32);
-        ml += -(mask * f32::ln(m) + (1.0_f32 - mask) * f32::ln(1.0_f32 - m)) / pixel_den;
-        if masks >= 1e-5_f32 && masks <= 1.0_f32 - 1e-5_f32 {
-            dm = (m - mask) / (m * (1.0_f32 - m) * pixel_den);
-        }
+    let mask = patches[pb + 6 + pixel * 13 + 12];
+    for j in 0..3usize {
+        let err = (normals[j] - patches[pb + 6 + pixel * 13 + 9 + j]) * mask;
+        nl += err * err / normal_den;
+        dn[j] = 2.0_f32 * err * mask / normal_den;
     }
+    let m = f32::clamp(masks, 1e-5_f32, 1.0_f32 - 1e-5_f32);
+    ml += -(mask * f32::ln(m) + (1.0_f32 - mask) * f32::ln(1.0_f32 - m)) / pixel_den;
+    if masks >= 1e-5_f32 && masks <= 1.0_f32 - 1e-5_f32 {
+        dm = (m - mask) / (m * (1.0_f32 - m) * pixel_den);
+    }
+
     for rev in 0..(end - begin) {
         let s = end - 1 - rev;
-        for i in pixel..pixel + 1 {
-            let sb = (s * 9 + i) * 10;
-            let g0 = scratch[sb];
-            let g1 = scratch[sb + 1];
-            let g2 = scratch[sb + 2];
-            let t = scratch[sb + 3];
-            let a = scratch[sb + 4];
-            let norm = f32::sqrt(g0 * g0 + g1 * g1 + g2 * g2);
-            el += (norm - 1.0_f32) * (norm - 1.0_f32) / sample_den;
-            let eg = 2.0_f32 * (norm - 1.0_f32) / sample_den / f32::max(norm, 1e-12_f32);
-            let dg0 = t * a * dn[0] + eg * g0;
-            let dg1 = t * a * dn[1] + eg * g1;
-            let dg2 = t * a * dn[2] + eg * g2;
-            let vb = pb + 6 + i * 13;
-            let dp0 = (patches[vb] * dg0 + patches[vb + 3] * dg1 + patches[vb + 6] * dg2)
-                * geometry[s * 27 + i * 3];
-            let dp1 = (patches[vb + 1] * dg0 + patches[vb + 4] * dg1 + patches[vb + 7] * dg2)
-                * geometry[s * 27 + i * 3 + 1];
-            let dp2 = (patches[vb + 2] * dg0 + patches[vb + 5] * dg1 + patches[vb + 8] * dg2)
-                * geometry[s * 27 + i * 3 + 2];
-            let i0 = usize::cast_from(ids[s * 18 + i]);
-            let i1 = usize::cast_from(ids[s * 18 + 9 + i]);
-            scratch[sb + 5] = dp0;
-            scratch[sb + 6] = dp1;
-            scratch[sb + 7] = dp2;
-            scratch[sb + 8] = 0.0_f32;
-            scratch[sb + 9] = 0.0_f32;
-            let gw = dn[0] * g0 + dn[1] * g1 + dn[2] * g2 + dm;
-            let q = f32::max(1.0_f32 - a, 1e-10_f32);
-            let tail = if 1.0_f32 - a >= 1e-10_f32 {
-                future
-            } else {
-                0.0_f32
-            };
-            let da = t * (gw - tail);
-            future = gw * a + q * future;
-            let s0 = sdf[i0];
-            let s1 = sdf[i1];
-            let c0 = 1.0_f32 / (1.0_f32 + f32::exp(-s0 * inv));
-            let c1 = 1.0_f32 / (1.0_f32 + f32::exp(-s1 * inv));
-            let denom = c0 + 1e-5_f32;
-            let raw = (c0 - c1 + 1e-5_f32) / denom;
-            if raw >= 0.0_f32 && raw <= 1.0_f32 {
-                let z0 = da * c1 / (denom * denom) * c0 * (1.0_f32 - c0);
-                let z1 = -da / denom * c1 * (1.0_f32 - c1);
-                scratch[sb + 8] = z0 * inv;
-                scratch[sb + 9] = z1 * inv;
-                bias += z0 * inv + z1 * inv;
-                dinv += z0 * s0 + z1 * s1;
-            }
-        }
+        let sb = (s * 9 + pixel) * 10;
+        let g0 = scratch[sb];
+        let g1 = scratch[sb + 1];
+        let g2 = scratch[sb + 2];
+        let t = scratch[sb + 3];
+        let a = scratch[sb + 4];
+        let c0 = scratch[sb + 5];
+        let c1 = scratch[sb + 6];
+        let s0 = scratch[sb + 7];
+        let s1 = scratch[sb + 8];
+        let norm = f32::sqrt(g0 * g0 + g1 * g1 + g2 * g2);
+        el += (norm - 1.0_f32) * (norm - 1.0_f32) / sample_den;
+        let eg = 2.0_f32 * (norm - 1.0_f32) / sample_den / f32::max(norm, 1e-12_f32);
+        let dg0 = t * a * dn[0] + eg * g0;
+        let dg1 = t * a * dn[1] + eg * g1;
+        let dg2 = t * a * dn[2] + eg * g2;
+        let vb = pb + 6 + pixel * 13;
+        let gb = s * 27 + pixel * 3;
+        let dp0 = (patches[vb] * dg0 + patches[vb + 3] * dg1 + patches[vb + 6] * dg2)
+            * geometry[gb];
+        let dp1 = (patches[vb + 1] * dg0 + patches[vb + 4] * dg1 + patches[vb + 7] * dg2)
+            * geometry[gb + 1];
+        let dp2 = (patches[vb + 2] * dg0 + patches[vb + 5] * dg1 + patches[vb + 8] * dg2)
+            * geometry[gb + 2];
+        scratch[sb + 5] = dp0;
+        scratch[sb + 6] = dp1;
+        scratch[sb + 7] = dp2;
+        let gw = dn[0] * g0 + dn[1] * g1 + dn[2] * g2 + dm;
+        let one_minus_a = 1.0_f32 - a;
+        let q = f32::max(one_minus_a, 1e-10_f32);
+        let tail = if one_minus_a >= 1e-10_f32 {
+            future
+        } else {
+            0.0_f32
+        };
+        let da = t * (gw - tail);
+        future = gw * a + q * future;
+        let denom = c0 + 1e-5_f32;
+        let raw = (c0 - c1 + 1e-5_f32) / denom;
+        // Branchless predication (s05_branchless_predication): evaluate z0/z1 via
+        // register select and issue a single unconditional store per scratch slot.
+        let active_raw = raw >= 0.0_f32 && raw <= 1.0_f32;
+        let z0_raw = da * c1 / (denom * denom) * c0 * (1.0_f32 - c0);
+        let z1_raw = -da / denom * c1 * (1.0_f32 - c1);
+        let z0 = if active_raw { z0_raw } else { 0.0_f32 };
+        let z1 = if active_raw { z1_raw } else { 0.0_f32 };
+        scratch[sb + 8] = z0 * inv;
+        scratch[sb + 9] = z1 * inv;
+        bias += z0 * inv + z1 * inv;
+        dinv += z0 * s0 + z1 * s1;
     }
     stats[ray * 5] = nl;
     stats[ray * 5 + 1] = ml;
@@ -1515,15 +1587,23 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([s, g, i, p, vp, w, d, l, r], [od, ol]) = self.desc.as_fixed();
+        let [
+            ScalarIr::UInt(valid_points),
+            ScalarIr::UInt(compact_tables),
+        ] = self.desc.scalars.as_slice()
+        else {
+            panic!("invalid composite scalars")
+        };
         let [s, g, i, p, vp, w, d, l, r] =
             [s, g, i, p, vp, w, d, l, r].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = s.client.clone();
-        let n = p.meta.shape().dims::<2>()[0] * 9;
-        let dim = CubeDim::new(&client, n);
+        let rays = (p.meta.shape().dims::<2>()[0] * 9).max(1);
+        let dim_rays = CubeDim::new(&client, rays);
+        let compact = *compact_tables != 0;
         composite_kernel::launch(
             &client,
-            cubecl::calculate_cube_count_elemwise(&client, n, dim),
-            dim,
+            cubecl::calculate_cube_count_elemwise(&client, rays, dim_rays),
+            dim_rays,
             s.into_tensor_arg(),
             g.into_tensor_arg(),
             i.into_tensor_arg(),
@@ -1531,8 +1611,9 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             vp.into_tensor_arg(),
             w.clone().into_tensor_arg(),
             l.clone().into_tensor_arg(),
+            compact,
         );
-        let count = d.meta.shape().dims::<2>()[0];
+        let count = (*valid_points as usize).max(1);
         let dim = CubeDim::new(&client, count);
         composite_gather_kernel::launch(
             &client,
@@ -1541,13 +1622,19 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             w.into_tensor_arg(),
             r.into_tensor_arg(),
             d.clone().into_tensor_arg(),
+            *valid_points as u32,
+            compact,
         );
         handles.register_float_tensor::<CubeBackend>(&od.id, d);
         handles.register_float_tensor::<CubeBackend>(&ol.id, l);
         Ok(())
     }
 }
-pub fn composite_gpu(inputs: [burn::tensor::Tensor<2>; 9]) -> [burn::tensor::Tensor<2>; 2] {
+pub fn composite_gpu(
+    inputs: [burn::tensor::Tensor<2>; 9],
+    valid_points: usize,
+    compact_tables: bool,
+) -> [burn::tensor::Tensor<2>; 2] {
     let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let outputs: Vec<_> = inputs[6..8]
@@ -1558,7 +1645,10 @@ pub fn composite_gpu(inputs: [burn::tensor::Tensor<2>; 9]) -> [burn::tensor::Ten
         "supernormal_composite",
         &inputs.map(|t| t.into_ir()),
         &outputs,
-        vec![],
+        vec![
+            ScalarIr::UInt(valid_points as u64),
+            ScalarIr::UInt(compact_tables as u64),
+        ],
     );
     let result: [_; 2] = client
         .register(
@@ -1570,6 +1660,11 @@ pub fn composite_gpu(inputs: [burn::tensor::Tensor<2>; 9]) -> [burn::tensor::Ten
     result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
+// Keep total shared memory at 2,821 floats (11,284 bytes < 12 KB) so 4 blocks
+// of 256 threads (1,024 threads/SM) reside concurrently on each Ampere SM.
+// Both the 64-neuron `dh * W0` feature-gradient dot product (16 iterations per
+// thread across 224 threads) and the 8-corner trilinear hash scatter (2 corners
+// per thread across 224 threads) execute across 87.5% of the workgroup.
 #[cube(launch)]
 fn field_backward_kernel(
     pre: &Tensor<f32>,
@@ -1581,6 +1676,7 @@ fn field_backward_kernel(
     metadata: &Tensor<f32>,
     table_grad: &Tensor<Atomic<u32>>,
     active: u32,
+    valid_n: u32,
     #[comptime] local_hash: bool,
     #[comptime] compact_gradients: bool,
     #[comptime] corner_parallel: bool,
@@ -1603,103 +1699,139 @@ fn field_backward_kernel(
     let slot = unit / 64;
     let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
     let point = group * 4 + slot;
+    let n_valid = usize::cast_from(valid_n);
     let mut shared = Shared::new_slice(256usize);
-    // Only the compact variant needs a workgroup-local output-gradient tile.
-    let mut output_grads = Shared::new_slice(if compact_gradients { 256usize } else { 1usize });
-    let mut grad_staging = Shared::new_slice(if corner_parallel { 112usize } else { 1usize });
+    // Reused first for `output_grads` `[256]` and then for 224-thread partial
+    // feature gradients `[448]`, keeping shared memory under 12 KB per block.
+    let mut partials = Shared::new_slice(if corner_parallel {
+        448usize
+    } else if compact_gradients {
+        256usize
+    } else {
+        1usize
+    });
+    let mut slot_ds = Shared::new_slice(4usize);
     let mut output_grad = 0.0_f32;
     let mut v = 0.0_f32;
-    if point < pre.shape(0) {
-        let h = pre[point * 64 + lane];
-        let scaled = h * 100.0_f32;
-        let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
-        let derivative = if scaled > 20.0_f32 {
-            1.0_f32
-        } else {
-            exp_pos / (1.0_f32 + exp_pos)
-        };
-        v = ds[point] * shared_weights[2048 + lane] * derivative;
+    let mut ds_val = 0.0_f32;
+    if point < n_valid {
+        ds_val = ds[point];
+        if ds_val != 0.0_f32 {
+            let h = pre[point * 64 + lane];
+            let scaled = h * 100.0_f32;
+            let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
+            let derivative = if scaled > 20.0_f32 {
+                1.0_f32
+            } else {
+                exp_pos / (1.0_f32 + exp_pos)
+            };
+            v = ds_val * shared_weights[2048 + lane] * derivative;
+            let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
+            let hidden = if scaled > 20.0_f32 { h } else { soft };
+            output_grad = ds_val * hidden;
+        }
         dh[point * 64 + lane] = v;
-        let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
-        let hidden = if scaled > 20.0_f32 { h } else { soft };
-        output_grad = ds[point] * hidden;
         if !compact_gradients {
             dw1[point * 64 + lane] = output_grad;
         }
     }
+    if lane == 0 {
+        slot_ds[slot] = ds_val;
+    }
     let shared_index = if local_hash { lane * 4 + slot } else { unit };
     shared[shared_index] = v;
     if compact_gradients {
-        output_grads[unit] = output_grad;
+        partials[unit] = output_grad;
     }
     sync_cube();
     if compact_gradients && slot == 0 {
         if group < dw1.shape(0) {
-            // All tail lanes participate with zero contributions. No atomics
-            // and no subgroup-size assumptions; retain all 64 output weights.
-            dw1[group * 64 + lane] = (output_grads[lane] + output_grads[64 + lane])
-                + (output_grads[128 + lane] + output_grads[192 + lane]);
+            dw1[group * 64 + lane] = (partials[lane] + partials[64 + lane])
+                + (partials[128 + lane] + partials[192 + lane]);
         }
     }
+    if slot_ds[0] == 0.0_f32
+        && slot_ds[1] == 0.0_f32
+        && slot_ds[2] == 0.0_f32
+        && slot_ds[3] == 0.0_f32
+    {
+        terminate!();
+    }
     if corner_parallel {
+        if compact_gradients {
+            sync_cube();
+        }
+        // Map 224 threads across (hash_slot in 0..4, sub_part in 0..4, level in 0..14).
+        // Phase 1: Each thread accumulates 16 of the 64 hidden neurons (4x faster than
+        // 56 threads looping 64 times) and writes `[p_g0, p_g1]` to `partials`.
         let hash_slot = unit & 3usize;
-        let level = unit >> 2;
+        let sub_part = (unit >> 2) & 3usize;
+        let level = unit >> 4;
         let hash_point = group * 4 + hash_slot;
         if level < 14usize {
-            let mut g0 = 0.0_f32;
-            let mut g1 = 0.0_f32;
-            if hash_point < pre.shape(0) && level < usize::cast_from(active) {
+            let mut p_g0 = 0.0_f32;
+            let mut p_g1 = 0.0_f32;
+            if hash_point < n_valid
+                && level < usize::cast_from(active)
+                && slot_ds[hash_slot] != 0.0_f32
+            {
                 let col = 3 + level * 2;
-                for j in 0..64usize {
+                let j_base = sub_part * 16;
+                for j_off in 0..16usize {
+                    let j = j_base + j_off;
                     let hi = if local_hash {
                         j * 4 + hash_slot
                     } else {
                         hash_slot * 64 + j
                     };
-                    let w0 = if local_hash {
+                    let w_idx0 = if local_hash {
                         j * 31 + col
                     } else {
                         col * 64 + j
                     };
-                    let w1 = if local_hash {
+                    let w_idx1 = if local_hash {
                         j * 31 + col + 1
                     } else {
                         (col + 1) * 64 + j
                     };
                     let h = shared[hi];
-                    g0 += h * shared_weights[w0];
-                    g1 += h * shared_weights[w1];
+                    p_g0 += h * shared_weights[w_idx0];
+                    p_g1 += h * shared_weights[w_idx1];
                 }
             }
-            grad_staging[(level * 4 + hash_slot) * 2] = g0;
-            grad_staging[(level * 4 + hash_slot) * 2 + 1] = g1;
+            partials[unit * 2] = p_g0;
+            partials[unit * 2 + 1] = p_g1;
         }
         sync_cube();
-        let c_slot = unit & 3usize;
-        let corner_pair = (unit >> 2) & 3usize;
-        let c_level = unit >> 4;
-        let c_point = group * 4 + c_slot;
-        if c_point < pre.shape(0) && c_level < usize::cast_from(active) {
-            let g0 = grad_staging[(c_level * 4 + c_slot) * 2];
-            let g1 = grad_staging[(c_level * 4 + c_slot) * 2 + 1];
+        // Phase 2: All 224 threads sum the 4 partial dot products for `(level, hash_slot)`
+        // and scatter their 2 trilinear corners concurrently (448 lookups/atomics per block).
+        if hash_point < n_valid
+            && level < usize::cast_from(active)
+            && slot_ds[hash_slot] != 0.0_f32
+        {
+            let base_p = (level * 16 + hash_slot) * 2;
+            let g0 = (partials[base_p] + partials[base_p + 8])
+                + (partials[base_p + 16] + partials[base_p + 24]);
+            let g1 = (partials[base_p + 1] + partials[base_p + 9])
+                + (partials[base_p + 17] + partials[base_p + 25]);
             if g0 != 0.0_f32 || g1 != 0.0_f32 {
                 let norm0 = f32::clamp(
-                    (points[c_point * 3] + 1.0_f32) * 0.5_f32,
+                    (points[hash_point * 3] + 1.0_f32) * 0.5_f32,
                     0.0_f32,
                     1.0_f32 - 1e-7_f32,
                 );
                 let norm1 = f32::clamp(
-                    (points[c_point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                    (points[hash_point * 3 + 1] + 1.0_f32) * 0.5_f32,
                     0.0_f32,
                     1.0_f32 - 1e-7_f32,
                 );
                 let norm2 = f32::clamp(
-                    (points[c_point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                    (points[hash_point * 3 + 2] + 1.0_f32) * 0.5_f32,
                     0.0_f32,
                     1.0_f32 - 1e-7_f32,
                 );
-                let res = u32::cast_from(metadata[c_level * 2]);
-                let offset = u32::cast_from(metadata[c_level * 2 + 1]);
+                let res = u32::cast_from(metadata[level * 2]);
+                let offset = u32::cast_from(metadata[level * 2 + 1]);
                 let c0 = norm0 * f32::cast_from(res);
                 let c1 = norm1 * f32::cast_from(res);
                 let c2 = norm2 * f32::cast_from(res);
@@ -1715,7 +1847,7 @@ fn field_backward_kernel(
                 let r1 = res + 1;
                 let dense = r1 * r1 * r1 <= 524288;
                 for c_sub in 0..2u32 {
-                    let corner = u32::cast_from(corner_pair) * 2 + c_sub;
+                    let corner = u32::cast_from(sub_part) * 2 + c_sub;
                     let bit0 = corner & 1;
                     let bit1 = (corner >> 1) & 1;
                     let bit2 = (corner >> 2) & 1;
@@ -1747,7 +1879,10 @@ fn field_backward_kernel(
         let hash_slot = if local_hash { unit % 4 } else { slot };
         let level = if local_hash { unit / 4 } else { lane };
         let hash_point = group * 4 + hash_slot;
-        if hash_point < pre.shape(0) && level < usize::cast_from(active) {
+        if hash_point < n_valid
+            && level < usize::cast_from(active)
+            && slot_ds[hash_slot] != 0.0_f32
+        {
             let col = 3 + level * 2;
             let mut g0 = 0.0_f32;
             let mut g1 = 0.0_f32;
@@ -1847,6 +1982,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         let ([p, d, w, x, m, t, h, g], [ot, oh, og]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(active),
+            ScalarIr::UInt(valid_n),
             ScalarIr::UInt(local_hash),
             ScalarIr::UInt(compact_gradients),
             ScalarIr::UInt(corner_parallel),
@@ -1858,7 +1994,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
             [p, d, w, x, m, t, h, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let t = if t.can_mut() { t } else { t.copy() };
         let client = p.client.clone();
-        let groups = p.meta.shape().dims::<2>()[0].div_ceil(4);
+        let groups = (*valid_n as usize).div_ceil(4).max(1);
         let gx = groups.min(65535).max(1);
         let native_add = client
             .properties()
@@ -1899,6 +2035,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 m.into_tensor_arg(),
                 t.clone().into_tensor_arg(),
                 *active as u32,
+                *valid_n as u32,
                 *local_hash != 0,
                 *compact_gradients != 0,
                 *corner_parallel != 0,
@@ -1917,6 +2054,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 m.into_tensor_arg(),
                 t.clone().into_tensor_arg(),
                 *active as u32,
+                *valid_n as u32,
                 *local_hash != 0,
                 *compact_gradients != 0,
                 *corner_parallel != 0,
@@ -1930,6 +2068,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
 }
 pub fn field_backward(
     inputs: [burn::tensor::Tensor<2>; 6],
+    valid_n: usize,
     active: usize,
     local_hash: bool,
     compact_gradients: bool,
@@ -1938,14 +2077,16 @@ pub fn field_backward(
     use burn::tensor::Tensor as BT;
     let n = inputs[0].dims()[0];
     let device = inputs[0].device();
+    let dw1_rows = if compact_gradients {
+        valid_n.div_ceil(4).max(1)
+    } else {
+        valid_n.max(1)
+    };
     let inputs: Vec<_> = inputs
         .into_iter()
         .chain([
             BT::empty([n, 64], &device),
-            BT::empty(
-                [if compact_gradients { n.div_ceil(4) } else { n }, 64],
-                &device,
-            ),
+            BT::empty([dw1_rows, 64], &device),
         ])
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
@@ -1960,6 +2101,7 @@ pub fn field_backward(
         &outputs,
         vec![
             ScalarIr::UInt(active as u64),
+            ScalarIr::UInt(valid_n as u64),
             ScalarIr::UInt(local_hash as u64),
             ScalarIr::UInt(compact_gradients as u64),
             ScalarIr::UInt(corner_parallel as u64),
@@ -1976,43 +2118,99 @@ pub fn field_backward(
 }
 
 #[cube(launch)]
-fn composite_gather_kernel(scratch: &Tensor<f32>, reverse: &Tensor<f32>, ds: &mut Tensor<f32>) {
+fn composite_gather_kernel(
+    scratch: &Tensor<f32>,
+    reverse: &Tensor<f32>,
+    ds: &mut Tensor<f32>,
+    valid_points: u32,
+    #[comptime] compact_reverse: bool,
+) {
     let point = ABSOLUTE_POS;
-    if point >= ds.shape(0) {
+    if point >= usize::cast_from(valid_points) {
         terminate!();
     }
     let mut total = 0.0_f32;
-    for occurrence in 0..2usize {
-        let code = reverse[point * 2 + occurrence];
-        if code >= 0.0_f32 {
-            let code = usize::cast_from(code);
-            let sample = code / 18;
-            let corner = code % 18;
-            let pixel = corner % 9;
-            let base = (sample * 9 + pixel) * 10;
-            if corner >= 9 {
-                total += scratch[base + 5] + scratch[base + 9];
-            } else {
-                total += -scratch[base + 5] + scratch[base + 8];
-                for j in 0..9usize {
-                    let col = j % 3;
-                    let row = j / 3;
-                    let l = if col == 0 { j } else { j - 1 };
-                    let r = if col == 2 { j } else { j + 1 };
-                    let u = if row == 0 { j } else { j - 3 };
-                    let d = if row == 2 { j } else { j + 3 };
-                    let other = (sample * 9 + j) * 10;
-                    if pixel == l {
-                        total -= scratch[other + 6];
+    if compact_reverse {
+        let ep = point / 9;
+        let pixel = point % 9;
+        let p_col = pixel % 3;
+        let p_row = pixel / 3;
+        for occurrence in 0..2usize {
+            let code = reverse[ep * 2 + occurrence];
+            if code >= 0.0_f32 {
+                let c = usize::cast_from(code);
+                let sample = c / 2;
+                let is_end = (c & 1usize) != 0usize;
+                let base = (sample * 9 + pixel) * 10;
+                if is_end {
+                    total += scratch[base + 5] + scratch[base + 9];
+                } else {
+                    total += -scratch[base + 5] + scratch[base + 8];
+                    if p_col == 0 {
+                        total -= scratch[base + 6];
                     }
-                    if pixel == r {
-                        total += scratch[other + 6];
+                    if p_col > 0 {
+                        total += scratch[(sample * 9 + pixel - 1) * 10 + 6];
                     }
-                    if pixel == u {
-                        total -= scratch[other + 7];
+                    if p_col < 2 {
+                        total -= scratch[(sample * 9 + pixel + 1) * 10 + 6];
                     }
-                    if pixel == d {
-                        total += scratch[other + 7];
+                    if p_col == 2 {
+                        total += scratch[base + 6];
+                    }
+                    if p_row == 0 {
+                        total -= scratch[base + 7];
+                    }
+                    if p_row > 0 {
+                        total += scratch[(sample * 9 + pixel - 3) * 10 + 7];
+                    }
+                    if p_row < 2 {
+                        total -= scratch[(sample * 9 + pixel + 3) * 10 + 7];
+                    }
+                    if p_row == 2 {
+                        total += scratch[base + 7];
+                    }
+                }
+            }
+        }
+    } else {
+        for occurrence in 0..2usize {
+            let code = reverse[point * 2 + occurrence];
+            if code >= 0.0_f32 {
+                let code = usize::cast_from(code);
+                let sample = code / 18;
+                let corner = code % 18;
+                let pixel = corner % 9;
+                let base = (sample * 9 + pixel) * 10;
+                if corner >= 9 {
+                    total += scratch[base + 5] + scratch[base + 9];
+                } else {
+                    total += -scratch[base + 5] + scratch[base + 8];
+                    let p_col = pixel % 3;
+                    let p_row = pixel / 3;
+                    if p_col == 0 {
+                        total -= scratch[base + 6];
+                    }
+                    if p_col > 0 {
+                        total += scratch[(sample * 9 + pixel - 1) * 10 + 6];
+                    }
+                    if p_col < 2 {
+                        total -= scratch[(sample * 9 + pixel + 1) * 10 + 6];
+                    }
+                    if p_col == 2 {
+                        total += scratch[base + 6];
+                    }
+                    if p_row == 0 {
+                        total -= scratch[base + 7];
+                    }
+                    if p_row > 0 {
+                        total += scratch[(sample * 9 + pixel - 3) * 10 + 7];
+                    }
+                    if p_row < 2 {
+                        total -= scratch[(sample * 9 + pixel + 3) * 10 + 7];
+                    }
+                    if p_row == 2 {
+                        total += scratch[base + 7];
                     }
                 }
             }
@@ -2139,6 +2337,7 @@ fn field_backward_native_kernel(
     metadata: &Tensor<f32>,
     table_grad: &Tensor<Atomic<f32>>,
     active: u32,
+    valid_n: u32,
     #[comptime] local_hash: bool,
     #[comptime] compact_gradients: bool,
     #[comptime] corner_parallel: bool,
@@ -2161,103 +2360,132 @@ fn field_backward_native_kernel(
     let slot = unit / 64;
     let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
     let point = group * 4 + slot;
+    let n_valid = usize::cast_from(valid_n);
     let mut shared = Shared::new_slice(256usize);
-    // Only the compact variant needs a workgroup-local output-gradient tile.
-    let mut output_grads = Shared::new_slice(if compact_gradients { 256usize } else { 1usize });
-    let mut grad_staging = Shared::new_slice(if corner_parallel { 112usize } else { 1usize });
+    let mut partials = Shared::new_slice(if corner_parallel {
+        448usize
+    } else if compact_gradients {
+        256usize
+    } else {
+        1usize
+    });
+    let mut slot_ds = Shared::new_slice(4usize);
     let mut output_grad = 0.0_f32;
     let mut v = 0.0_f32;
-    if point < pre.shape(0) {
-        let h = pre[point * 64 + lane];
-        let scaled = h * 100.0_f32;
-        let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
-        let derivative = if scaled > 20.0_f32 {
-            1.0_f32
-        } else {
-            exp_pos / (1.0_f32 + exp_pos)
-        };
-        v = ds[point] * shared_weights[2048 + lane] * derivative;
+    let mut ds_val = 0.0_f32;
+    if point < n_valid {
+        ds_val = ds[point];
+        if ds_val != 0.0_f32 {
+            let h = pre[point * 64 + lane];
+            let scaled = h * 100.0_f32;
+            let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
+            let derivative = if scaled > 20.0_f32 {
+                1.0_f32
+            } else {
+                exp_pos / (1.0_f32 + exp_pos)
+            };
+            v = ds_val * shared_weights[2048 + lane] * derivative;
+            let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
+            let hidden = if scaled > 20.0_f32 { h } else { soft };
+            output_grad = ds_val * hidden;
+        }
         dh[point * 64 + lane] = v;
-        let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
-        let hidden = if scaled > 20.0_f32 { h } else { soft };
-        output_grad = ds[point] * hidden;
         if !compact_gradients {
             dw1[point * 64 + lane] = output_grad;
         }
     }
+    if lane == 0 {
+        slot_ds[slot] = ds_val;
+    }
     let shared_index = if local_hash { lane * 4 + slot } else { unit };
     shared[shared_index] = v;
     if compact_gradients {
-        output_grads[unit] = output_grad;
+        partials[unit] = output_grad;
     }
     sync_cube();
     if compact_gradients && slot == 0 {
         if group < dw1.shape(0) {
-            // All tail lanes participate with zero contributions. No atomics
-            // and no subgroup-size assumptions; retain all 64 output weights.
-            dw1[group * 64 + lane] = (output_grads[lane] + output_grads[64 + lane])
-                + (output_grads[128 + lane] + output_grads[192 + lane]);
+            dw1[group * 64 + lane] = (partials[lane] + partials[64 + lane])
+                + (partials[128 + lane] + partials[192 + lane]);
         }
     }
+    if slot_ds[0] == 0.0_f32
+        && slot_ds[1] == 0.0_f32
+        && slot_ds[2] == 0.0_f32
+        && slot_ds[3] == 0.0_f32
+    {
+        terminate!();
+    }
     if corner_parallel {
+        if compact_gradients {
+            sync_cube();
+        }
         let hash_slot = unit & 3usize;
-        let level = unit >> 2;
+        let sub_part = (unit >> 2) & 3usize;
+        let level = unit >> 4;
         let hash_point = group * 4 + hash_slot;
         if level < 14usize {
-            let mut g0 = 0.0_f32;
-            let mut g1 = 0.0_f32;
-            if hash_point < pre.shape(0) && level < usize::cast_from(active) {
+            let mut p_g0 = 0.0_f32;
+            let mut p_g1 = 0.0_f32;
+            if hash_point < n_valid
+                && level < usize::cast_from(active)
+                && slot_ds[hash_slot] != 0.0_f32
+            {
                 let col = 3 + level * 2;
-                for j in 0..64usize {
+                let j_base = sub_part * 16;
+                for j_off in 0..16usize {
+                    let j = j_base + j_off;
                     let hi = if local_hash {
                         j * 4 + hash_slot
                     } else {
                         hash_slot * 64 + j
                     };
-                    let w0 = if local_hash {
+                    let w_idx0 = if local_hash {
                         j * 31 + col
                     } else {
                         col * 64 + j
                     };
-                    let w1 = if local_hash {
+                    let w_idx1 = if local_hash {
                         j * 31 + col + 1
                     } else {
                         (col + 1) * 64 + j
                     };
                     let h = shared[hi];
-                    g0 += h * shared_weights[w0];
-                    g1 += h * shared_weights[w1];
+                    p_g0 += h * shared_weights[w_idx0];
+                    p_g1 += h * shared_weights[w_idx1];
                 }
             }
-            grad_staging[(level * 4 + hash_slot) * 2] = g0;
-            grad_staging[(level * 4 + hash_slot) * 2 + 1] = g1;
+            partials[unit * 2] = p_g0;
+            partials[unit * 2 + 1] = p_g1;
         }
         sync_cube();
-        let c_slot = unit & 3usize;
-        let corner_pair = (unit >> 2) & 3usize;
-        let c_level = unit >> 4;
-        let c_point = group * 4 + c_slot;
-        if c_point < pre.shape(0) && c_level < usize::cast_from(active) {
-            let g0 = grad_staging[(c_level * 4 + c_slot) * 2];
-            let g1 = grad_staging[(c_level * 4 + c_slot) * 2 + 1];
+        if hash_point < n_valid
+            && level < usize::cast_from(active)
+            && slot_ds[hash_slot] != 0.0_f32
+        {
+            let base_p = (level * 16 + hash_slot) * 2;
+            let g0 = (partials[base_p] + partials[base_p + 8])
+                + (partials[base_p + 16] + partials[base_p + 24]);
+            let g1 = (partials[base_p + 1] + partials[base_p + 9])
+                + (partials[base_p + 17] + partials[base_p + 25]);
             if g0 != 0.0_f32 || g1 != 0.0_f32 {
                 let norm0 = f32::clamp(
-                    (points[c_point * 3] + 1.0_f32) * 0.5_f32,
+                    (points[hash_point * 3] + 1.0_f32) * 0.5_f32,
                     0.0_f32,
                     1.0_f32 - 1e-7_f32,
                 );
                 let norm1 = f32::clamp(
-                    (points[c_point * 3 + 1] + 1.0_f32) * 0.5_f32,
+                    (points[hash_point * 3 + 1] + 1.0_f32) * 0.5_f32,
                     0.0_f32,
                     1.0_f32 - 1e-7_f32,
                 );
                 let norm2 = f32::clamp(
-                    (points[c_point * 3 + 2] + 1.0_f32) * 0.5_f32,
+                    (points[hash_point * 3 + 2] + 1.0_f32) * 0.5_f32,
                     0.0_f32,
                     1.0_f32 - 1e-7_f32,
                 );
-                let res = u32::cast_from(metadata[c_level * 2]);
-                let offset = u32::cast_from(metadata[c_level * 2 + 1]);
+                let res = u32::cast_from(metadata[level * 2]);
+                let offset = u32::cast_from(metadata[level * 2 + 1]);
                 let c0 = norm0 * f32::cast_from(res);
                 let c1 = norm1 * f32::cast_from(res);
                 let c2 = norm2 * f32::cast_from(res);
@@ -2273,7 +2501,7 @@ fn field_backward_native_kernel(
                 let r1 = res + 1;
                 let dense = r1 * r1 * r1 <= 524288;
                 for c_sub in 0..2u32 {
-                    let corner = u32::cast_from(corner_pair) * 2 + c_sub;
+                    let corner = u32::cast_from(sub_part) * 2 + c_sub;
                     let bit0 = corner & 1;
                     let bit1 = (corner >> 1) & 1;
                     let bit2 = (corner >> 2) & 1;
@@ -2305,7 +2533,10 @@ fn field_backward_native_kernel(
         let hash_slot = if local_hash { unit % 4 } else { slot };
         let level = if local_hash { unit / 4 } else { lane };
         let hash_point = group * 4 + hash_slot;
-        if hash_point < pre.shape(0) && level < usize::cast_from(active) {
+        if hash_point < n_valid
+            && level < usize::cast_from(active)
+            && slot_ds[hash_slot] != 0.0_f32
+        {
             let col = 3 + level * 2;
             let mut g0 = 0.0_f32;
             let mut g1 = 0.0_f32;

@@ -43,8 +43,10 @@ pub struct Field {
     pub compact_gradients: bool,
     pub wide_gradient_tiles: bool,
     pub corner_parallel: bool,
+    pub chunked_eval: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
+    persistent_table_grad: std::cell::RefCell<Option<Tensor<2>>>,
 }
 
 pub fn tensor<const D: usize>(data: Vec<f32>, shape: [usize; D], device: &Device) -> Tensor<D> {
@@ -110,8 +112,8 @@ impl Gradients {
 }
 
 pub struct FeatureChunk {
-    pub feat: Tensor<2>,
-    pub preactivation: Tensor<2>,
+    pub feat: Option<Tensor<2>>,
+    pub preactivation: Option<Tensor<2>>,
     pub pts_tensor: Tensor<2>,
     pub point_count: usize,
     pub padded_count: usize,
@@ -125,7 +127,7 @@ pub struct PendingEvaluation {
 
 impl PendingEvaluation {
     pub fn into_device(self) -> (Tensor<2>, Vec<FeatureChunk>) {
-        let outputs = self
+        let mut outputs: Vec<Tensor<2>> = self
             .outputs
             .into_iter()
             .map(|(n, y)| {
@@ -136,13 +138,24 @@ impl PendingEvaluation {
                 }
             })
             .collect();
-        (Tensor::cat(outputs, 0), self.cache)
+        let sdf = if outputs.len() == 1 {
+            outputs.pop().unwrap()
+        } else {
+            Tensor::cat(outputs, 0)
+        };
+        (sdf, self.cache)
     }
 
     pub fn finish(self) -> Result<(Vec<f32>, Vec<FeatureChunk>)> {
         Ok((Field::read_outputs(self.outputs)?, self.cache))
     }
 }
+
+/// Cap simultaneously resident cached `(feat, preactivation)` chunks in VRAM
+/// (`3 * 49.8 MB = 149 MB` at `--query 131072`). Any additional chunks during
+/// the early step 1-900 sample spike stream through a single reusable buffer
+/// in backward, keeping total VRAM flat at ~1.6-1.8 GB from step 1 onward.
+const MAX_CACHED_CHUNKS: usize = 3;
 
 impl Field {
     fn build_packed_embedding(
@@ -298,8 +311,10 @@ impl Field {
             compact_gradients: true,
             wide_gradient_tiles: true,
             corner_parallel: true,
+            chunked_eval: false,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
+            persistent_table_grad: std::cell::RefCell::new(None),
         }
     }
 
@@ -379,8 +394,10 @@ impl Field {
             compact_gradients: true,
             wide_gradient_tiles: true,
             corner_parallel: true,
+            chunked_eval: false,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
+            persistent_table_grad: std::cell::RefCell::new(None),
         })
     }
 
@@ -437,11 +454,29 @@ impl Field {
     }
 
     #[inline]
-    fn static_bucket_size(n: usize, chunk: usize) -> usize {
+    pub fn static_bucket_size(n: usize, chunk: usize) -> usize {
         if n == chunk || chunk < 1024 {
-            return n;
+            return n.max(1);
         }
         n.next_power_of_two().max(1024).min(chunk)
+    }
+
+    /// Compute the total allocated row capacity for a device-resident point buffer
+    /// `[count, 3]` so its tail chunk of size `count % chunk` already has exact
+    /// `static_bucket_size(tail, chunk)` capacity, eliminating `Tensor::zeros` +
+    /// `Tensor::cat` padding copies during chunked evaluation.
+    #[inline]
+    pub fn padded_point_capacity(count: usize, chunk: usize) -> usize {
+        if count == 0 {
+            return 1024.min(chunk.max(1));
+        }
+        let full_chunks = count / chunk;
+        let rem = count % chunk;
+        if rem == 0 {
+            full_chunks * chunk
+        } else {
+            full_chunks * chunk + Self::static_bucket_size(rem, chunk)
+        }
     }
 
     /// One mapping/readback for the entire query, rather than a host wait for
@@ -450,7 +485,7 @@ impl Field {
         if outputs.is_empty() {
             return Ok(Vec::new());
         }
-        let outputs = outputs
+        let outputs: Vec<Tensor<2>> = outputs
             .into_iter()
             .map(|(n, y)| {
                 if y.dims()[0] == n {
@@ -460,7 +495,12 @@ impl Field {
                 }
             })
             .collect();
-        Ok(Tensor::cat(outputs, 0).try_into_vec_as::<f32>()?)
+        let cat = if outputs.len() == 1 {
+            outputs.into_iter().next().unwrap()
+        } else {
+            Tensor::cat(outputs, 0)
+        };
+        Ok(cat.try_into_vec_as::<f32>()?)
     }
 
     fn enqueue_evaluation(&self, points: &[[f32; 3]], chunk: usize) -> Vec<(usize, Tensor<2>)> {
@@ -474,7 +514,7 @@ impl Field {
 
             let xyz = tensor(flat, [padded_n, 3], &self.device);
             let y = if self.fused_field {
-                let [y, _, _] = self.fused_forward(xyz, false);
+                let [y, _, _] = self.fused_forward_valid(xyz, n, false);
                 y
             } else {
                 let features = self.compute_features_gpu(xyz);
@@ -486,54 +526,73 @@ impl Field {
         pending
     }
 
-    /// Evaluate points that are already device-resident `[count, 3]` without
-    /// downloading or re-uploading coordinates.
-    pub fn evaluate_device_tensor(&self, points: Tensor<2>, chunk: usize) -> Tensor<2> {
-        let count = points.dims()[0];
-        let outputs: Vec<_> = (0..count)
+    /// Evaluate points that are already device-resident `[padded_cap, 3]` with
+    /// `valid_count` active points without downloading or re-uploading coordinates.
+    pub fn evaluate_device_tensor_valid(
+        &self,
+        points: Tensor<2>,
+        valid_count: usize,
+        chunk: usize,
+    ) -> Tensor<2> {
+        let total_rows = points.dims()[0];
+        if valid_count <= chunk && total_rows == Self::static_bucket_size(valid_count, chunk) {
+            return if self.fused_field {
+                let [y, _, _] = self.fused_forward_valid(points, valid_count, false);
+                y
+            } else {
+                let features = self.compute_features_gpu(points);
+                let y = self.mlp_forward(features, false);
+                if y.dims()[0] == valid_count {
+                    y
+                } else {
+                    y.slice([0..valid_count, 0..1])
+                }
+            };
+        }
+        let mut outputs: Vec<Tensor<2>> = (0..valid_count)
             .step_by(chunk)
             .map(|start| {
-                let n = (count - start).min(chunk);
+                let n = (valid_count - start).min(chunk);
                 let padded_n = Self::static_bucket_size(n, chunk);
-                let pts = points.clone().slice([start..start + n, 0..3]);
-                let xyz = if padded_n == n {
-                    pts
+                let xyz = if start == 0 && total_rows == padded_n {
+                    points.clone()
+                } else if start + padded_n <= total_rows {
+                    points.clone().slice([start..start + padded_n, 0..3])
                 } else {
-                    Tensor::cat(
-                        vec![pts, Tensor::zeros([padded_n - n, 3], &self.device)],
-                        0,
-                    )
+                    let pts = points.clone().slice([start..start + n, 0..3]);
+                    if padded_n == n {
+                        pts
+                    } else {
+                        Tensor::cat(
+                            vec![pts, Tensor::empty([padded_n - n, 3], &self.device)],
+                            0,
+                        )
+                    }
                 };
-                let y = if self.fused_field {
-                    let [y, _, _] = self.fused_forward(xyz, false);
+                if self.fused_field {
+                    let [y, _, _] = self.fused_forward_valid(xyz, n, false);
                     y
                 } else {
                     let features = self.compute_features_gpu(xyz);
-                    self.mlp_forward(features, false)
-                };
-                if y.dims()[0] == n {
-                    y
-                } else {
-                    y.slice([0..n, 0..1])
+                    let y = self.mlp_forward(features, false);
+                    if y.dims()[0] == n {
+                        y
+                    } else {
+                        y.slice([0..n, 0..1])
+                    }
                 }
             })
             .collect();
-        Tensor::cat(outputs, 0)
+        if outputs.len() == 1 {
+            outputs.pop().unwrap()
+        } else {
+            Tensor::cat(outputs, 0)
+        }
     }
 
-    pub fn evaluate_device(&self, points: &[[f32; 3]], chunk: usize) -> Tensor<2> {
-        let outputs = self
-            .enqueue_evaluation(points, chunk)
-            .into_iter()
-            .map(|(n, y)| {
-                if y.dims()[0] == n {
-                    y
-                } else {
-                    y.slice([0..n, 0..1])
-                }
-            })
-            .collect();
-        Tensor::cat(outputs, 0)
+    pub fn evaluate_device_tensor(&self, points: Tensor<2>, chunk: usize) -> Tensor<2> {
+        let count = points.dims()[0];
+        self.evaluate_device_tensor_valid(points, count, chunk)
     }
 
     pub fn evaluate(&self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
@@ -575,16 +634,17 @@ impl Field {
     }
 
     /// Evaluate visibility on device-resident center points, pairs, and ranges,
-    /// returning the `[rays + 1, 1]` result tensor without host transfers.
+    /// returning the `[rays + 1, 2]` result tensor without host transfers.
     pub fn visibility_device(
         &self,
         unique_pts: Tensor<2>,
+        valid_ep_count: usize,
         pairs: Tensor<2>,
         ranges: Tensor<2>,
         chunk: usize,
     ) -> Tensor<2> {
         let rays = ranges.dims()[0];
-        let sdf = self.evaluate_device_tensor(unique_pts, chunk);
+        let sdf = self.evaluate_device_tensor_valid(unique_pts, valid_ep_count, chunk);
         crate::kernels::visibility([
             sdf,
             pairs,
@@ -785,7 +845,7 @@ impl Field {
         self.enqueue_cached(points, chunk).finish()
     }
 
-    fn fused_forward(&self, xyz: Tensor<2>, cache: bool) -> [Tensor<2>; 3] {
+    fn fused_forward_valid(&self, xyz: Tensor<2>, valid_n: usize, cache: bool) -> [Tensor<2>; 3] {
         if self.packed_mlp.borrow().is_none() {
             let weights = Tensor::cat(
                 vec![
@@ -804,6 +864,7 @@ impl Field {
         let (tables, metadata) = self.packed_tables();
         crate::kernels::fused_field(
             [xyz, tables, metadata, weights],
+            valid_n,
             self.active.min(14),
             cache,
             self.local_hash,
@@ -822,17 +883,30 @@ impl Field {
         self.enqueue_cached_inputs(inputs)
     }
 
-    /// Consume generated GPU coordinates without downloading/re-uploading them.
-    pub fn enqueue_cached_device(&self, points: Tensor<2>, chunk: usize) -> PendingEvaluation {
-        let count = points.dims()[0];
-        let inputs = (0..count).step_by(chunk).map(|start| {
-            let n = (count - start).min(chunk);
+    /// Consume generated GPU coordinates `[padded_cap, 3]` with `valid_count`
+    /// points in static power-of-two `chunk` buckets without downloading/re-uploading
+    /// or issuing `Tensor::zeros` + `Tensor::cat` padding copies.
+    pub fn enqueue_cached_device_valid(
+        &self,
+        points: Tensor<2>,
+        valid_count: usize,
+        chunk: usize,
+    ) -> PendingEvaluation {
+        let total_rows = points.dims()[0];
+        let inputs = (0..valid_count).step_by(chunk).map(|start| {
+            let n = (valid_count - start).min(chunk);
             let padded = Self::static_bucket_size(n, chunk);
-            let pts = points.clone().slice([start..start + n, 0..3]);
-            let pts = if padded == n {
-                pts
+            let pts = if start == 0 && total_rows == padded {
+                points.clone()
+            } else if start + padded <= total_rows {
+                points.clone().slice([start..start + padded, 0..3])
             } else {
-                Tensor::cat(vec![pts, Tensor::zeros([padded - n, 3], &self.device)], 0)
+                let sub = points.clone().slice([start..start + n, 0..3]);
+                if padded == n {
+                    sub
+                } else {
+                    Tensor::cat(vec![sub, Tensor::empty([padded - n, 3], &self.device)], 0)
+                }
             };
             (n, pts)
         });
@@ -845,27 +919,49 @@ impl Field {
     ) -> PendingEvaluation {
         let mut chunks = Vec::new();
         let mut pending_outputs = Vec::new();
-        let w0_t = self.effective_weight(0, false).transpose();
-        let b0 = self.p("lin0.bias").without_autodiff();
-        for (n, pts_tensor) in inputs {
+        let w0_t = if !self.fused_field {
+            Some(self.effective_weight(0, false).transpose())
+        } else {
+            None
+        };
+        let b0 = if !self.fused_field {
+            Some(self.p("lin0.bias").without_autodiff())
+        } else {
+            None
+        };
+        for (chunk_idx, (n, pts_tensor)) in inputs.enumerate() {
             let padded_n = pts_tensor.dims()[0];
-            let [y, feat, preactivation] = if self.fused_field {
-                self.fused_forward(pts_tensor.clone(), true)
+            if self.fused_field {
+                let keep_cache = chunk_idx < MAX_CACHED_CHUNKS;
+                let [y, feat, preactivation] =
+                    self.fused_forward_valid(pts_tensor.clone(), n, keep_cache);
+                pending_outputs.push((n, y));
+                chunks.push(FeatureChunk {
+                    feat: if keep_cache { Some(feat) } else { None },
+                    preactivation: if keep_cache {
+                        Some(preactivation)
+                    } else {
+                        None
+                    },
+                    pts_tensor,
+                    point_count: n,
+                    padded_count: padded_n,
+                });
             } else {
                 let feat = self.compute_features_gpu(pts_tensor.clone());
-                let preactivation = feat.clone().matmul(w0_t.clone()) + b0.clone();
+                let preactivation =
+                    feat.clone().matmul(w0_t.clone().unwrap()) + b0.clone().unwrap();
                 let hidden = Self::softplus(preactivation.clone());
-                [self.mlp_output(hidden, false), feat, preactivation]
-            };
-
-            pending_outputs.push((n, y));
-            chunks.push(FeatureChunk {
-                feat,
-                preactivation,
-                pts_tensor,
-                point_count: n,
-                padded_count: padded_n,
-            });
+                let y = self.mlp_output(hidden, false);
+                pending_outputs.push((n, y));
+                chunks.push(FeatureChunk {
+                    feat: Some(feat),
+                    preactivation: Some(preactivation),
+                    pts_tensor,
+                    point_count: n,
+                    padded_count: padded_n,
+                });
+            }
         }
 
         PendingEvaluation {
@@ -884,7 +980,7 @@ impl Field {
         if let Some(usage) = self.device.memory_pool_usage() {
             self.peak_reserved_bytes
                 .set(self.peak_reserved_bytes.get().max(usage.bytes_reserved));
-            if usage.bytes_reserved > 1024 * 1024 * 1024 {
+            if usage.bytes_reserved > 768 * 1024 * 1024 {
                 self.device.memory_cleanup();
             }
         }
@@ -912,34 +1008,52 @@ impl Field {
         let active_levels = self.active.min(14);
         let (_, metadata) = self.packed_tables();
         if !accumulated.params.contains_key("encoding.packed") {
-            let entries = self.level_offsets[active_levels];
-            accumulated.params.insert(
-                "encoding.packed".into(),
-                Tensor::zeros([entries, 2], &self.device),
-            );
+            let total_entries = *self.level_offsets.last().unwrap();
+            let grad_buf = self
+                .persistent_table_grad
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| Tensor::zeros([total_entries, 2], &self.device));
+            accumulated.params.insert("encoding.packed".into(), grad_buf);
         }
 
-        let w0 = self.effective_weight(0, false);
-        let w1 = self.effective_weight(1, false);
+        let w0 = if !self.fused_field {
+            Some(self.effective_weight(0, false))
+        } else {
+            None
+        };
+        let w1 = if !self.fused_field {
+            Some(self.effective_weight(1, false))
+        } else {
+            None
+        };
 
         let mut offset = 0;
         let mut dw0_total: Option<Tensor<2>> = None;
         let mut dw1_total: Option<Tensor<2>> = None;
         let mut db0_total: Option<Tensor<2>> = None;
         let mut db1_total: Option<Tensor<2>> = None;
+        let single_chunk = cached.len() == 1;
 
         for chunk in cached {
             let n = chunk.point_count;
             let padded_n = chunk.padded_count;
-            let mut ds_tensor = adjoints.clone().slice([offset..offset + n, 0..1]);
+            let mut ds_tensor = if single_chunk && adjoints.dims()[0] == n {
+                adjoints.clone()
+            } else {
+                adjoints.clone().slice([offset..offset + n, 0..1])
+            };
             offset += n;
-            if padded_n != n {
-                ds_tensor = Tensor::cat(
-                    vec![ds_tensor, Tensor::zeros([padded_n - n, 1], &self.device)],
-                    0,
-                );
-            }
-            let (dh, d_feat_tensor, dw1_chunk) = if self.fused_field {
+
+            let (feat, preactivation) = match (chunk.feat, chunk.preactivation) {
+                (Some(f), Some(p)) => (f, p),
+                _ => {
+                    let [_, f, p] = self.fused_forward_valid(chunk.pts_tensor.clone(), n, true);
+                    (f, p)
+                }
+            };
+
+            let (dh, d_feat_tensor, dw1_chunk, db1_chunk) = if self.fused_field {
                 let weights = self
                     .packed_mlp
                     .borrow()
@@ -949,37 +1063,57 @@ impl Field {
                 let table_grad = accumulated.params.remove("encoding.packed").unwrap();
                 let [updated, dh, dw1] = crate::kernels::field_backward(
                     [
-                        chunk.preactivation,
+                        preactivation,
                         ds_tensor.clone(),
                         weights,
                         chunk.pts_tensor.clone(),
                         metadata.clone(),
                         table_grad,
                     ],
+                    n,
                     active_levels,
                     self.local_hash,
                     self.compact_gradients,
                     self.corner_parallel,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
-                (dh, None, dw1.sum_dim(0))
+                (dh, None, dw1.sum_dim(0), ds_tensor.sum_dim(0))
             } else {
-                let hidden = Self::softplus(chunk.preactivation.clone());
+                let db1_chunk = ds_tensor.clone().sum_dim(0);
+                if padded_n != n {
+                    ds_tensor = Tensor::cat(
+                        vec![ds_tensor, Tensor::zeros([padded_n - n, 1], &self.device)],
+                        0,
+                    );
+                }
+                let hidden = Self::softplus(preactivation.clone());
                 let dw1 = ds_tensor.clone().transpose().matmul(hidden);
-                let scaled = chunk.preactivation * 100.;
+                let scaled = preactivation * 100.;
                 let derivative = ((-scaled.clone()).exp() + 1.)
                     .recip()
                     .mask_fill(scaled.greater_elem(20.), 1.);
-                let dh = ds_tensor.clone() * w1.clone() * derivative;
-                let df = dh.clone().matmul(w0.clone());
-                (dh, Some(df), dw1)
+                let dh = ds_tensor * w1.clone().unwrap() * derivative;
+                let df = dh.clone().matmul(w0.clone().unwrap());
+                (dh, Some(df), dw1, db1_chunk)
             };
             let (dw0_chunk, db0_chunk) = if self.tiled_gradients {
-                crate::sampling_gpu::parameter_gradients(dh, chunk.feat, self.wide_gradient_tiles)
+                crate::sampling_gpu::parameter_gradients(dh, feat, n, self.wide_gradient_tiles)
             } else {
-                (dh.clone().transpose().matmul(chunk.feat), dh.sum_dim(0))
+                let dh_valid = if padded_n == n {
+                    dh
+                } else {
+                    dh.slice([0..n, 0..64])
+                };
+                let feat_valid = if padded_n == n {
+                    feat
+                } else {
+                    feat.slice([0..n, 0..31])
+                };
+                (
+                    dh_valid.clone().transpose().matmul(feat_valid),
+                    dh_valid.sum_dim(0),
+                )
             };
-            let db1_chunk = ds_tensor.sum_dim(0);
 
             dw0_total = Some(match dw0_total {
                 Some(acc) => (acc + dw0_chunk).without_autodiff(),
@@ -1006,6 +1140,7 @@ impl Field {
                     metadata.clone(),
                     table_grad,
                     active_levels,
+                    n,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
             }
@@ -1065,13 +1200,15 @@ impl Field {
                         (1.0 / (1.0 - 0.999f64.powi(updates)).sqrt()) as f32,
                     ]);
                 }
+                let active_rows = self.level_offsets[active];
                 let packed = self.packed_embedding.take().unwrap();
-                let [value, m, v] = crate::kernels::adam_packed(
+                let [value, m, v, zeroed_grad] = crate::kernels::adam_packed(
                     packed.value,
                     packed.m,
                     packed.v,
                     packed_grad.without_autodiff(),
                     tensor(corrections, [active, 3], &self.device),
+                    active_rows,
                 );
                 self.packed_embedding = Some(Parameter {
                     value,
@@ -1079,6 +1216,9 @@ impl Field {
                     v,
                     updates: self.level_u32_updates[0],
                 });
+                *self.persistent_table_grad.borrow_mut() = Some(zeroed_grad);
+            } else {
+                *self.persistent_table_grad.borrow_mut() = Some(packed_grad.without_autodiff());
             }
         }
         for (name, grad) in gradients.params {
@@ -1139,9 +1279,12 @@ pub fn verify(path: &Path, device: Device) -> Result<()> {
     let values = y.clone().try_into_vec_as::<f32>()?;
     let (gpu_values, gpu_cache) = field.evaluate_and_cache(&r.points, 8192)?;
     ensure!(
-        gpu_cache
-            .iter()
-            .all(|c| !c.preactivation.is_require_grad() && !c.feat.is_require_grad()),
+        gpu_cache.iter().all(|c| {
+            c.preactivation
+                .as_ref()
+                .is_none_or(|t| !t.is_require_grad())
+                && c.feat.as_ref().is_none_or(|t| !t.is_require_grad())
+        }),
         "cached inference unexpectedly tracks gradients"
     );
     drop(gpu_cache);

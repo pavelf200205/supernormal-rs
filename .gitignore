@@ -22,6 +22,11 @@ __pycache__/
 /unimsps-rs/
 unimsps-weights/*.safetensors
 
+# Lino-UniPS
+/lino-rs/
+/lino-weights/
+/LINO_UniPS/
+
 # Large binary checkpoints and meshes
 *.pth
 *.bin

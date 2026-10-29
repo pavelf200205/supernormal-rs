@@ -295,3 +295,59 @@ Four bottlenecks previously capped board power around 85 W / 170 W TDP and cause
    - `Dataset::load` precomputes world-space ray directions and closed-form orthonormal cross-product basis inverses for every pixel once on startup, turning `View::patch` (`18,432` rays per step) into a direct table lookup with zero per-step matrix inversions or ray normalizations.
 
 See `OPTIMIZATIONS.md` for a detailed technical breakdown and A/B benchmarking instructions.
+
+
+### Single-dispatch evaluation, GPU patch gathering, and deferred loss readback (Update 4)
+
+Five additional optimizations further reduce CPU-GPU synchronization stalls, host-to-device memory traffic, and per-step kernel launch overhead:
+
+1. **Unchunked Single-Dispatch Device Evaluation & Backward (`src/field.rs`)**:
+   - Device-resident point sets in `evaluate_device_tensor`, `enqueue_cached_device`, and `accumulate_gradients_device` now execute in a single unpadded `fused_field` / `field_backward` / `parameter_gradients` dispatch instead of splitting into `65,536`-point chunks, zero-padding the tail chunk (`Tensor::cat`), and slicing/concatenating outputs.
+   - Pass `--chunked-eval` to restore `--query`-chunked device evaluation for A/B comparison.
+
+2. **Device-Resident View Tables & GPU Patch Gathering (`src/data.rs`, `src/sampling_gpu.rs`, `src/render.rs`)**:
+   - `Dataset::device_dataset` uploads all views' precomputed pixel ray directions, analytical 3×3 basis inverses, normals, masks, and camera metadata to the GPU once at startup.
+   - During training, `Dataset::random_patch_coords` samples only `(view, x, y)` coordinates and accumulates `normal_den` in O(1) via precomputed 3×3 `patch_mask_sums` without materializing 2,048 `Patch` structs (`~1 MB`) on the CPU.
+   - `gather_patch_tables_kernel` gathers both `geom_rays` (`[2048, 39]`) and `packed_patches` (`[2048, 123]`) directly on the GPU from the compact `[2048, 3]` coordinates, eliminating ~1.33 MB of host-to-device PCIe uploads every step.
+   - Pass `--cpu-patch-upload` to restore CPU `Patch` struct construction and host-to-device patch table uploads.
+
+3. **Deferred Loss Readback Piggybacked on Next Step's March Readback (`src/train.rs`, `src/render.rs`)**:
+   - Instead of blocking the CPU at the end of every step to read `stats.slice([0..1, 0..3])` immediately after `device.flush()`, the 3 loss scalars from step `N` are concatenated onto step `N+1`'s `march_prefix` tail readback (`5` floats in a single transfer).
+   - This eliminates the end-of-step CPU-GPU synchronization barrier so the GPU executes `geometry -> fused_field -> composite -> field_backward -> parameter_gradients -> Adam -> next step's march` continuously without pipeline drain.
+   - Pass `--sync-loss` to restore synchronous end-of-step loss readback.
+
+4. **Zero-Recompute Compositor Reverse Pass & O(1) Direct Stencil Gather (`src/kernels.rs`)**:
+   - `composite_kernel` caches `c0`, `c1`, `s0`, and `s1` in unused forward scratch slots `scratch[sb + 5..9]` during the forward transmittance loop and reads them directly during the reverse pass, eliminating `2 * S * 9` `f32::exp` evaluations and `4 * S * 9` global memory reads (`ids` and `sdf`) per step.
+   - `composite_gather_kernel` replaces the 9-iteration inner stencil loop (`for j in 0..9`) with direct O(1) row/column neighbor lookups.
+
+5. **Persistent Hash-Table Gradient Buffer with In-Place Adam Zeroing (`src/kernels.rs`, `src/field.rs`)**:
+   - `packed_adam_kernel` clears each active gradient entry (`gradient[index] = 0.0`) immediately after reading it, and `Field` reuses the resulting zeroed `[total_entries, 2]` buffer across steps instead of allocating and zero-filling a fresh 1.4M-float tensor every step.
+
+
+### 3DGS-Inspired Warp-Aligned Compositor, Cooperative Voxel-Leader Reduction, and Backward Pruning (Update 5)
+
+Porting key micro-architectural principles from George Kopanas's *What the 3DGS Literature Left on the Table: Five Self-Contained CUDA Optimizations for 3D Gaussian Splatting* (`https://grgkopanas.github.io/3dgs_cuda_blog/`):
+
+1. **Cooperative Voxel-Leader Hash Gradient Reduction (`s02_reduce_scatter`)**:
+   - Because `points_kernel` orders `unique_points` by `endpoint * 9 + pixel`, every 4-point workgroup evaluates 4 adjacent pixels of the same 3×3 patch (~`0.002` world units apart). Across levels `0..11` (`res = 32..675`), those 4 points fall into the **exact same integer voxel cell** 60–95% of the time.
+   - Previously, 4 threads in the same warp hammered the exact same `table_grad[entry]` address with 4 colliding global atomic additions.
+   - `field_backward_kernel` and `field_backward_native_kernel` now stage `(base0, base1, base2)` and `(w0, w1, w2)` in shared memory and elect the first matching slot (`s`) as the voxel leader for each `(level, corner, channel)` lane, accumulating `wg_sum` across all slots `k >= s` that share `(base0, base1, base2)` in registers before issuing **a single combined global atomic add** (~1.8× fewer global atomics and drastically lower L2 cache line contention).
+
+2. **Zero-Adjoint Backward Pruning (`s04_raster_pruning`)**:
+   - In `field_backward_kernel`, when a point's incoming SDF adjoint `ds[point] == 0.0`, the kernel skips the MUFU `exp` and `ln` evaluations immediately, and if all 4 points in the workgroup have `ds == 0.0`, the entire 256-thread workgroup terminates early before executing the 64-iteration weight dot product and 14-level hash coordinate math.
+
+3. **Branchless Reverse-Pass Predication (`s05_branchless_predication`)**:
+   - In `composite_kernel`'s reverse transmittance loop, `z0` and `z1` are predicated via branchless register selection (`if active_raw { z0_raw } else { 0.0_f32 }`) and written to `scratch[sb + 8..10]` once unconditionally, eliminating inner-loop SIMT reconvergence stalls (`BSSY`/`BSYNC`) across the 27 active pixel lanes of the warp and avoiding duplicate global memory writes.
+
+4. **32-Thread Single-Warp Cooperative Shared-SDF Compositor (`s06_multirow_and_pipe_math` & `s03_sh_streaming`)**:
+   - `composite_kernel` now runs with `CubeDim::new_1d(32)` (1 warp = 3 patches = 27 active pixel lanes) with partitioned per-patch shared memory (`shared_sdf[lp * 18 .. +18]`). Within each sample step, the 9 pixel lanes of each patch cooperatively load the 18 unique endpoint SDFs into shared memory once, so all 4 spatial stencil neighbors (`l, r, u, d`) are read from shared memory instead of issuing 4 redundant global `ids` + `sdf` gathers per pixel (cutting global `ids`/`sdf` memory loads in `composite_kernel` by **3×** and eliminating multi-warp barrier stalls).
+
+
+### High-speed 1024-resolution mesh extraction (`src/mesh.rs`, `src/sampling_gpu.rs`)
+
+At `--mesh-resolution 1024`, mesh extraction previously evaluated $1024^3 = 1.073\times 10^9$ points by allocating and uploading 1,024 separate 12.6 MB `Vec<[f32; 3]>` slabs (`12.9 GB` total PCIe upload per mesh), waiting synchronously on every slab, and using a `std::collections::HashMap<(usize, usize), u32>` with `edges.retain(...)` on every slab.
+
+Mesh extraction now uses:
+1. **GPU-Generated Coordinate Slabs (`mesh_slab_points_kernel`)**: Generates all $1024 \times 1024$ `[x, y, z]` coordinates directly on the GPU from 3 floats (`res`, `1 / (res - 1)`, `z_coord`), eliminating 12.9 GB of CPU allocation and host-to-device PCIe uploads per mesh.
+2. **Unchunked Single-Dispatch Slab Evaluation + Double-Buffered GPU/CPU Overlap**: Evaluates all $1,048,576$ points of a slab in a single `fused_field` launch and enqueues slab `z + 2` via `device.flush()` before reading slab `z + 1`, overlapping GPU SDF evaluation with CPU triangle extraction.
+3. **$O(1)$ Rolling Flat-Array Edge Tables (`xy_lower`, `xy_upper`, `z_edges`)**: Replaces `std::collections::HashMap<(usize, usize), u32>` and `edges.retain(...)` with three flat `Vec<u32>` buffers (`20 MB` total at `res = 1024`) swapped per slab, plus an immediate `if case == 0 || case == 255 { continue; }` fast path and vectorized `bytemuck::cast_slice` binary PLY writes.
