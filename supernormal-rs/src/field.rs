@@ -55,6 +55,8 @@ pub struct Field {
     pub feature_only_cache: bool,
     pub fused_feature_replay: bool,
     pub register_gradient_tiles: bool,
+    pub hybrid_activation_cache: bool,
+    pub fused_mlp_packing: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
     persistent_table_grad: std::cell::RefCell<Option<Tensor<2>>>,
@@ -333,6 +335,8 @@ impl Field {
             feature_only_cache: true,
             fused_feature_replay: true,
             register_gradient_tiles: true,
+            hybrid_activation_cache: true,
+            fused_mlp_packing: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
             persistent_table_grad: std::cell::RefCell::new(None),
@@ -427,6 +431,8 @@ impl Field {
             feature_only_cache: true,
             fused_feature_replay: true,
             register_gradient_tiles: true,
+            hybrid_activation_cache: true,
+            fused_mlp_packing: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
             persistent_table_grad: std::cell::RefCell::new(None),
@@ -892,17 +898,28 @@ impl Field {
         cache_preactivation: bool,
     ) -> [Tensor<2>; 3] {
         if self.packed_mlp.borrow().is_none() {
-            let weights = Tensor::cat(
-                vec![
-                    self.effective_weight(0, false)
-                        .transpose()
-                        .reshape([1, 1984]),
-                    self.p("lin0.bias").without_autodiff().reshape([1, 64]),
-                    self.effective_weight(1, false).reshape([1, 64]),
-                    self.p("lin1.bias").without_autodiff().reshape([1, 1]),
-                ],
-                1,
-            );
+            let weights = if self.fused_mlp_packing {
+                crate::kernels::pack_mlp_weights([
+                    self.p("lin0.weight_v").without_autodiff(),
+                    self.p("lin0.weight_g").without_autodiff(),
+                    self.p("lin0.bias").without_autodiff(),
+                    self.p("lin1.weight_v").without_autodiff(),
+                    self.p("lin1.weight_g").without_autodiff(),
+                    self.p("lin1.bias").without_autodiff(),
+                ])
+            } else {
+                Tensor::cat(
+                    vec![
+                        self.effective_weight(0, false)
+                            .transpose()
+                            .reshape([1, 1984]),
+                        self.p("lin0.bias").without_autodiff().reshape([1, 64]),
+                        self.effective_weight(1, false).reshape([1, 64]),
+                        self.p("lin1.bias").without_autodiff().reshape([1, 1]),
+                    ],
+                    1,
+                )
+            };
             *self.packed_mlp.borrow_mut() = Some(weights);
         }
         let weights = self.packed_mlp.borrow().as_ref().unwrap().clone();
@@ -991,7 +1008,50 @@ impl Field {
                 .unwrap_or(0)
         };
         let feature_budget = budget.saturating_sub(pre_workspace);
-        let mut retained_bytes = 0usize;
+        // First maximize hash-feature coverage, then spend spare bytes on
+        // preactivations. This avoids replay without sacrificing retained
+        // feature chunks or raising the old cache budget.
+        let mut feature_retained = 0usize;
+        let keep_features: Vec<bool> = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, points))| {
+                if !feature_only {
+                    return index < MAX_CACHED_CHUNKS;
+                }
+                let cost = bytes(points.dims()[0], 31);
+                let keep = cost <= feature_budget.saturating_sub(feature_retained);
+                if keep {
+                    feature_retained += cost;
+                }
+                keep
+            })
+            .collect();
+        let mut spare = feature_budget.saturating_sub(feature_retained);
+        let keep_preactivations: Vec<bool> = inputs
+            .iter()
+            .zip(&keep_features)
+            .map(|((_, points), &keep)| {
+                if !feature_only {
+                    return keep;
+                }
+                if !self.hybrid_activation_cache || !keep {
+                    return false;
+                }
+                let cost = bytes(points.dims()[0], 64);
+                if cost > spare {
+                    return false;
+                }
+                spare -= cost;
+                true
+            })
+            .collect();
+        if feature_only {
+            crate::diagnostics::count(
+                "field.retained_activation_bytes",
+                feature_budget.saturating_sub(spare),
+            );
+        }
         if feature_only {
             crate::diagnostics::count("field.feature_only_batches", 1);
         }
@@ -1012,21 +1072,13 @@ impl Field {
             crate::diagnostics::count("field.cached_forward_points", n);
             crate::diagnostics::count("field.cached_capacity_points", padded_n);
             if self.fused_field {
-                let cost = bytes(padded_n, if feature_only { 31 } else { 95 });
-                let keep_cache = if feature_only {
-                    cost <= feature_budget.saturating_sub(retained_bytes)
-                } else {
-                    chunk_idx < MAX_CACHED_CHUNKS
-                };
-                if keep_cache {
-                    retained_bytes += cost;
-                }
-                let cache_pre = keep_cache && !feature_only;
+                let keep_cache = keep_features[chunk_idx];
+                let cache_pre = keep_preactivations[chunk_idx];
                 let [y, feat, preactivation] =
                     self.fused_forward_cache_valid(pts_tensor.clone(), n, keep_cache, cache_pre);
                 if keep_cache {
                     crate::diagnostics::count(
-                        if feature_only {
+                        if !cache_pre {
                             "field.feature_only_cached_points"
                         } else {
                             "field.full_cached_points"

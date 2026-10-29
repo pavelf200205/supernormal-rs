@@ -493,3 +493,31 @@ Diagnostics count `field.fused_feature_replay_points`; its work appears in the
 See [RUN6_ANALYSIS.md](RUN6_ANALYSIS.md) for the measured run comparison and
 limitations. Rebuild and test yourself: no build, tests or GPU run were performed
 for this update. Sampling, loss and mesh extraction settings remain unchanged.
+
+### Hybrid cache and fused MLP weight preparation
+
+Enabled by default. After retaining feature chunks within the existing cache
+budget, unused bytes now retain preactivations for some of those same chunks.
+This avoids first-layer replay without reducing feature coverage. For four
+full query-131072 chunks, the planner retains all four feature chunks and two
+preactivation chunks (126 MiB within the existing 142.5 MiB ceiling). Padded
+tail shapes and the legacy replay workspace are accounted for. Pooling may
+still affect observed driver VRAM.
+
+The fused field now prepares its packed weights with one GPU kernel that
+normalizes rows and writes the input-major layout directly. This replaces
+separate effective-weight, transpose and concatenation operations. Packed
+weights are still cached until the next optimizer update. The normalization
+formula is unchanged, but reduction grouping may introduce small floating-point
+differences, including during mesh inference.
+
+For comparisons, `--no-hybrid-cache` restores run 7's feature-only cache policy;
+`--legacy-mlp-packing` restores the Burn packing operations. These are independent
+of earlier fallback flags. Diagnostics add a `pack_mlp_weights` timing window and
+the cumulative `field.retained_activation_bytes` counter for feature-cache
+batches; this counter is not a peak-memory measurement.
+
+See [RUN7_ANALYSIS.md](RUN7_ANALYSIS.md) for run measurements and limitations.
+Rebuild and test the same command with a fresh output directory. No builds,
+tests or GPU runs were performed for this update; new gains and numerical
+parity require measurement.

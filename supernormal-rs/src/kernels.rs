@@ -1359,6 +1359,116 @@ fn fused_field_kernel(
     }
 }
 
+// One group per weight-normalized row, including the single output row.
+// Write the input-major packed layout directly: no effective-weight temporary,
+// transpose, or concatenation is needed for the fused field.
+#[cube(launch)]
+fn pack_mlp_weights_kernel(
+    v0: &Tensor<f32>,
+    g0: &Tensor<f32>,
+    b0: &Tensor<f32>,
+    v1: &Tensor<f32>,
+    g1: &Tensor<f32>,
+    b1: &Tensor<f32>,
+    packed: &mut Tensor<f32>,
+) {
+    let row = usize::cast_from(CUBE_POS_X);
+    let lane = usize::cast_from(UNIT_POS);
+    let mut v = 0.0_f32;
+    if row < 64 {
+        if lane < 31 {
+            v = v0[row * v0.stride(0) + lane * v0.stride(1)];
+        }
+    } else {
+        v = v1[lane * v1.stride(1)];
+    }
+    let mut squares = Shared::new_slice(64usize);
+    squares[lane] = v * v;
+    sync_cube();
+    for stage in 0..6usize {
+        let width = 32usize >> stage;
+        if lane < width {
+            squares[lane] += squares[lane + width];
+        }
+        sync_cube();
+    }
+    let norm = f32::sqrt(squares[0]);
+    if row < 64 {
+        if lane < 31 {
+            packed[lane * 64 + row] = (v * g0[row * g0.stride(0)]) / norm;
+        }
+        if lane == 0 {
+            packed[1984 + row] = b0[row * b0.stride(1)];
+        }
+    } else {
+        packed[2048 + lane] = (v * g1[0]) / norm;
+        if lane == 0 {
+            packed[2112] = b1[0];
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PackMlpWeightsOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for PackMlpWeightsOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([v0, g0, b0, v1, g1, b1, packed], [out]) = self.desc.as_fixed();
+        let [v0, g0, b0, v1, g1, b1, packed] =
+            [v0, g0, b0, v1, g1, b1, packed].map(|t| handles.get_float_tensor::<CubeBackend>(t));
+        let client = packed.client.clone();
+        let _timing = crate::diagnostics::start(&client, "pack_mlp_weights");
+        pack_mlp_weights_kernel::launch(
+            &client,
+            CubeCount::Static(65, 1, 1),
+            CubeDim::new_1d(64),
+            v0.into_tensor_arg(),
+            g0.into_tensor_arg(),
+            b0.into_tensor_arg(),
+            v1.into_tensor_arg(),
+            g1.into_tensor_arg(),
+            b1.into_tensor_arg(),
+            packed.clone().into_tensor_arg(),
+        );
+        handles.register_float_tensor::<CubeBackend>(&out.id, packed);
+        Ok(())
+    }
+}
+
+pub fn pack_mlp_weights(inputs: [burn::tensor::Tensor<2>; 6]) -> burn::tensor::Tensor<2> {
+    use burn::tensor::Tensor as BT;
+    let device = inputs[0].device();
+    let inputs: Vec<_> = inputs
+        .into_iter()
+        .chain([BT::empty([1, 2113], &device)])
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
+        .collect();
+    let client = inputs[0].client.clone();
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        inputs[6].shape.clone(),
+        inputs[6].dtype,
+    );
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_pack_mlp_weights",
+        &inputs.into_iter().map(|t| t.into_ir()).collect::<Vec<_>>(),
+        &[out],
+        vec![],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            PackMlpWeightsOp { desc },
+        )
+        .outputs();
+    BT::<2>::from_primitive::<GpuBackend>(out)
+}
+
 #[derive(Debug)]
 struct FusedFieldOp {
     desc: CustomOpIr,

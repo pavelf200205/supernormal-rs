@@ -96,6 +96,14 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_parameter_kernel: bool,
+    /// Leave spare feature-cache capacity unused instead of caching preactivations.
+    #[arg(long)]
+    #[serde(default)]
+    pub no_hybrid_cache: bool,
+    /// Normalize, transpose and concatenate packed MLP weights with Burn operations.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_mlp_packing: bool,
     /// Forward workgroup weight-reuse tile: 4, 8, or 16 points.
     #[arg(long, default_value_t = 4)]
     #[serde(default = "default_field_points")]
@@ -358,6 +366,8 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.feature_only_cache = !args.legacy_activation_cache;
     field.fused_feature_replay = !args.legacy_feature_replay;
     field.register_gradient_tiles = !args.legacy_parameter_kernel;
+    field.hybrid_activation_cache = !args.no_hybrid_cache;
+    field.fused_mlp_packing = !args.legacy_mlp_packing;
     field.chunked_eval = args.chunked_eval;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
