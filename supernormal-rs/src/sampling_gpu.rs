@@ -1208,6 +1208,74 @@ fn parameter_kernel(
     partials[part * 2048 + (row_base + row) * 32 + col_base + col] = sum;
 }
 
+// 16x32 outputs, four accumulators per thread. Compared with the 8x32
+// kernel this halves feature-tile loads and workgroup/barrier count per part.
+// Derivatives are already computed by field backward: this path adds no exp().
+#[cube(launch)]
+fn parameter_register_kernel(
+    dh: &Tensor<f32>,
+    features: &Tensor<f32>,
+    partials: &mut Tensor<f32>,
+    valid_rows: u32,
+) {
+    let unit = usize::cast_from(UNIT_POS);
+    let row_base = usize::cast_from(CUBE_POS_X) * 16;
+    let part = usize::cast_from(CUBE_POS_Y);
+    let row = unit / 16;
+    let col = unit % 16;
+    let valid_n = usize::cast_from(valid_rows);
+    let mut hs = Shared::new_slice(512usize);
+    let mut xs = Shared::new_slice(1024usize);
+    let mut sum00 = 0.0_f32;
+    let mut sum01 = 0.0_f32;
+    let mut sum10 = 0.0_f32;
+    let mut sum11 = 0.0_f32;
+    for block in 0..8usize {
+        let sample_base = part * 256 + block * 32;
+        for load in 0..4usize {
+            let index = unit + load * 128;
+            let sample = sample_base + index / 16;
+            let channel = row_base + index % 16;
+            let mut h = 0.0_f32;
+            if sample < valid_n {
+                h = dh[sample * dh.stride(0) + channel * dh.stride(1)];
+            }
+            hs[index] = h;
+        }
+        for load in 0..8usize {
+            let index = unit + load * 128;
+            let sample = sample_base + index / 32;
+            let feature = index % 32;
+            let mut x = 0.0_f32;
+            if sample < valid_n {
+                if feature == 31 {
+                    x = 1.0_f32;
+                } else {
+                    x = features[sample * features.stride(0) + feature * features.stride(1)];
+                }
+            }
+            xs[index] = x;
+        }
+        sync_cube();
+        for j in 0..32usize {
+            let h0 = hs[j * 16 + row];
+            let h1 = hs[j * 16 + row + 8];
+            let x0 = xs[j * 32 + col];
+            let x1 = xs[j * 32 + col + 16];
+            sum00 += h0 * x0;
+            sum01 += h0 * x1;
+            sum10 += h1 * x0;
+            sum11 += h1 * x1;
+        }
+        sync_cube();
+    }
+    let first = part * 2048 + (row_base + row) * 32 + col;
+    partials[first] = sum00;
+    partials[first + 16] = sum01;
+    partials[first + 256] = sum10;
+    partials[first + 272] = sum11;
+}
+
 #[derive(Debug)]
 struct ParameterOp {
     desc: CustomOpIr,
@@ -1224,6 +1292,7 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
             ScalarIr::UInt(wide),
             ScalarIr::UInt(valid_rows),
             ScalarIr::UInt(recompute),
+            ScalarIr::UInt(register_tiles),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid parameter-gradient arguments")
@@ -1232,20 +1301,32 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
         let client = h.client.clone();
         let _timing = crate::diagnostics::start(&client, "parameter_gradients");
         let parts = (*valid_rows as usize).div_ceil(256).max(1);
-        parameter_kernel::launch(
-            &client,
-            CubeCount::Static((2048 / (8 * tile_cols)) as u32, parts as u32, 1),
-            CubeDim::new_1d((8 * tile_cols) as u32),
-            h.into_tensor_arg(),
-            f.into_tensor_arg(),
-            p.clone().into_tensor_arg(),
-            pre.into_tensor_arg(),
-            ds.into_tensor_arg(),
-            w.into_tensor_arg(),
-            *valid_rows as u32,
-            tile_cols,
-            *recompute != 0,
-        );
+        if *register_tiles != 0 && *wide != 0 && *recompute == 0 {
+            parameter_register_kernel::launch(
+                &client,
+                CubeCount::Static(4, parts as u32, 1),
+                CubeDim::new_1d(128),
+                h.into_tensor_arg(),
+                f.into_tensor_arg(),
+                p.clone().into_tensor_arg(),
+                *valid_rows as u32,
+            );
+        } else {
+            parameter_kernel::launch(
+                &client,
+                CubeCount::Static((2048 / (8 * tile_cols)) as u32, parts as u32, 1),
+                CubeDim::new_1d((8 * tile_cols) as u32),
+                h.into_tensor_arg(),
+                f.into_tensor_arg(),
+                p.clone().into_tensor_arg(),
+                pre.into_tensor_arg(),
+                ds.into_tensor_arg(),
+                w.into_tensor_arg(),
+                *valid_rows as u32,
+                tile_cols,
+                *recompute != 0,
+            );
+        }
         handles.register_float_tensor::<CubeBackend>(&out.id, p);
         Ok(())
     }
@@ -1255,6 +1336,7 @@ pub fn parameter_gradients(
     features: burn::tensor::Tensor<2>,
     valid_rows: usize,
     wide: bool,
+    register_tiles: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     parameter_gradients_impl(
         dh.clone(),
@@ -1264,6 +1346,7 @@ pub fn parameter_gradients(
         dh,
         valid_rows,
         wide,
+        register_tiles,
         false,
     )
 }
@@ -1275,6 +1358,7 @@ pub fn parameter_gradients_recompute(
     weights: burn::tensor::Tensor<2>,
     valid_rows: usize,
     wide: bool,
+    register_tiles: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     parameter_gradients_impl(
         pre.clone(),
@@ -1284,6 +1368,7 @@ pub fn parameter_gradients_recompute(
         weights,
         valid_rows,
         wide,
+        register_tiles,
         true,
     )
 }
@@ -1296,6 +1381,7 @@ fn parameter_gradients_impl(
     weights: burn::tensor::Tensor<2>,
     valid_rows: usize,
     wide: bool,
+    register_tiles: bool,
     recompute: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use burn::tensor::Tensor;
@@ -1319,6 +1405,7 @@ fn parameter_gradients_impl(
             ScalarIr::UInt(wide as u64),
             ScalarIr::UInt(valid_rows as u64),
             ScalarIr::UInt(recompute as u64),
+            ScalarIr::UInt(register_tiles as u64),
         ],
     );
     let [out] = client

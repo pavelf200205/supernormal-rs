@@ -88,6 +88,14 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_activation_cache: bool,
+    /// Materialize feature-only preactivations in a separate dispatch for comparison.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_feature_replay: bool,
+    /// Restore one-output-per-thread parameter-gradient tiles.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_parameter_kernel: bool,
     /// Forward workgroup weight-reuse tile: 4, 8, or 16 points.
     #[arg(long, default_value_t = 4)]
     #[serde(default = "default_field_points")]
@@ -348,6 +356,8 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.level_adam = !args.legacy_adam_dispatch;
     field.reuse_endpoints = !args.no_endpoint_reuse;
     field.feature_only_cache = !args.legacy_activation_cache;
+    field.fused_feature_replay = !args.legacy_feature_replay;
+    field.register_gradient_tiles = !args.legacy_parameter_kernel;
     field.chunked_eval = args.chunked_eval;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);

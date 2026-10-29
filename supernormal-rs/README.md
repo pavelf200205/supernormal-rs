@@ -464,3 +464,32 @@ latter with `field.recomputed_points` (full hash+MLP replay), and use the
 perturb timing; measure normal throughput separately. Source formatting and
 review only: no builds or tests were run. Rebuild and test performance, gradients
 and mesh quality yourself; no speedup or bitwise shader parity is claimed yet.
+
+### Fused feature replay and register-tiled parameter gradients
+
+Feature-only chunks now rebuild first-layer preactivations inside field backward
+and immediately consume them in registers. This removes the standalone
+`cached_mlp_preactivation` dispatch and its full-size temporary buffer on that
+path. Four feature vectors share a 512-byte workgroup tile. The existing cache
+budget can retain nine full feature chunks at query 131072 (139.5 MiB), rather
+than seven plus a 32 MiB temporary workspace. This bounds logical cache storage;
+it does not guarantee unchanged driver VRAM reservation.
+
+The default parameter-gradient kernel computes a 16×32 output tile with 128
+threads and four accumulators per thread, reusing staged features across twice
+as many hidden neurons. It halves feature-tile loads and group count relative to
+the previous 8×32 layout. The partial gradient allocation and per-output sample
+accumulation order are unchanged. It uses 6 KiB shared storage per group and
+introduces no additional sigmoid computations or global buffers.
+
+For independent comparisons, `--legacy-feature-replay` restores separate MLP
+replay and its workspace reservation; `--legacy-parameter-kernel` restores the
+previous parameter kernel. Both upgrades are on by default. Existing
+`--legacy-gradient-tiles` and `--recompute-parameter-gradients` retain their
+previous parameter kernels. The latter also retains materialized preactivations.
+Diagnostics count `field.fused_feature_replay_points`; its work appears in the
+`field_backward` timing window rather than a standalone replay row.
+
+See [RUN6_ANALYSIS.md](RUN6_ANALYSIS.md) for the measured run comparison and
+limitations. Rebuild and test yourself: no build, tests or GPU run were performed
+for this update. Sampling, loss and mesh extraction settings remain unchanged.

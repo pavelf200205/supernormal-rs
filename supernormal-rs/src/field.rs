@@ -53,6 +53,8 @@ pub struct Field {
     pub reuse_endpoints: bool,
     pub chunked_eval: bool,
     pub feature_only_cache: bool,
+    pub fused_feature_replay: bool,
+    pub register_gradient_tiles: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
     persistent_table_grad: std::cell::RefCell<Option<Tensor<2>>>,
@@ -329,6 +331,8 @@ impl Field {
             reuse_endpoints: true,
             chunked_eval: false,
             feature_only_cache: true,
+            fused_feature_replay: true,
+            register_gradient_tiles: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
             persistent_table_grad: std::cell::RefCell::new(None),
@@ -421,6 +425,8 @@ impl Field {
             reuse_endpoints: true,
             chunked_eval: false,
             feature_only_cache: true,
+            fused_feature_replay: true,
+            register_gradient_tiles: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
             persistent_table_grad: std::cell::RefCell::new(None),
@@ -972,13 +978,18 @@ impl Field {
             total.saturating_add(bytes(pts.dims()[0], 95))
         });
         let feature_only = self.fused_field && self.feature_only_cache && full_bytes > budget;
-        // Reserve one streamed preactivation tile within the old retained-cache
-        // budget, rather than growing peak activation storage by another tile.
-        let pre_workspace = inputs
-            .iter()
-            .map(|(_, pts)| bytes(pts.dims()[0], 64))
-            .max()
-            .unwrap_or(0);
+        // Materialized replay needs a streamed preactivation workspace. Fused
+        // replay keeps h in registers, making that space available to features
+        // without increasing the previous retained-cache budget.
+        let pre_workspace = if self.fused_feature_replay && !self.recompute_parameter_gradients {
+            0
+        } else {
+            inputs
+                .iter()
+                .map(|(_, pts)| bytes(pts.dims()[0], 64))
+                .max()
+                .unwrap_or(0)
+        };
         let feature_budget = budget.saturating_sub(pre_workspace);
         let mut retained_bytes = 0usize;
         if feature_only {
@@ -1157,8 +1168,17 @@ impl Field {
             offset += n;
             crate::diagnostics::sample_addresses(&chunk.pts_tensor, &ds_tensor, n, active_levels);
 
+            let mut replay_features = false;
             let (feat, preactivation) = match (chunk.feat, chunk.preactivation) {
                 (Some(f), Some(p)) => (f, p),
+                (Some(f), None)
+                    if self.fused_feature_replay && !self.recompute_parameter_gradients =>
+                {
+                    replay_features = true;
+                    crate::diagnostics::count("field.fused_feature_replay_points", n);
+                    // Placeholder only: the shader rebuilds h in registers from f.
+                    (f.clone(), f)
+                }
                 (Some(f), None) => {
                     crate::diagnostics::count("field.mlp_only_recomputed_points", n);
                     let weights = self
@@ -1208,6 +1228,7 @@ impl Field {
                         weights,
                         chunk.pts_tensor.clone(),
                         metadata.clone(),
+                        feat.clone(),
                         table_grad,
                     ],
                     n,
@@ -1219,6 +1240,7 @@ impl Field {
                     self.aggregation_levels,
                     self.cross_corners,
                     !recompute,
+                    replay_features,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
                 (
@@ -1263,9 +1285,16 @@ impl Field {
                         weights,
                         n,
                         self.wide_gradient_tiles,
+                        self.register_gradient_tiles,
                     )
                 } else {
-                    crate::sampling_gpu::parameter_gradients(dh, feat, n, self.wide_gradient_tiles)
+                    crate::sampling_gpu::parameter_gradients(
+                        dh,
+                        feat,
+                        n,
+                        self.wide_gradient_tiles,
+                        self.register_gradient_tiles,
+                    )
                 }
             } else {
                 let dh_valid = if padded_n == n {

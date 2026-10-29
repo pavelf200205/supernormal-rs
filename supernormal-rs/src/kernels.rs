@@ -1823,15 +1823,16 @@ pub fn composite_gpu(
     result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
-// Keep total shared memory at 2,821 floats (11,284 bytes < 12 KB) so 4 blocks
-// of 256 threads on some Ampere configurations; actual residency also depends
-// on register allocation and device limits.
+// Shared memory is 2,821 floats plus the optional 128-float replay tile
+// (11,796 bytes < 12 KiB); actual residency also depends on register allocation
+// and device limits.
 // Both the 64-neuron `dh * W0` feature-gradient dot product (16 iterations per
 // thread across 224 threads) and the 8-corner trilinear hash scatter (2 corners
 // per thread across 224 threads) execute across 87.5% of the workgroup.
 #[cube(launch)]
 fn field_backward_kernel(
     pre: &Tensor<f32>,
+    features: &Tensor<f32>,
     ds: &Tensor<f32>,
     weights: &Tensor<f32>,
     dh: &mut Tensor<f32>,
@@ -1848,6 +1849,7 @@ fn field_backward_kernel(
     #[comptime] aggregate_hash: bool,
     #[comptime] cross_corners: bool,
     #[comptime] write_dh: bool,
+    #[comptime] replay_features: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -1862,12 +1864,27 @@ fn field_backward_kernel(
             shared_weights[target] = weights[index];
         }
     }
-    sync_cube();
     let lane = unit % 64;
     let slot = unit / 64;
     let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
     let point = group * 4 + slot;
     let n_valid = usize::cast_from(valid_n);
+    // Only replay variants need this 512-byte tile. Stage each feature once for
+    // all 64 neurons; no full preactivation buffer is written or read.
+    let mut replay = Shared::new_slice(if replay_features { 128usize } else { 1usize });
+    if replay_features {
+        if unit < 128 {
+            let p = group * 4 + unit / 32;
+            let col = unit % 32;
+            let mut f = 0.0_f32;
+            if p < n_valid && col < 3 + usize::cast_from(active) * 2 {
+                f = features[p * features.stride(0) + col * features.stride(1)];
+            }
+            replay[unit] = f;
+        }
+    }
+    // One uniform barrier publishes both packed weights and optional features.
+    sync_cube();
     let mut shared = Shared::new_slice(256usize);
     // Reused first for `output_grads` `[256]` and then for 224-thread partial
     // feature gradients `[448]`, keeping shared memory under 12 KB per block.
@@ -1885,7 +1902,20 @@ fn field_backward_kernel(
     if point < n_valid {
         ds_val = ds[point];
         if ds_val != 0.0_f32 {
-            let h = pre[point * 64 + lane];
+            let mut h = 0.0_f32;
+            if replay_features {
+                for col in 0..(3 + usize::cast_from(active) * 2) {
+                    let wi = if local_hash {
+                        lane * 31 + col
+                    } else {
+                        col * 64 + lane
+                    };
+                    h += replay[slot * 32 + col] * shared_weights[wi];
+                }
+                h += shared_weights[1984 + lane];
+            } else {
+                h = pre[point * 64 + lane];
+            }
             let scaled = h * 100.0_f32;
             let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
             let derivative = if scaled > 20.0_f32 {
@@ -2224,7 +2254,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([p, d, w, x, m, t, h, g], [ot, oh, og]) = self.desc.as_fixed();
+        let ([p, d, w, x, m, f, t, h, g], [ot, oh, og]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(active),
             ScalarIr::UInt(valid_n),
@@ -2235,12 +2265,13 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
             ScalarIr::UInt(aggregation_levels),
             ScalarIr::UInt(cross_corners),
             ScalarIr::UInt(write_dh),
+            ScalarIr::UInt(replay_features),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid backward scalars")
         };
-        let [p, d, w, x, m, t, h, g] =
-            [p, d, w, x, m, t, h, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [p, d, w, x, m, f, t, h, g] =
+            [p, d, w, x, m, f, t, h, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let t = if t.can_mut() {
             t
         } else {
@@ -2290,6 +2321,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 CubeCount::Static(gx as u32, groups.div_ceil(gx) as u32, 1),
                 CubeDim::new_1d(256),
                 p.into_tensor_arg(),
+                f.into_tensor_arg(),
                 d.into_tensor_arg(),
                 w.into_tensor_arg(),
                 h.clone().into_tensor_arg(),
@@ -2306,6 +2338,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *aggregate_hash != 0 && *aggregation_levels > 0,
                 *cross_corners != 0,
                 *write_dh != 0,
+                *replay_features != 0,
             );
         } else {
             field_backward_kernel::launch(
@@ -2313,6 +2346,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 CubeCount::Static(gx as u32, groups.div_ceil(gx) as u32, 1),
                 CubeDim::new_1d(256),
                 p.into_tensor_arg(),
+                f.into_tensor_arg(),
                 d.into_tensor_arg(),
                 w.into_tensor_arg(),
                 h.clone().into_tensor_arg(),
@@ -2329,6 +2363,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *aggregate_hash != 0 && *aggregation_levels > 0,
                 *cross_corners != 0,
                 *write_dh != 0,
+                *replay_features != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
@@ -2338,7 +2373,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
     }
 }
 pub fn field_backward(
-    inputs: [burn::tensor::Tensor<2>; 6],
+    inputs: [burn::tensor::Tensor<2>; 7],
     valid_n: usize,
     active: usize,
     local_hash: bool,
@@ -2348,6 +2383,7 @@ pub fn field_backward(
     aggregation_levels: usize,
     cross_corners: bool,
     write_dh: bool,
+    replay_features: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     use burn::tensor::Tensor as BT;
     let n = inputs[0].dims()[0];
@@ -2366,7 +2402,7 @@ pub fn field_backward(
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = inputs[5..]
+    let outputs: Vec<_> = inputs[6..]
         .iter()
         .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
         .collect();
@@ -2384,6 +2420,7 @@ pub fn field_backward(
             ScalarIr::UInt(aggregation_levels as u64),
             ScalarIr::UInt(cross_corners as u64),
             ScalarIr::UInt(write_dh as u64),
+            ScalarIr::UInt(replay_features as u64),
         ],
     );
     let result: [_; 3] = client
@@ -2642,6 +2679,7 @@ pub fn visibility(
 #[cube(launch)]
 fn field_backward_native_kernel(
     pre: &Tensor<f32>,
+    features: &Tensor<f32>,
     ds: &Tensor<f32>,
     weights: &Tensor<f32>,
     dh: &mut Tensor<f32>,
@@ -2658,6 +2696,7 @@ fn field_backward_native_kernel(
     #[comptime] aggregate_hash: bool,
     #[comptime] cross_corners: bool,
     #[comptime] write_dh: bool,
+    #[comptime] replay_features: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -2672,12 +2711,27 @@ fn field_backward_native_kernel(
             shared_weights[target] = weights[index];
         }
     }
-    sync_cube();
     let lane = unit % 64;
     let slot = unit / 64;
     let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
     let point = group * 4 + slot;
     let n_valid = usize::cast_from(valid_n);
+    // Only replay variants need this 512-byte tile. Stage each feature once for
+    // all 64 neurons; no full preactivation buffer is written or read.
+    let mut replay = Shared::new_slice(if replay_features { 128usize } else { 1usize });
+    if replay_features {
+        if unit < 128 {
+            let p = group * 4 + unit / 32;
+            let col = unit % 32;
+            let mut f = 0.0_f32;
+            if p < n_valid && col < 3 + usize::cast_from(active) * 2 {
+                f = features[p * features.stride(0) + col * features.stride(1)];
+            }
+            replay[unit] = f;
+        }
+    }
+    // One uniform barrier publishes both packed weights and optional features.
+    sync_cube();
     let mut shared = Shared::new_slice(256usize);
     // Reused first for `output_grads` `[256]` and then for 224-thread partial
     // feature gradients `[448]`, keeping shared memory under 12 KB per block.
@@ -2695,7 +2749,20 @@ fn field_backward_native_kernel(
     if point < n_valid {
         ds_val = ds[point];
         if ds_val != 0.0_f32 {
-            let h = pre[point * 64 + lane];
+            let mut h = 0.0_f32;
+            if replay_features {
+                for col in 0..(3 + usize::cast_from(active) * 2) {
+                    let wi = if local_hash {
+                        lane * 31 + col
+                    } else {
+                        col * 64 + lane
+                    };
+                    h += replay[slot * 32 + col] * shared_weights[wi];
+                }
+                h += shared_weights[1984 + lane];
+            } else {
+                h = pre[point * 64 + lane];
+            }
             let scaled = h * 100.0_f32;
             let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
             let derivative = if scaled > 20.0_f32 {
