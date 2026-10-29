@@ -203,3 +203,28 @@ Analysis of the 30,000-step `metrics.csv` (`1,038.91s` total step time) and Wind
 4. **Restored 4 Blocks/SM Occupancy (`< 12 KB` Shared Memory) & 224-Thread Parallel MLP Dot Product in `field_backward_kernel` (`src/kernels.rs`)**:
    - Reuses a single `448`-float `partials` shared buffer for both `output_grads` and `grad_staging`, reducing shared memory from `12,308 B` to `11,284 B` (`< 12 KB`, restoring 4 blocks/SM = 1,024 threads/SM on Ampere).
    - Splits the 64-neuron `dh * W0` dot product across all **224 threads** (`16` iterations per thread instead of `64` on 56 threads), followed by 224-thread parallel trilinear corner scatter.
+
+
+## George Kopanas upgrades part 2 (2026-10-29)
+
+- Implemented local same-address aggregation for four neighboring points at
+  each level/corner in both native-float and CAS corner-parallel backward paths.
+  Unlike the historical voxel-leader proposal, comparison uses actual table
+  addresses. MLP weight shared storage is repurposed after all readers finish;
+  no extra shared allocation or global buffer is introduced. Two extra uniform
+  barriers and leader/reduction work require performance comparison. The
+  legacy sequential-corner path is unchanged.
+- Changed compositor scratch from `[sample][pixel][component]` to
+  `[sample][component][pixel]`. Both compositor passes and the reverse-index
+  gather use matching indexing. This improves adjacent-pixel access locality
+  without bringing back the superseded shared-SDF compositor. Buffer size and
+  sample order are unchanged.
+- Independent fallback switches: `--no-hash-aggregation` and
+  `--legacy-composite-scratch`. Pass both to compare with part 1.
+
+These are the remaining applicable adaptations identified in the audit, not
+literal ports of Gaussian SH, sorting, ellipse bounds, opacity math, fixed
+half-warp shuffles, or CUDA-specific approximate instructions. No precision or
+loss changes are introduced. Speed and parity remain unmeasured for part 2;
+rebuild and test on the target GPUs. The latest power-interrupted reconstruction
+is incomplete and is not used here as completed-run performance evidence.

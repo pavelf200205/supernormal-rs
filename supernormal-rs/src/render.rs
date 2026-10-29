@@ -71,10 +71,7 @@ impl Occupancy {
 
         if !self.cpu_update {
             use crate::field::tensor;
-            anyhow::ensure!(
-                n < (1 << 24),
-                "occupancy update exceeds exact index range"
-            );
+            anyhow::ensure!(n < (1 << 24), "occupancy update exceeds exact index range");
             let seed: u32 = rng.random::<u32>();
             let mut values = self
                 .device_values
@@ -99,22 +96,23 @@ impl Occupancy {
                         &field.device,
                     );
                     let sdf = field.evaluate_device_tensor_valid(pts, valid_n, query);
-                    values = crate::sampling_gpu::occupancy_apply_slice(sdf, values, valid_n, start);
+                    values =
+                        crate::sampling_gpu::occupancy_apply_slice(sdf, values, valid_n, start);
                 }
             } else {
                 // Stratified GPU selection: 100% of occupied cells + 1 random cell
                 // per 4-cell block (`n / 4` unoccupied cells), compacted on the GPU
                 // without duplicates, linked lists, or host transfers.
-                let flags = self
-                    .device_flags
-                    .take()
-                    .unwrap_or_else(|| {
-                        tensor(
-                            self.flags.iter().map(|&v| if v { 1. } else { 0. }).collect(),
-                            [n, 1],
-                            &field.device,
-                        )
-                    });
+                let flags = self.device_flags.take().unwrap_or_else(|| {
+                    tensor(
+                        self.flags
+                            .iter()
+                            .map(|&v| if v { 1. } else { 0. })
+                            .collect(),
+                        [n, 1],
+                        &field.device,
+                    )
+                });
                 let num_blocks = 2048usize.min(n.max(1));
                 let cells_per_thread = n.div_ceil(num_blocks);
                 let counts = crate::sampling_gpu::occupancy_count(
@@ -1305,6 +1303,7 @@ pub fn composite_device(
     normal_den: f32,
     pixel_den: f32,
     sample_den: f32,
+    coalesced_scratch: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use crate::field::tensor;
     use burn::tensor::Tensor;
@@ -1369,6 +1368,7 @@ pub fn composite_device(
         ],
         n,
         false,
+        coalesced_scratch,
     );
     let stats = stats.sum_dim(0);
     let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
@@ -1399,6 +1399,7 @@ pub fn composite_device_tables(
     normal_den: f32,
     pixel_den: f32,
     sample_den: f32,
+    coalesced_scratch: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use crate::field::tensor;
     use burn::tensor::Tensor;
@@ -1446,6 +1447,7 @@ pub fn composite_device_tables(
         ],
         n,
         true,
+        coalesced_scratch,
     );
     let stats = stats.sum_dim(0);
     let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
@@ -1598,14 +1600,7 @@ pub fn march_and_filter_device(
             };
             rays.extend(o);
             rays.extend(d);
-            rays.extend([
-                near,
-                far,
-                step_size,
-                capacity as f32,
-                count as f32,
-                r_f32,
-            ]);
+            rays.extend([near, far, step_size, capacity as f32, count as f32, r_f32]);
             coords_flat.extend([v as f32, x as f32, y as f32]);
             for py in 0..3 {
                 let row_off = (y + py - 1) * view.width;
@@ -1642,14 +1637,7 @@ pub fn march_and_filter_device(
             };
             rays.extend(o);
             rays.extend(d);
-            rays.extend([
-                near,
-                far,
-                step_size,
-                capacity as f32,
-                count as f32,
-                r_f32,
-            ]);
+            rays.extend([near, far, step_size, capacity as f32, count as f32, r_f32]);
             capacity = capacity
                 .checked_add(count)
                 .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
@@ -1686,9 +1674,7 @@ pub fn march_and_filter_device(
         Tensor::empty([n_patches, 2], device),
     ]);
     let march_prefix = counts.cumsum(0);
-    let tail_totals = march_prefix
-        .clone()
-        .slice([n_patches - 1..n_patches, 0..2]);
+    let tail_totals = march_prefix.clone().slice([n_patches - 1..n_patches, 0..2]);
     let (total_marched, unique_ep_count, prev_loss) = if let Some(ps) = prev_stats {
         let loss_slice = ps.slice([0..1, 0..3]).reshape([3, 1]);
         let flat_tail = tail_totals.reshape([2, 1]);
@@ -1746,16 +1732,15 @@ pub fn march_and_filter_device(
 
     let (vis_prefix_host, vis_ep_prefix_host, total_visible, total_visible_endpoints) =
         if group_size >= n_patches {
-            let tail = vis_prefix
-                .clone()
-                .slice([n_patches - 1..n_patches, 0..2]);
+            let tail = vis_prefix.clone().slice([n_patches - 1..n_patches, 0..2]);
             let meta = Tensor::cat(vec![tail, var_row], 0).try_into_vec_as::<f32>()?;
             let tot_s = meta[0] as usize;
             let tot_ep = meta[1] as usize;
             field.variance_host = meta[2];
             (vec![], vec![], tot_s, tot_ep)
         } else {
-            let meta = Tensor::cat(vec![vis_prefix.clone(), var_row], 0).try_into_vec_as::<f32>()?;
+            let meta =
+                Tensor::cat(vec![vis_prefix.clone(), var_row], 0).try_into_vec_as::<f32>()?;
             field.variance_host = meta[n_patches * 2];
             let mut s_host = Vec::with_capacity(n_patches);
             let mut ep_host = Vec::with_capacity(n_patches);
@@ -1807,7 +1792,12 @@ pub fn prepare_geometry_from_device_batch(
     use burn::tensor::Tensor;
     let patch_count = end - start;
     let (s_begin, s_end, ep_begin, ep_end) = if start == 0 && end == total_patches {
-        (0, vis_batch.total_visible, 0, vis_batch.total_visible_endpoints)
+        (
+            0,
+            vis_batch.total_visible,
+            0,
+            vis_batch.total_visible_endpoints,
+        )
     } else {
         let sb = if start == 0 {
             0
@@ -1913,7 +1903,12 @@ pub fn prepare_geometry_device(
     samples: &[Sample],
     query: usize,
     device: &burn::tensor::Device,
-) -> (burn::tensor::Tensor<2>, usize, Vec<usize>, burn::tensor::Tensor<2>) {
+) -> (
+    burn::tensor::Tensor<2>,
+    usize,
+    Vec<usize>,
+    burn::tensor::Tensor<2>,
+) {
     use crate::field::tensor;
     use burn::tensor::Tensor;
     assert!(!samples.is_empty());

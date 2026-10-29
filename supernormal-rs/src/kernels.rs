@@ -1373,6 +1373,22 @@ pub fn fused_field(
 //    4 stencil neighbor lookups (`l, r, u, d`) into contiguous L1 cache hits.
 // 3. Forward caches `(c0, c1, s0, s1)` in `scratch[sb + 5..9]` so the reverse
 //    pass executes zero `exp()` calls and uses branchless predication.
+// Component-major within a nine-pixel sample: adjacent pixel lanes read/write
+// adjacent words. Keep the former 10-float pixel records as an A/B variant.
+#[cube]
+fn composite_scratch_index(
+    sample: usize,
+    pixel: usize,
+    component: usize,
+    #[comptime] coalesced: bool,
+) -> usize {
+    if coalesced {
+        sample * 90 + component * 9 + pixel
+    } else {
+        (sample * 9 + pixel) * 10 + component
+    }
+}
+
 #[cube(launch)]
 fn composite_kernel(
     sdf: &Tensor<f32>,
@@ -1383,6 +1399,7 @@ fn composite_kernel(
     scratch: &mut Tensor<f32>,
     stats: &mut Tensor<f32>,
     #[comptime] compact_ids: bool,
+    #[comptime] coalesced_scratch: bool,
 ) {
     let ray = ABSOLUTE_POS;
     if ray >= patches.shape(0) * 9 {
@@ -1483,19 +1500,18 @@ fn composite_kernel(
         let c1 = 1.0_f32 / (1.0_f32 + f32::exp(-s1 * inv));
         let a = f32::clamp((c0 - c1 + 1e-5_f32) / (c0 + 1e-5_f32), 0.0_f32, 1.0_f32);
         let w = trans * a;
-        let sb = (s * 9 + pixel) * 10;
-        scratch[sb + 3] = trans;
-        scratch[sb + 4] = a;
-        scratch[sb + 5] = c0;
-        scratch[sb + 6] = c1;
-        scratch[sb + 7] = s0;
-        scratch[sb + 8] = s1;
+        scratch[composite_scratch_index(s, pixel, 3, coalesced_scratch)] = trans;
+        scratch[composite_scratch_index(s, pixel, 4, coalesced_scratch)] = a;
+        scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch)] = c0;
+        scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch)] = c1;
+        scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch)] = s0;
+        scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch)] = s1;
         trans *= f32::max(1.0_f32 - a, 1e-10_f32);
         masks += w;
         for j in 0..3usize {
             let vb = pb + 6 + pixel * 13 + j * 3;
             let g = patches[vb] * dt + patches[vb + 1] * dx + patches[vb + 2] * dy;
-            scratch[sb + j] = g;
+            scratch[composite_scratch_index(s, pixel, j, coalesced_scratch)] = g;
             normals[j] += w * g;
         }
     }
@@ -1519,16 +1535,15 @@ fn composite_kernel(
 
     for rev in 0..(end - begin) {
         let s = end - 1 - rev;
-        let sb = (s * 9 + pixel) * 10;
-        let g0 = scratch[sb];
-        let g1 = scratch[sb + 1];
-        let g2 = scratch[sb + 2];
-        let t = scratch[sb + 3];
-        let a = scratch[sb + 4];
-        let c0 = scratch[sb + 5];
-        let c1 = scratch[sb + 6];
-        let s0 = scratch[sb + 7];
-        let s1 = scratch[sb + 8];
+        let g0 = scratch[composite_scratch_index(s, pixel, 0, coalesced_scratch)];
+        let g1 = scratch[composite_scratch_index(s, pixel, 1, coalesced_scratch)];
+        let g2 = scratch[composite_scratch_index(s, pixel, 2, coalesced_scratch)];
+        let t = scratch[composite_scratch_index(s, pixel, 3, coalesced_scratch)];
+        let a = scratch[composite_scratch_index(s, pixel, 4, coalesced_scratch)];
+        let c0 = scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch)];
+        let c1 = scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch)];
+        let s0 = scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch)];
+        let s1 = scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch)];
         let norm = f32::sqrt(g0 * g0 + g1 * g1 + g2 * g2);
         el += (norm - 1.0_f32) * (norm - 1.0_f32) / sample_den;
         let eg = 2.0_f32 * (norm - 1.0_f32) / sample_den / f32::max(norm, 1e-12_f32);
@@ -1537,15 +1552,15 @@ fn composite_kernel(
         let dg2 = t * a * dn[2] + eg * g2;
         let vb = pb + 6 + pixel * 13;
         let gb = s * 27 + pixel * 3;
-        let dp0 = (patches[vb] * dg0 + patches[vb + 3] * dg1 + patches[vb + 6] * dg2)
-            * geometry[gb];
+        let dp0 =
+            (patches[vb] * dg0 + patches[vb + 3] * dg1 + patches[vb + 6] * dg2) * geometry[gb];
         let dp1 = (patches[vb + 1] * dg0 + patches[vb + 4] * dg1 + patches[vb + 7] * dg2)
             * geometry[gb + 1];
         let dp2 = (patches[vb + 2] * dg0 + patches[vb + 5] * dg1 + patches[vb + 8] * dg2)
             * geometry[gb + 2];
-        scratch[sb + 5] = dp0;
-        scratch[sb + 6] = dp1;
-        scratch[sb + 7] = dp2;
+        scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch)] = dp0;
+        scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch)] = dp1;
+        scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch)] = dp2;
         let gw = dn[0] * g0 + dn[1] * g1 + dn[2] * g2 + dm;
         let one_minus_a = 1.0_f32 - a;
         let q = f32::max(one_minus_a, 1e-10_f32);
@@ -1565,8 +1580,8 @@ fn composite_kernel(
         let z1_raw = -da / denom * c1 * (1.0_f32 - c1);
         let z0 = if active_raw { z0_raw } else { 0.0_f32 };
         let z1 = if active_raw { z1_raw } else { 0.0_f32 };
-        scratch[sb + 8] = z0 * inv;
-        scratch[sb + 9] = z1 * inv;
+        scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch)] = z0 * inv;
+        scratch[composite_scratch_index(s, pixel, 9, coalesced_scratch)] = z1 * inv;
         bias += z0 * inv + z1 * inv;
         dinv += z0 * s0 + z1 * s1;
     }
@@ -1590,6 +1605,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
         let [
             ScalarIr::UInt(valid_points),
             ScalarIr::UInt(compact_tables),
+            ScalarIr::UInt(coalesced_scratch),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid composite scalars")
@@ -1612,6 +1628,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             w.clone().into_tensor_arg(),
             l.clone().into_tensor_arg(),
             compact,
+            *coalesced_scratch != 0,
         );
         let count = (*valid_points as usize).max(1);
         let dim = CubeDim::new(&client, count);
@@ -1624,6 +1641,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             d.clone().into_tensor_arg(),
             *valid_points as u32,
             compact,
+            *coalesced_scratch != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&od.id, d);
         handles.register_float_tensor::<CubeBackend>(&ol.id, l);
@@ -1634,6 +1652,7 @@ pub fn composite_gpu(
     inputs: [burn::tensor::Tensor<2>; 9],
     valid_points: usize,
     compact_tables: bool,
+    coalesced_scratch: bool,
 ) -> [burn::tensor::Tensor<2>; 2] {
     let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -1648,6 +1667,7 @@ pub fn composite_gpu(
         vec![
             ScalarIr::UInt(valid_points as u64),
             ScalarIr::UInt(compact_tables as u64),
+            ScalarIr::UInt(coalesced_scratch as u64),
         ],
     );
     let result: [_; 2] = client
@@ -1661,7 +1681,8 @@ pub fn composite_gpu(
 }
 
 // Keep total shared memory at 2,821 floats (11,284 bytes < 12 KB) so 4 blocks
-// of 256 threads (1,024 threads/SM) reside concurrently on each Ampere SM.
+// of 256 threads on some Ampere configurations; actual residency also depends
+// on register allocation and device limits.
 // Both the 64-neuron `dh * W0` feature-gradient dot product (16 iterations per
 // thread across 224 threads) and the 8-corner trilinear hash scatter (2 corners
 // per thread across 224 threads) execute across 87.5% of the workgroup.
@@ -1680,6 +1701,7 @@ fn field_backward_kernel(
     #[comptime] local_hash: bool,
     #[comptime] compact_gradients: bool,
     #[comptime] corner_parallel: bool,
+    #[comptime] aggregate_hash: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -1805,9 +1827,15 @@ fn field_backward_kernel(
         sync_cube();
         // Phase 2: All 224 threads sum the 4 partial dot products for `(level, hash_slot)`
         // and scatter their 2 trilinear corners concurrently (448 lookups/atomics per block).
-        if hash_point < n_valid
-            && level < usize::cast_from(active)
-            && slot_ds[hash_slot] != 0.0_f32
+        let mut scatter_keys = Array::<f32>::new(2usize);
+        let mut scatter_g0 = Array::<f32>::new(2usize);
+        let mut scatter_g1 = Array::<f32>::new(2usize);
+        for i in 0..2usize {
+            scatter_keys[i] = -1.0_f32;
+            scatter_g0[i] = 0.0_f32;
+            scatter_g1[i] = 0.0_f32;
+        }
+        if hash_point < n_valid && level < usize::cast_from(active) && slot_ds[hash_slot] != 0.0_f32
         {
             let base_p = (level * 16 + hash_slot) * 2;
             let g0 = (partials[base_p] + partials[base_p + 8])
@@ -1866,11 +1894,64 @@ fn field_backward_kernel(
                     let entry = usize::cast_from(offset + idx) * 2;
                     let wg0 = weight * g0;
                     let wg1 = weight * g1;
-                    if wg0 != 0.0_f32 {
-                        atomic_add_f32(table_grad, entry, wg0);
+                    if aggregate_hash {
+                        let c = usize::cast_from(c_sub);
+                        scatter_keys[c] = f32::cast_from(idx);
+                        scatter_g0[c] = wg0;
+                        scatter_g1[c] = wg1;
+                    } else {
+                        if wg0 != 0.0_f32 {
+                            atomic_add_f32(table_grad, entry, wg0);
+                        }
+                        if wg1 != 0.0_f32 {
+                            atomic_add_f32(table_grad, entry + 1, wg1);
+                        }
                     }
-                    if wg1 != 0.0_f32 {
-                        atomic_add_f32(table_grad, entry + 1, wg1);
+                }
+            }
+        }
+        if aggregate_hash {
+            // Repurpose the weight tile after every lane finishes reading it.
+            // Keys are level-local integer addresses, exactly representable in
+            // f32. This adds no shared-memory allocation.
+            sync_cube();
+            if unit < 224usize {
+                for c in 0..2usize {
+                    let staging = c * 224 + unit;
+                    shared_weights[staging] = scatter_keys[c];
+                    shared_weights[448 + staging] = scatter_g0[c];
+                    shared_weights[896 + staging] = scatter_g1[c];
+                }
+            }
+            sync_cube();
+            if unit < 224usize && level < usize::cast_from(active) {
+                let peers = unit - hash_slot;
+                let offset = usize::cast_from(metadata[level * 2 + 1]);
+                for c in 0..2usize {
+                    let key = scatter_keys[c];
+                    let mut leader = key >= 0.0_f32;
+                    for other in 0..4usize {
+                        if other < hash_slot && shared_weights[c * 224 + peers + other] == key {
+                            leader = false;
+                        }
+                    }
+                    if leader {
+                        let mut sum0 = 0.0_f32;
+                        let mut sum1 = 0.0_f32;
+                        for other in 0..4usize {
+                            let staging = c * 224 + peers + other;
+                            if shared_weights[staging] == key {
+                                sum0 += shared_weights[448 + staging];
+                                sum1 += shared_weights[896 + staging];
+                            }
+                        }
+                        let entry = (offset + usize::cast_from(key)) * 2;
+                        if sum0 != 0.0_f32 {
+                            atomic_add_f32(table_grad, entry, sum0);
+                        }
+                        if sum1 != 0.0_f32 {
+                            atomic_add_f32(table_grad, entry + 1, sum1);
+                        }
                     }
                 }
             }
@@ -1879,9 +1960,7 @@ fn field_backward_kernel(
         let hash_slot = if local_hash { unit % 4 } else { slot };
         let level = if local_hash { unit / 4 } else { lane };
         let hash_point = group * 4 + hash_slot;
-        if hash_point < n_valid
-            && level < usize::cast_from(active)
-            && slot_ds[hash_slot] != 0.0_f32
+        if hash_point < n_valid && level < usize::cast_from(active) && slot_ds[hash_slot] != 0.0_f32
         {
             let col = 3 + level * 2;
             let mut g0 = 0.0_f32;
@@ -1986,6 +2065,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
             ScalarIr::UInt(local_hash),
             ScalarIr::UInt(compact_gradients),
             ScalarIr::UInt(corner_parallel),
+            ScalarIr::UInt(aggregate_hash),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid backward scalars")
@@ -2003,7 +2083,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         static NOTICE: std::sync::Once = std::sync::Once::new();
         NOTICE.call_once(|| {
             eprintln!(
-                "Hash gradients: {}; hash layout: {}; corner parallelism: {}",
+                "Hash gradients: {}; hash layout: {}; corner parallelism: {}; local aggregation: {}",
                 if native_add {
                     "native float atomics"
                 } else {
@@ -2018,6 +2098,11 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                     "256-thread corner-parallel"
                 } else {
                     "legacy 56-thread sequential corners"
+                },
+                if *aggregate_hash != 0 && *corner_parallel != 0 {
+                    "enabled"
+                } else {
+                    "disabled"
                 },
             );
         });
@@ -2039,6 +2124,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *local_hash != 0,
                 *compact_gradients != 0,
                 *corner_parallel != 0,
+                *aggregate_hash != 0,
             );
         } else {
             field_backward_kernel::launch(
@@ -2058,6 +2144,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *local_hash != 0,
                 *compact_gradients != 0,
                 *corner_parallel != 0,
+                *aggregate_hash != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
@@ -2073,6 +2160,7 @@ pub fn field_backward(
     local_hash: bool,
     compact_gradients: bool,
     corner_parallel: bool,
+    aggregate_hash: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     use burn::tensor::Tensor as BT;
     let n = inputs[0].dims()[0];
@@ -2105,6 +2193,7 @@ pub fn field_backward(
             ScalarIr::UInt(local_hash as u64),
             ScalarIr::UInt(compact_gradients as u64),
             ScalarIr::UInt(corner_parallel as u64),
+            ScalarIr::UInt(aggregate_hash as u64),
         ],
     );
     let result: [_; 3] = client
@@ -2124,6 +2213,7 @@ fn composite_gather_kernel(
     ds: &mut Tensor<f32>,
     valid_points: u32,
     #[comptime] compact_reverse: bool,
+    #[comptime] coalesced_scratch: bool,
 ) {
     let point = ABSOLUTE_POS;
     if point >= usize::cast_from(valid_points) {
@@ -2141,34 +2231,43 @@ fn composite_gather_kernel(
                 let c = usize::cast_from(code);
                 let sample = c / 2;
                 let is_end = (c & 1usize) != 0usize;
-                let base = (sample * 9 + pixel) * 10;
                 if is_end {
-                    total += scratch[base + 5] + scratch[base + 9];
+                    total += scratch[composite_scratch_index(sample, pixel, 5, coalesced_scratch)]
+                        + scratch[composite_scratch_index(sample, pixel, 9, coalesced_scratch)];
                 } else {
-                    total += -scratch[base + 5] + scratch[base + 8];
+                    total += -scratch[composite_scratch_index(sample, pixel, 5, coalesced_scratch)]
+                        + scratch[composite_scratch_index(sample, pixel, 8, coalesced_scratch)];
                     if p_col == 0 {
-                        total -= scratch[base + 6];
+                        total -=
+                            scratch[composite_scratch_index(sample, pixel, 6, coalesced_scratch)];
                     }
                     if p_col > 0 {
-                        total += scratch[(sample * 9 + pixel - 1) * 10 + 6];
+                        total += scratch
+                            [composite_scratch_index(sample, pixel - 1, 6, coalesced_scratch)];
                     }
                     if p_col < 2 {
-                        total -= scratch[(sample * 9 + pixel + 1) * 10 + 6];
+                        total -= scratch
+                            [composite_scratch_index(sample, pixel + 1, 6, coalesced_scratch)];
                     }
                     if p_col == 2 {
-                        total += scratch[base + 6];
+                        total +=
+                            scratch[composite_scratch_index(sample, pixel, 6, coalesced_scratch)];
                     }
                     if p_row == 0 {
-                        total -= scratch[base + 7];
+                        total -=
+                            scratch[composite_scratch_index(sample, pixel, 7, coalesced_scratch)];
                     }
                     if p_row > 0 {
-                        total += scratch[(sample * 9 + pixel - 3) * 10 + 7];
+                        total += scratch
+                            [composite_scratch_index(sample, pixel - 3, 7, coalesced_scratch)];
                     }
                     if p_row < 2 {
-                        total -= scratch[(sample * 9 + pixel + 3) * 10 + 7];
+                        total -= scratch
+                            [composite_scratch_index(sample, pixel + 3, 7, coalesced_scratch)];
                     }
                     if p_row == 2 {
-                        total += scratch[base + 7];
+                        total +=
+                            scratch[composite_scratch_index(sample, pixel, 7, coalesced_scratch)];
                     }
                 }
             }
@@ -2181,36 +2280,45 @@ fn composite_gather_kernel(
                 let sample = code / 18;
                 let corner = code % 18;
                 let pixel = corner % 9;
-                let base = (sample * 9 + pixel) * 10;
                 if corner >= 9 {
-                    total += scratch[base + 5] + scratch[base + 9];
+                    total += scratch[composite_scratch_index(sample, pixel, 5, coalesced_scratch)]
+                        + scratch[composite_scratch_index(sample, pixel, 9, coalesced_scratch)];
                 } else {
-                    total += -scratch[base + 5] + scratch[base + 8];
+                    total += -scratch[composite_scratch_index(sample, pixel, 5, coalesced_scratch)]
+                        + scratch[composite_scratch_index(sample, pixel, 8, coalesced_scratch)];
                     let p_col = pixel % 3;
                     let p_row = pixel / 3;
                     if p_col == 0 {
-                        total -= scratch[base + 6];
+                        total -=
+                            scratch[composite_scratch_index(sample, pixel, 6, coalesced_scratch)];
                     }
                     if p_col > 0 {
-                        total += scratch[(sample * 9 + pixel - 1) * 10 + 6];
+                        total += scratch
+                            [composite_scratch_index(sample, pixel - 1, 6, coalesced_scratch)];
                     }
                     if p_col < 2 {
-                        total -= scratch[(sample * 9 + pixel + 1) * 10 + 6];
+                        total -= scratch
+                            [composite_scratch_index(sample, pixel + 1, 6, coalesced_scratch)];
                     }
                     if p_col == 2 {
-                        total += scratch[base + 6];
+                        total +=
+                            scratch[composite_scratch_index(sample, pixel, 6, coalesced_scratch)];
                     }
                     if p_row == 0 {
-                        total -= scratch[base + 7];
+                        total -=
+                            scratch[composite_scratch_index(sample, pixel, 7, coalesced_scratch)];
                     }
                     if p_row > 0 {
-                        total += scratch[(sample * 9 + pixel - 3) * 10 + 7];
+                        total += scratch
+                            [composite_scratch_index(sample, pixel - 3, 7, coalesced_scratch)];
                     }
                     if p_row < 2 {
-                        total -= scratch[(sample * 9 + pixel + 3) * 10 + 7];
+                        total -= scratch
+                            [composite_scratch_index(sample, pixel + 3, 7, coalesced_scratch)];
                     }
                     if p_row == 2 {
-                        total += scratch[base + 7];
+                        total +=
+                            scratch[composite_scratch_index(sample, pixel, 7, coalesced_scratch)];
                     }
                 }
             }
@@ -2341,6 +2449,7 @@ fn field_backward_native_kernel(
     #[comptime] local_hash: bool,
     #[comptime] compact_gradients: bool,
     #[comptime] corner_parallel: bool,
+    #[comptime] aggregate_hash: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -2362,6 +2471,8 @@ fn field_backward_native_kernel(
     let point = group * 4 + slot;
     let n_valid = usize::cast_from(valid_n);
     let mut shared = Shared::new_slice(256usize);
+    // Reused first for `output_grads` `[256]` and then for 224-thread partial
+    // feature gradients `[448]`, keeping shared memory under 12 KB per block.
     let mut partials = Shared::new_slice(if corner_parallel {
         448usize
     } else if compact_gradients {
@@ -2420,6 +2531,9 @@ fn field_backward_native_kernel(
         if compact_gradients {
             sync_cube();
         }
+        // Map 224 threads across (hash_slot in 0..4, sub_part in 0..4, level in 0..14).
+        // Phase 1: Each thread accumulates 16 of the 64 hidden neurons (4x faster than
+        // 56 threads looping 64 times) and writes `[p_g0, p_g1]` to `partials`.
         let hash_slot = unit & 3usize;
         let sub_part = (unit >> 2) & 3usize;
         let level = unit >> 4;
@@ -2459,9 +2573,17 @@ fn field_backward_native_kernel(
             partials[unit * 2 + 1] = p_g1;
         }
         sync_cube();
-        if hash_point < n_valid
-            && level < usize::cast_from(active)
-            && slot_ds[hash_slot] != 0.0_f32
+        // Phase 2: All 224 threads sum the 4 partial dot products for `(level, hash_slot)`
+        // and scatter their 2 trilinear corners concurrently (448 lookups/atomics per block).
+        let mut scatter_keys = Array::<f32>::new(2usize);
+        let mut scatter_g0 = Array::<f32>::new(2usize);
+        let mut scatter_g1 = Array::<f32>::new(2usize);
+        for i in 0..2usize {
+            scatter_keys[i] = -1.0_f32;
+            scatter_g0[i] = 0.0_f32;
+            scatter_g1[i] = 0.0_f32;
+        }
+        if hash_point < n_valid && level < usize::cast_from(active) && slot_ds[hash_slot] != 0.0_f32
         {
             let base_p = (level * 16 + hash_slot) * 2;
             let g0 = (partials[base_p] + partials[base_p + 8])
@@ -2520,11 +2642,64 @@ fn field_backward_native_kernel(
                     let entry = usize::cast_from(offset + idx) * 2;
                     let wg0 = weight * g0;
                     let wg1 = weight * g1;
-                    if wg0 != 0.0_f32 {
-                        table_grad[entry].fetch_add(wg0);
+                    if aggregate_hash {
+                        let c = usize::cast_from(c_sub);
+                        scatter_keys[c] = f32::cast_from(idx);
+                        scatter_g0[c] = wg0;
+                        scatter_g1[c] = wg1;
+                    } else {
+                        if wg0 != 0.0_f32 {
+                            table_grad[entry].fetch_add(wg0);
+                        }
+                        if wg1 != 0.0_f32 {
+                            table_grad[entry + 1].fetch_add(wg1);
+                        }
                     }
-                    if wg1 != 0.0_f32 {
-                        table_grad[entry + 1].fetch_add(wg1);
+                }
+            }
+        }
+        if aggregate_hash {
+            // Repurpose the weight tile after every lane finishes reading it.
+            // Keys are level-local integer addresses, exactly representable in
+            // f32. This adds no shared-memory allocation.
+            sync_cube();
+            if unit < 224usize {
+                for c in 0..2usize {
+                    let staging = c * 224 + unit;
+                    shared_weights[staging] = scatter_keys[c];
+                    shared_weights[448 + staging] = scatter_g0[c];
+                    shared_weights[896 + staging] = scatter_g1[c];
+                }
+            }
+            sync_cube();
+            if unit < 224usize && level < usize::cast_from(active) {
+                let peers = unit - hash_slot;
+                let offset = usize::cast_from(metadata[level * 2 + 1]);
+                for c in 0..2usize {
+                    let key = scatter_keys[c];
+                    let mut leader = key >= 0.0_f32;
+                    for other in 0..4usize {
+                        if other < hash_slot && shared_weights[c * 224 + peers + other] == key {
+                            leader = false;
+                        }
+                    }
+                    if leader {
+                        let mut sum0 = 0.0_f32;
+                        let mut sum1 = 0.0_f32;
+                        for other in 0..4usize {
+                            let staging = c * 224 + peers + other;
+                            if shared_weights[staging] == key {
+                                sum0 += shared_weights[448 + staging];
+                                sum1 += shared_weights[896 + staging];
+                            }
+                        }
+                        let entry = (offset + usize::cast_from(key)) * 2;
+                        if sum0 != 0.0_f32 {
+                            table_grad[entry].fetch_add(sum0);
+                        }
+                        if sum1 != 0.0_f32 {
+                            table_grad[entry + 1].fetch_add(sum1);
+                        }
                     }
                 }
             }
@@ -2533,9 +2708,7 @@ fn field_backward_native_kernel(
         let hash_slot = if local_hash { unit % 4 } else { slot };
         let level = if local_hash { unit / 4 } else { lane };
         let hash_point = group * 4 + hash_slot;
-        if hash_point < n_valid
-            && level < usize::cast_from(active)
-            && slot_ds[hash_slot] != 0.0_f32
+        if hash_point < n_valid && level < usize::cast_from(active) && slot_ds[hash_slot] != 0.0_f32
         {
             let col = 3 + level * 2;
             let mut g0 = 0.0_f32;

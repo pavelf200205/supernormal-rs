@@ -70,6 +70,14 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_corner_loop: bool,
+    /// Disable local same-address hash-gradient aggregation.
+    #[arg(long)]
+    #[serde(default)]
+    pub no_hash_aggregation: bool,
+    /// Restore pixel-major compositor scratch storage.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_composite_scratch: bool,
     /// Restore host sample readbacks between march, visibility, and geometry preparation.
     #[arg(long)]
     #[serde(default)]
@@ -273,6 +281,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.compact_gradients = !args.legacy_output_gradients;
     field.wide_gradient_tiles = !args.legacy_gradient_tiles;
     field.corner_parallel = !args.legacy_corner_loop;
+    field.aggregate_hash = !args.no_hash_aggregation;
     field.chunked_eval = args.chunked_eval;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
@@ -527,6 +536,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         normal_den,
                         pixel_den,
                         sample_den,
+                        !args.legacy_composite_scratch,
                     )
                 } else {
                     render::composite_device(
@@ -539,6 +549,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         normal_den,
                         pixel_den,
                         sample_den,
+                        !args.legacy_composite_scratch,
                     )
                 };
                 device_stats = Some(match device_stats {

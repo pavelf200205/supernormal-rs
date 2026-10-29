@@ -43,6 +43,7 @@ pub struct Field {
     pub compact_gradients: bool,
     pub wide_gradient_tiles: bool,
     pub corner_parallel: bool,
+    pub aggregate_hash: bool,
     pub chunked_eval: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
@@ -311,6 +312,7 @@ impl Field {
             compact_gradients: true,
             wide_gradient_tiles: true,
             corner_parallel: true,
+            aggregate_hash: true,
             chunked_eval: false,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
@@ -394,6 +396,7 @@ impl Field {
             compact_gradients: true,
             wide_gradient_tiles: true,
             corner_parallel: true,
+            aggregate_hash: true,
             chunked_eval: false,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
@@ -563,10 +566,7 @@ impl Field {
                     if padded_n == n {
                         pts
                     } else {
-                        Tensor::cat(
-                            vec![pts, Tensor::empty([padded_n - n, 3], &self.device)],
-                            0,
-                        )
+                        Tensor::cat(vec![pts, Tensor::empty([padded_n - n, 3], &self.device)], 0)
                     }
                 };
                 if self.fused_field {
@@ -1014,7 +1014,9 @@ impl Field {
                 .borrow_mut()
                 .take()
                 .unwrap_or_else(|| Tensor::zeros([total_entries, 2], &self.device));
-            accumulated.params.insert("encoding.packed".into(), grad_buf);
+            accumulated
+                .params
+                .insert("encoding.packed".into(), grad_buf);
         }
 
         let w0 = if !self.fused_field {
@@ -1075,6 +1077,7 @@ impl Field {
                     self.local_hash,
                     self.compact_gradients,
                     self.corner_parallel,
+                    self.aggregate_hash,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
                 (dh, None, dw1.sum_dim(0), ds_tensor.sum_dim(0))

@@ -1,6 +1,6 @@
 # Kopanas optimization audit — 2026-10-29
 
-Scope: source inspection of the current working tree, including existing
+Scope: source inspection of the part-1 state (`03e589d`), including then-existing
 uncommitted updates. All eight supplied article/diff pages were downloaded and
 reviewed. No builds, tests, GPU captures, or benchmarks were run. Presence of
 source mechanisms does not establish numerical parity or machine-code behavior.
@@ -76,3 +76,33 @@ separately before choosing another mapping or precision change. Keep numerical
 and reconstruction validation separate from source-presence checks.
 
 Reference overview: https://grgkopanas.github.io/3dgs_cuda_blog/
+
+
+## Part 2 implementation follow-up
+
+The historical findings above describe part 1. Part 2 now adds local
+same-address hash aggregation in both corner-parallel backward variants (native
+float and CAS). Each corner/level group of four points elects one leader per
+matching table address, combines both feature channels, and emits the combined
+updates. Different cells that hash to the same address are safely combined too;
+no contribution is discarded. Other corner groups still use independent atomics.
+The existing shared MLP weight tile is reused after a uniform barrier, so shared
+allocation and global buffer sizes do not increase. Two additional barriers,
+leader comparisons, and a small register window are the tradeoff. This is a
+portable local reduction, not the article's CUDA half-warp folding primitive.
+The sequential-corner reference path deliberately retains its original atomics.
+
+Compositor scratch is now component-major within each nine-pixel sample. Both
+forward/reverse compositing and the adjoint gather use the same selectable
+indexing helper. This improves contiguous access for neighboring pixel lanes
+without introducing shared staging, assumptions about subgroup width, or
+workgroup barriers. Buffer size remains 90 floats per sample.
+
+Use `--no-hash-aggregation` and `--legacy-composite-scratch` together to restore
+part-1 behavior for these changes. They can also be tested independently.
+Article-specific Gaussian binning, SH streaming, contributor thresholds, and
+opacity/quadratic formulas remain inapplicable and are not claimed as ports.
+The eikonal loss, finite-difference dependencies, occupancy policy, precision,
+and ray sample ordering are preserved. Atomic sum grouping can change rounding.
+No builds or tests were run; shader validation, gradient/mesh parity, speed, and
+memory behavior need to be measured by the user after rebuilding.

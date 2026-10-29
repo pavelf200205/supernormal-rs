@@ -351,3 +351,21 @@ Mesh extraction now uses:
 1. **GPU-Generated Coordinate Slabs (`mesh_slab_points_kernel`)**: Generates all $1024 \times 1024$ `[x, y, z]` coordinates directly on the GPU from 3 floats (`res`, `1 / (res - 1)`, `z_coord`), eliminating 12.9 GB of CPU allocation and host-to-device PCIe uploads per mesh.
 2. **Unchunked Single-Dispatch Slab Evaluation + Double-Buffered GPU/CPU Overlap**: Evaluates all $1,048,576$ points of a slab in a single `fused_field` launch and enqueues slab `z + 2` via `device.flush()` before reading slab `z + 1`, overlapping GPU SDF evaluation with CPU triangle extraction.
 3. **$O(1)$ Rolling Flat-Array Edge Tables (`xy_lower`, `xy_upper`, `z_edges`)**: Replaces `std::collections::HashMap<(usize, usize), u32>` and `edges.retain(...)` with three flat `Vec<u32>` buffers (`20 MB` total at `res = 1024`) swapped per slab, plus an immediate `if case == 0 || case == 255 { continue; }` fast path and vectorized `bytemuck::cast_slice` binary PLY writes.
+
+
+### Kopanas part 2 comparison
+
+The default corner-parallel hash backward combines equal-address updates from
+four neighboring points before emitting native-float or CAS atomics. It reuses
+existing shared weight storage and adds no global buffers. Compositor scratch
+now keeps each component's nine pixels adjacent, including matching adjoint
+gather indexing. Both changes preserve ray order, all losses, and FP32 storage;
+local sum grouping can change floating-point rounding.
+
+For an A/B comparison from the same checkpoint and identical settings, add
+`--no-hash-aggregation --legacy-composite-scratch` to restore part-1 behavior for
+these changes. Each flag can be tested separately. `--legacy-corner-loop` also
+bypasses local hash aggregation by selecting the original sequential scatter.
+Use fresh output directories. Rebuild and test yourself: no build, test, or
+runtime benchmark was performed for this update. See
+[KOPANAS_AUDIT.md](KOPANAS_AUDIT.md) for applicability and implementation details.
