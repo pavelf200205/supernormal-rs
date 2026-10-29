@@ -1128,6 +1128,7 @@ fn fused_field_kernel(
     active: u32,
     valid_n: u32,
     #[comptime] cache: bool,
+    #[comptime] cache_preactivation: bool,
     #[comptime] local_hash: bool,
     #[comptime] corner_parallel: bool,
     #[comptime] point_tiles: usize,
@@ -1308,8 +1309,10 @@ fn fused_field_kernel(
                     * shared_weights[k * 64 + lane];
             }
             h += shared_weights[1984 + lane];
-            if cache {
+            if cache_preactivation {
                 preactivation[point_idx * 64 + lane] = h;
+            }
+            if cache {
                 if lane < 31 {
                     features[point_idx * 31 + lane] =
                         shared_features[field_feature_index(slot, lane, local_hash)];
@@ -1371,6 +1374,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             ScalarIr::UInt(active),
             ScalarIr::UInt(valid_n),
             ScalarIr::UInt(cache),
+            ScalarIr::UInt(cache_preactivation),
             ScalarIr::UInt(local_hash),
             ScalarIr::UInt(corner_parallel),
             ScalarIr::UInt(point_tiles),
@@ -1416,6 +1420,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             *active as u32,
             *valid_n as u32,
             *cache != 0,
+            *cache_preactivation != 0,
             *local_hash != 0,
             *corner_parallel != 0,
             point_tiles,
@@ -1433,6 +1438,7 @@ pub fn fused_field(
     valid_n: usize,
     active: usize,
     cache: bool,
+    cache_preactivation: bool,
     local_hash: bool,
     corner_parallel: bool,
     point_tiles: usize,
@@ -1446,7 +1452,7 @@ pub fn fused_field(
     let buffers = [
         burn::tensor::Tensor::<2>::empty([valid_n.max(1), 1], &device),
         burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 31], &device),
-        burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 64], &device),
+        burn::tensor::Tensor::<2>::empty([if cache_preactivation { n } else { 1 }, 64], &device),
     ];
     let inputs: Vec<_> = inputs
         .into_iter()
@@ -1466,6 +1472,7 @@ pub fn fused_field(
             ScalarIr::UInt(active as u64),
             ScalarIr::UInt(valid_n as u64),
             ScalarIr::UInt(cache as u64),
+            ScalarIr::UInt(cache_preactivation as u64),
             ScalarIr::UInt(local_hash as u64),
             ScalarIr::UInt(corner_parallel as u64),
             ScalarIr::UInt(point_tiles as u64),
@@ -3016,4 +3023,110 @@ fn field_backward_native_kernel(
             }
         }
     }
+}
+
+// Rebuild only the first MLP layer from retained features. The accumulation
+// order and packed weights match fused_field_kernel; no hash lookup, softplus,
+// final SDF output, or new per-point cache is needed in this pass.
+#[cube(launch)]
+fn cached_mlp_preactivation_kernel(
+    features: &Tensor<f32>,
+    weights: &Tensor<f32>,
+    pre: &mut Tensor<f32>,
+    valid_n: u32,
+    active: u32,
+) {
+    let unit = usize::cast_from(UNIT_POS);
+    let lane = unit % 64;
+    let slot = unit / 64;
+    let group = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X);
+    let point = group * 4 + slot;
+    let valid = point < usize::cast_from(valid_n);
+    let mut shared_weights = Shared::new_slice(2048usize);
+    let mut shared_features = Shared::new_slice(128usize);
+    for tile in 0..8usize {
+        let i = unit + tile * 256;
+        shared_weights[i] = weights[i];
+    }
+    if lane < 31 && valid {
+        shared_features[slot * 32 + lane] =
+            features[point * features.stride(0) + lane * features.stride(1)];
+    }
+    // All invocations, including padded/tail lanes, reach the barrier.
+    sync_cube();
+    if valid {
+        let mut h = 0.0_f32;
+        for k in 0..(3 + usize::cast_from(active) * 2) {
+            h += shared_features[slot * 32 + k] * shared_weights[k * 64 + lane];
+        }
+        pre[point * 64 + lane] = h + shared_weights[1984 + lane];
+    }
+}
+
+#[derive(Debug)]
+struct CachedMlpOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for CachedMlpOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([f, w, p], [out]) = self.desc.as_fixed();
+        let [ScalarIr::UInt(valid_n), ScalarIr::UInt(active)] = self.desc.scalars.as_slice() else {
+            panic!("invalid cached MLP scalars")
+        };
+        let [f, w, p] = [f, w, p].map(|ir| handles.get_float_tensor::<CubeBackend>(ir));
+        let client = f.client.clone();
+        let _timing = crate::diagnostics::start(&client, "cached_mlp_preactivation");
+        let groups = (*valid_n as usize).div_ceil(4).max(1);
+        let gx = groups.min(65535);
+        cached_mlp_preactivation_kernel::launch(
+            &client,
+            CubeCount::Static(gx as u32, groups.div_ceil(gx) as u32, 1),
+            CubeDim::new_1d(256),
+            f.into_tensor_arg(),
+            w.into_tensor_arg(),
+            p.clone().into_tensor_arg(),
+            *valid_n as u32,
+            *active as u32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&out.id, p);
+        Ok(())
+    }
+}
+pub fn cached_mlp_preactivation(
+    features: burn::tensor::Tensor<2>,
+    weights: burn::tensor::Tensor<2>,
+    valid_n: usize,
+    active: usize,
+) -> burn::tensor::Tensor<2> {
+    use burn::tensor::Tensor as BT;
+    assert!(valid_n > 0 && valid_n <= features.dims()[0] && active <= 14);
+    let output = BT::empty([features.dims()[0], 64], &features.device());
+    let inputs =
+        [features, weights, output].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        inputs[2].shape.clone(),
+        inputs[2].dtype,
+    );
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_cached_mlp_preactivation",
+        &inputs.map(|t| t.into_ir()),
+        &[out],
+        vec![
+            ScalarIr::UInt(valid_n as u64),
+            ScalarIr::UInt(active as u64),
+        ],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            CachedMlpOp { desc },
+        )
+        .outputs();
+    BT::<2>::from_primitive::<GpuBackend>(out)
 }

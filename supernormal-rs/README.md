@@ -424,3 +424,43 @@ GPU gradient/mesh parity and performance still require user validation. Larger
 tiles, selective aggregation and recomputation are selectable experiments, not
 promised speedups. No build, tests, GPU captures or benchmarks were run by the
 assistant for this update. Rebuild and test the binary yourself.
+
+
+### Budgeted feature-only activation cache
+
+Enabled by default for fused training. If all query chunks fit in the former
+three-full-chunk cache budget, keep both features and preactivations as before.
+Otherwise retain only the 31-float features and rebuild the 64-float first-layer
+preactivations from those features during backward. A dedicated FP32 kernel
+uses the same packed weights, active columns and accumulation order as forward;
+it performs no hash lookups, softplus evaluation, or SDF-output computation.
+Chunks that do not fit still use the existing full-forward recomputation path.
+
+The budget is derived from the padded shapes of the first three chunks, matching
+the previous policy. Feature-only mode reserves a largest-chunk preactivation
+workspace inside that budget. With full `--query 131072` chunks, the old budget
+is about 149 MB (142.5 MiB). Reserving 32 MiB for that workspace leaves room for
+seven full feature-only chunks, versus three full feature+preactivation chunks;
+a sufficiently small tail may also fit. This is intentionally more conservative
+than spending the whole budget on nine feature-only chunks and then allocating
+another full temporary preactivation tile.
+
+There is no additional full-size preactivation output during the feature-only
+forward. This bounds logical retained activation bytes plus one rebuild
+workspace, not total driver/process VRAM: buffer pooling, compiled shaders and
+queued operation lifetimes can still change observed reservation. Measure memory
+on the target GPU before assuming identical VRAM use.
+
+Use `--legacy-activation-cache` to restore the former three-full-chunk policy
+for comparison from the same checkpoint, query, batch and microbatch settings.
+The flag is independent of `--recompute-parameter-gradients`; keep that separate
+experiment off when first measuring this change. Unfused/reference forward is
+unchanged. No mesh extraction, sampling, occupancy or loss changes are included.
+
+Diagnostics add `field.feature_only_batches`, `field.feature_only_cached_points`,
+`field.full_cached_points`, and `field.mlp_only_recomputed_points`. Compare the
+latter with `field.recomputed_points` (full hash+MLP replay), and use the
+`cached_mlp_preactivation` timing row to attribute rebuild work. Diagnostics
+perturb timing; measure normal throughput separately. Source formatting and
+review only: no builds or tests were run. Rebuild and test performance, gradients
+and mesh quality yourself; no speedup or bitwise shader parity is claimed yet.

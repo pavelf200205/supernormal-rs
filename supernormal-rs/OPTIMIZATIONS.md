@@ -240,3 +240,16 @@ Optional diagnostics use the installed CubeCL profiling-window API and distingui
 system/device timing from unavailable measurements. They count conditional copy
 bytes and sample address reuse without claiming hardware atomic/cache counters.
 No build or tests were run; default and experimental paths need user validation.
+
+
+## Budgeted feature-only cache
+
+Large fused training batches now retain features without preactivations and
+rebuild only the first MLP layer during backward, avoiding repeated hash reads
+for cached chunks. Smaller batches keep the full cache. The previous three-chunk
+activation budget is preserved with a reservation for one rebuilt preactivation
+tile; this typically permits seven full feature-only chunks instead of three
+full chunks at the same logical cache/workspace budget. Overflow still streams
+through the original full-recomputation fallback. Add
+`--legacy-activation-cache` for A/B comparison. See README.md for memory caveats,
+diagnostic counters and validation requirements. No build or tests were run.

@@ -52,6 +52,7 @@ pub struct Field {
     pub recompute_parameter_gradients: bool,
     pub reuse_endpoints: bool,
     pub chunked_eval: bool,
+    pub feature_only_cache: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
     persistent_table_grad: std::cell::RefCell<Option<Tensor<2>>>,
@@ -159,10 +160,9 @@ impl PendingEvaluation {
     }
 }
 
-/// Cap simultaneously resident cached `(feat, preactivation)` chunks in VRAM
-/// (`3 * 49.8 MB = 149 MB` at `--query 131072`). Any additional chunks during
-/// the early step 1-900 sample spike stream through a single reusable buffer
-/// in backward, keeping total VRAM flat at ~1.6-1.8 GB from step 1 onward.
+/// Baseline activation budget: three full feature + preactivation chunks.
+/// Large batches can retain features alone, reserving one preactivation workspace
+/// within that budget. Uncached chunks retain the existing streamed fallback.
 const MAX_CACHED_CHUNKS: usize = 3;
 
 impl Field {
@@ -328,6 +328,7 @@ impl Field {
             recompute_parameter_gradients: false,
             reuse_endpoints: true,
             chunked_eval: false,
+            feature_only_cache: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
             persistent_table_grad: std::cell::RefCell::new(None),
@@ -419,6 +420,7 @@ impl Field {
             recompute_parameter_gradients: false,
             reuse_endpoints: true,
             chunked_eval: false,
+            feature_only_cache: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
             persistent_table_grad: std::cell::RefCell::new(None),
@@ -873,6 +875,16 @@ impl Field {
     }
 
     fn fused_forward_valid(&self, xyz: Tensor<2>, valid_n: usize, cache: bool) -> [Tensor<2>; 3] {
+        self.fused_forward_cache_valid(xyz, valid_n, cache, cache)
+    }
+
+    fn fused_forward_cache_valid(
+        &self,
+        xyz: Tensor<2>,
+        valid_n: usize,
+        cache_features: bool,
+        cache_preactivation: bool,
+    ) -> [Tensor<2>; 3] {
         if self.packed_mlp.borrow().is_none() {
             let weights = Tensor::cat(
                 vec![
@@ -893,7 +905,8 @@ impl Field {
             [xyz, tables, metadata, weights],
             valid_n,
             self.active.min(14),
-            cache,
+            cache_features,
+            cache_preactivation,
             self.local_hash,
             self.corner_parallel,
             self.point_tiles,
@@ -946,6 +959,31 @@ impl Field {
         &self,
         inputs: impl Iterator<Item = (usize, Tensor<2>)>,
     ) -> PendingEvaluation {
+        // Look ahead at shapes only; no activation evaluation or GPU readback.
+        let inputs: Vec<_> = inputs.collect();
+        let bytes = |rows: usize, columns: usize| rows.saturating_mul(columns).saturating_mul(4);
+        let budget = inputs
+            .iter()
+            .take(MAX_CACHED_CHUNKS)
+            .fold(0usize, |total, (_, pts)| {
+                total.saturating_add(bytes(pts.dims()[0], 95))
+            });
+        let full_bytes = inputs.iter().fold(0usize, |total, (_, pts)| {
+            total.saturating_add(bytes(pts.dims()[0], 95))
+        });
+        let feature_only = self.fused_field && self.feature_only_cache && full_bytes > budget;
+        // Reserve one streamed preactivation tile within the old retained-cache
+        // budget, rather than growing peak activation storage by another tile.
+        let pre_workspace = inputs
+            .iter()
+            .map(|(_, pts)| bytes(pts.dims()[0], 64))
+            .max()
+            .unwrap_or(0);
+        let feature_budget = budget.saturating_sub(pre_workspace);
+        let mut retained_bytes = 0usize;
+        if feature_only {
+            crate::diagnostics::count("field.feature_only_batches", 1);
+        }
         let mut chunks = Vec::new();
         let mut pending_outputs = Vec::new();
         let w0_t = if !self.fused_field {
@@ -958,22 +996,37 @@ impl Field {
         } else {
             None
         };
-        for (chunk_idx, (n, pts_tensor)) in inputs.enumerate() {
+        for (chunk_idx, (n, pts_tensor)) in inputs.into_iter().enumerate() {
             let padded_n = pts_tensor.dims()[0];
             crate::diagnostics::count("field.cached_forward_points", n);
             crate::diagnostics::count("field.cached_capacity_points", padded_n);
             if self.fused_field {
-                let keep_cache = chunk_idx < MAX_CACHED_CHUNKS;
+                let cost = bytes(padded_n, if feature_only { 31 } else { 95 });
+                let keep_cache = if feature_only {
+                    cost <= feature_budget.saturating_sub(retained_bytes)
+                } else {
+                    chunk_idx < MAX_CACHED_CHUNKS
+                };
+                if keep_cache {
+                    retained_bytes += cost;
+                }
+                let cache_pre = keep_cache && !feature_only;
                 let [y, feat, preactivation] =
-                    self.fused_forward_valid(pts_tensor.clone(), n, keep_cache);
+                    self.fused_forward_cache_valid(pts_tensor.clone(), n, keep_cache, cache_pre);
+                if keep_cache {
+                    crate::diagnostics::count(
+                        if feature_only {
+                            "field.feature_only_cached_points"
+                        } else {
+                            "field.full_cached_points"
+                        },
+                        n,
+                    );
+                }
                 pending_outputs.push((n, y));
                 chunks.push(FeatureChunk {
                     feat: if keep_cache { Some(feat) } else { None },
-                    preactivation: if keep_cache {
-                        Some(preactivation)
-                    } else {
-                        None
-                    },
+                    preactivation: if cache_pre { Some(preactivation) } else { None },
                     pts_tensor,
                     point_count: n,
                     padded_count: padded_n,
@@ -1106,6 +1159,22 @@ impl Field {
 
             let (feat, preactivation) = match (chunk.feat, chunk.preactivation) {
                 (Some(f), Some(p)) => (f, p),
+                (Some(f), None) => {
+                    crate::diagnostics::count("field.mlp_only_recomputed_points", n);
+                    let weights = self
+                        .packed_mlp
+                        .borrow()
+                        .as_ref()
+                        .expect("forward packs MLP weights")
+                        .clone();
+                    let pre = crate::kernels::cached_mlp_preactivation(
+                        f.clone(),
+                        weights,
+                        n,
+                        active_levels,
+                    );
+                    (f, pre)
+                }
                 _ => {
                     crate::diagnostics::count("field.recomputed_points", n);
                     let [_, f, p] = self.fused_forward_valid(chunk.pts_tensor.clone(), n, true);
