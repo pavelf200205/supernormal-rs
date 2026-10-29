@@ -1605,21 +1605,49 @@ pub fn fused_field(
 //    always `start_ep + 1`, all 18 points of sample `s` are contiguous at
 //    `sdf[base_pt .. base_pt + 18]`, reducing index loads by 6x and turning all
 //    4 stencil neighbor lookups (`l, r, u, d`) into contiguous L1 cache hits.
-// 3. Forward caches `(c0, c1, s0, s1)` in `scratch[sb + 5..9]` so the reverse
-//    pass executes zero `exp()` calls and uses branchless predication.
+// 3. Forward retains sigmoid endpoints, avoiding exp() in reverse. Compact
+//    records reload immutable s0/s1 instead of storing redundant SDF values.
+//    Seven forward components become four derivatives after local reads finish.
 // Component-major within a nine-pixel sample: adjacent pixel lanes read/write
-// adjacent words. Keep the former 10-float pixel records as an A/B variant.
+// adjacent words. The legacy ten-float cache and pixel layout are independent
+// comparison switches.
 #[cube]
 fn composite_scratch_index(
     sample: usize,
     pixel: usize,
     component: usize,
     #[comptime] coalesced: bool,
+    #[comptime] compact_cache: bool,
 ) -> usize {
     if coalesced {
-        sample * 90 + component * 9 + pixel
+        if compact_cache {
+            sample * 63 + component * 9 + pixel
+        } else {
+            sample * 90 + component * 9 + pixel
+        }
     } else {
-        (sample * 9 + pixel) * 10 + component
+        if compact_cache {
+            (sample * 9 + pixel) * 7 + component
+        } else {
+            (sample * 9 + pixel) * 10 + component
+        }
+    }
+}
+
+// Forward inputs are dead before reverse writes these four derivatives.
+// Legacy records keep their original dp0, dp1, dp2, z0, z1 slots.
+#[cube]
+fn composite_adjoint_index(
+    sample: usize,
+    pixel: usize,
+    component: usize,
+    #[comptime] coalesced: bool,
+    #[comptime] compact_cache: bool,
+) -> usize {
+    if compact_cache {
+        composite_scratch_index(sample, pixel, component, coalesced, compact_cache)
+    } else {
+        composite_scratch_index(sample, pixel, component + 5, coalesced, compact_cache)
     }
 }
 
@@ -1634,6 +1662,7 @@ fn composite_kernel(
     stats: &mut Tensor<f32>,
     #[comptime] compact_ids: bool,
     #[comptime] coalesced_scratch: bool,
+    #[comptime] compact_cache: bool,
     #[comptime] reuse_endpoints: bool,
 ) {
     let ray = ABSOLUTE_POS;
@@ -1743,18 +1772,20 @@ fn composite_kernel(
         prev_end_id = i1;
         let a = f32::clamp((c0 - c1 + 1e-5_f32) / (c0 + 1e-5_f32), 0.0_f32, 1.0_f32);
         let w = trans * a;
-        scratch[composite_scratch_index(s, pixel, 3, coalesced_scratch)] = trans;
-        scratch[composite_scratch_index(s, pixel, 4, coalesced_scratch)] = a;
-        scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch)] = c0;
-        scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch)] = c1;
-        scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch)] = s0;
-        scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch)] = s1;
+        scratch[composite_scratch_index(s, pixel, 3, coalesced_scratch, compact_cache)] = trans;
+        scratch[composite_scratch_index(s, pixel, 4, coalesced_scratch, compact_cache)] = a;
+        scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch, compact_cache)] = c0;
+        scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch, compact_cache)] = c1;
+        if !compact_cache {
+            scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch, compact_cache)] = s0;
+            scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch, compact_cache)] = s1;
+        }
         trans *= f32::max(1.0_f32 - a, 1e-10_f32);
         masks += w;
         for j in 0..3usize {
             let vb = pb + 6 + pixel * 13 + j * 3;
             let g = patches[vb] * dt + patches[vb + 1] * dx + patches[vb + 2] * dy;
-            scratch[composite_scratch_index(s, pixel, j, coalesced_scratch)] = g;
+            scratch[composite_scratch_index(s, pixel, j, coalesced_scratch, compact_cache)] = g;
             normals[j] += w * g;
         }
     }
@@ -1778,15 +1809,30 @@ fn composite_kernel(
 
     for rev in 0..(end - begin) {
         let s = end - 1 - rev;
-        let g0 = scratch[composite_scratch_index(s, pixel, 0, coalesced_scratch)];
-        let g1 = scratch[composite_scratch_index(s, pixel, 1, coalesced_scratch)];
-        let g2 = scratch[composite_scratch_index(s, pixel, 2, coalesced_scratch)];
-        let t = scratch[composite_scratch_index(s, pixel, 3, coalesced_scratch)];
-        let a = scratch[composite_scratch_index(s, pixel, 4, coalesced_scratch)];
-        let c0 = scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch)];
-        let c1 = scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch)];
-        let s0 = scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch)];
-        let s1 = scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch)];
+        let g0 = scratch[composite_scratch_index(s, pixel, 0, coalesced_scratch, compact_cache)];
+        let g1 = scratch[composite_scratch_index(s, pixel, 1, coalesced_scratch, compact_cache)];
+        let g2 = scratch[composite_scratch_index(s, pixel, 2, coalesced_scratch, compact_cache)];
+        let t = scratch[composite_scratch_index(s, pixel, 3, coalesced_scratch, compact_cache)];
+        let a = scratch[composite_scratch_index(s, pixel, 4, coalesced_scratch, compact_cache)];
+        let c0 = scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch, compact_cache)];
+        let c1 = scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch, compact_cache)];
+        let mut s0 = 0.0_f32;
+        let mut s1 = 0.0_f32;
+        if compact_cache {
+            // SDF values are immutable throughout forward/reverse/gather.
+            // Reloading them avoids caching two extra floats per pixel/sample.
+            if compact_ids {
+                let base = usize::cast_from(ids[s]);
+                s0 = sdf[base + pixel];
+                s1 = sdf[base + 9 + pixel];
+            } else {
+                s0 = sdf[usize::cast_from(ids[s * 18 + pixel])];
+                s1 = sdf[usize::cast_from(ids[s * 18 + 9 + pixel])];
+            }
+        } else {
+            s0 = scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch, compact_cache)];
+            s1 = scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch, compact_cache)];
+        }
         let norm = f32::sqrt(g0 * g0 + g1 * g1 + g2 * g2);
         el += (norm - 1.0_f32) * (norm - 1.0_f32) / sample_den;
         let eg = 2.0_f32 * (norm - 1.0_f32) / sample_den / f32::max(norm, 1e-12_f32);
@@ -1801,9 +1847,11 @@ fn composite_kernel(
             * geometry[gb + 1];
         let dp2 = (patches[vb + 2] * dg0 + patches[vb + 5] * dg1 + patches[vb + 8] * dg2)
             * geometry[gb + 2];
-        scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch)] = dp0;
-        scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch)] = dp1;
-        scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch)] = dp2;
+        if !compact_cache {
+            scratch[composite_adjoint_index(s, pixel, 0, coalesced_scratch, compact_cache)] = dp0;
+        }
+        scratch[composite_adjoint_index(s, pixel, 1, coalesced_scratch, compact_cache)] = dp1;
+        scratch[composite_adjoint_index(s, pixel, 2, coalesced_scratch, compact_cache)] = dp2;
         let gw = dn[0] * g0 + dn[1] * g1 + dn[2] * g2 + dm;
         let one_minus_a = 1.0_f32 - a;
         let q = f32::max(one_minus_a, 1e-10_f32);
@@ -1823,8 +1871,18 @@ fn composite_kernel(
         let z1_raw = -da / denom * c1 * (1.0_f32 - c1);
         let z0 = if active_raw { z0_raw } else { 0.0_f32 };
         let z1 = if active_raw { z1_raw } else { 0.0_f32 };
-        scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch)] = z0 * inv;
-        scratch[composite_scratch_index(s, pixel, 9, coalesced_scratch)] = z1 * inv;
+        if compact_cache {
+            // Precombine exactly the endpoint expressions gather would evaluate.
+            scratch[composite_adjoint_index(s, pixel, 0, coalesced_scratch, compact_cache)] =
+                -dp0 + z0 * inv;
+            scratch[composite_adjoint_index(s, pixel, 3, coalesced_scratch, compact_cache)] =
+                dp0 + z1 * inv;
+        } else {
+            scratch[composite_adjoint_index(s, pixel, 3, coalesced_scratch, compact_cache)] =
+                z0 * inv;
+            scratch[composite_adjoint_index(s, pixel, 4, coalesced_scratch, compact_cache)] =
+                z1 * inv;
+        }
         bias += z0 * inv + z1 * inv;
         dinv += z0 * s0 + z1 * s1;
     }
@@ -1849,6 +1907,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             ScalarIr::UInt(valid_points),
             ScalarIr::UInt(compact_tables),
             ScalarIr::UInt(coalesced_scratch),
+            ScalarIr::UInt(compact_cache),
             ScalarIr::UInt(reuse_endpoints),
         ] = self.desc.scalars.as_slice()
         else {
@@ -1874,6 +1933,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             l.clone().into_tensor_arg(),
             compact,
             *coalesced_scratch != 0,
+            *compact_cache != 0,
             *reuse_endpoints != 0,
         );
         drop(timing);
@@ -1890,6 +1950,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             *valid_points as u32,
             compact,
             *coalesced_scratch != 0,
+            *compact_cache != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&od.id, d);
         handles.register_float_tensor::<CubeBackend>(&ol.id, l);
@@ -1901,8 +1962,10 @@ pub fn composite_gpu(
     valid_points: usize,
     compact_tables: bool,
     coalesced_scratch: bool,
+    compact_cache: bool,
     reuse_endpoints: bool,
 ) -> [burn::tensor::Tensor<2>; 2] {
+    assert_eq!(inputs[5].dims()[1], if compact_cache { 63 } else { 90 });
     let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let outputs: Vec<_> = inputs[6..8]
@@ -1917,6 +1980,7 @@ pub fn composite_gpu(
             ScalarIr::UInt(valid_points as u64),
             ScalarIr::UInt(compact_tables as u64),
             ScalarIr::UInt(coalesced_scratch as u64),
+            ScalarIr::UInt(compact_cache as u64),
             ScalarIr::UInt(reuse_endpoints as u64),
         ],
     );
@@ -2548,6 +2612,7 @@ fn composite_gather_kernel(
     valid_points: u32,
     #[comptime] compact_reverse: bool,
     #[comptime] coalesced_scratch: bool,
+    #[comptime] compact_cache: bool,
 ) {
     let point = ABSOLUTE_POS;
     if point >= usize::cast_from(valid_points) {
@@ -2566,42 +2631,124 @@ fn composite_gather_kernel(
                 let sample = c / 2;
                 let is_end = (c & 1usize) != 0usize;
                 if is_end {
-                    total += scratch[composite_scratch_index(sample, pixel, 5, coalesced_scratch)]
-                        + scratch[composite_scratch_index(sample, pixel, 9, coalesced_scratch)];
+                    if compact_cache {
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            3,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
+                    } else {
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            0,
+                            coalesced_scratch,
+                            compact_cache,
+                        )] + scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            4,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
+                    }
                 } else {
-                    total += -scratch[composite_scratch_index(sample, pixel, 5, coalesced_scratch)]
-                        + scratch[composite_scratch_index(sample, pixel, 8, coalesced_scratch)];
+                    if compact_cache {
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            0,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
+                    } else {
+                        total += -scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            0,
+                            coalesced_scratch,
+                            compact_cache,
+                        )] + scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            3,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
+                    }
                     if p_col == 0 {
-                        total -=
-                            scratch[composite_scratch_index(sample, pixel, 6, coalesced_scratch)];
+                        total -= scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            1,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_col > 0 {
-                        total += scratch
-                            [composite_scratch_index(sample, pixel - 1, 6, coalesced_scratch)];
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel - 1,
+                            1,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_col < 2 {
-                        total -= scratch
-                            [composite_scratch_index(sample, pixel + 1, 6, coalesced_scratch)];
+                        total -= scratch[composite_adjoint_index(
+                            sample,
+                            pixel + 1,
+                            1,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_col == 2 {
-                        total +=
-                            scratch[composite_scratch_index(sample, pixel, 6, coalesced_scratch)];
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            1,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_row == 0 {
-                        total -=
-                            scratch[composite_scratch_index(sample, pixel, 7, coalesced_scratch)];
+                        total -= scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            2,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_row > 0 {
-                        total += scratch
-                            [composite_scratch_index(sample, pixel - 3, 7, coalesced_scratch)];
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel - 3,
+                            2,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_row < 2 {
-                        total -= scratch
-                            [composite_scratch_index(sample, pixel + 3, 7, coalesced_scratch)];
+                        total -= scratch[composite_adjoint_index(
+                            sample,
+                            pixel + 3,
+                            2,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_row == 2 {
-                        total +=
-                            scratch[composite_scratch_index(sample, pixel, 7, coalesced_scratch)];
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            2,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                 }
             }
@@ -2615,44 +2762,126 @@ fn composite_gather_kernel(
                 let corner = code % 18;
                 let pixel = corner % 9;
                 if corner >= 9 {
-                    total += scratch[composite_scratch_index(sample, pixel, 5, coalesced_scratch)]
-                        + scratch[composite_scratch_index(sample, pixel, 9, coalesced_scratch)];
+                    if compact_cache {
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            3,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
+                    } else {
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            0,
+                            coalesced_scratch,
+                            compact_cache,
+                        )] + scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            4,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
+                    }
                 } else {
-                    total += -scratch[composite_scratch_index(sample, pixel, 5, coalesced_scratch)]
-                        + scratch[composite_scratch_index(sample, pixel, 8, coalesced_scratch)];
+                    if compact_cache {
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            0,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
+                    } else {
+                        total += -scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            0,
+                            coalesced_scratch,
+                            compact_cache,
+                        )] + scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            3,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
+                    }
                     let p_col = pixel % 3;
                     let p_row = pixel / 3;
                     if p_col == 0 {
-                        total -=
-                            scratch[composite_scratch_index(sample, pixel, 6, coalesced_scratch)];
+                        total -= scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            1,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_col > 0 {
-                        total += scratch
-                            [composite_scratch_index(sample, pixel - 1, 6, coalesced_scratch)];
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel - 1,
+                            1,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_col < 2 {
-                        total -= scratch
-                            [composite_scratch_index(sample, pixel + 1, 6, coalesced_scratch)];
+                        total -= scratch[composite_adjoint_index(
+                            sample,
+                            pixel + 1,
+                            1,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_col == 2 {
-                        total +=
-                            scratch[composite_scratch_index(sample, pixel, 6, coalesced_scratch)];
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            1,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_row == 0 {
-                        total -=
-                            scratch[composite_scratch_index(sample, pixel, 7, coalesced_scratch)];
+                        total -= scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            2,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_row > 0 {
-                        total += scratch
-                            [composite_scratch_index(sample, pixel - 3, 7, coalesced_scratch)];
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel - 3,
+                            2,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_row < 2 {
-                        total -= scratch
-                            [composite_scratch_index(sample, pixel + 3, 7, coalesced_scratch)];
+                        total -= scratch[composite_adjoint_index(
+                            sample,
+                            pixel + 3,
+                            2,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                     if p_row == 2 {
-                        total +=
-                            scratch[composite_scratch_index(sample, pixel, 7, coalesced_scratch)];
+                        total += scratch[composite_adjoint_index(
+                            sample,
+                            pixel,
+                            2,
+                            coalesced_scratch,
+                            compact_cache,
+                        )];
                     }
                 }
             }

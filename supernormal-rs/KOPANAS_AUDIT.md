@@ -106,3 +106,16 @@ The eikonal loss, finite-difference dependencies, occupancy policy, precision,
 and ray sample ordering are preserved. Atomic sum grouping can change rounding.
 No builds or tests were run; shader validation, gradient/mesh parity, speed, and
 memory behavior need to be measured by the user after rebuilding.
+
+
+## Compact compositor follow-up
+
+Default scratch now uses 63 floats per sample rather than the historical 90.
+Forward inputs are reused for four derivative outputs, and immutable SDF
+endpoints are reloaded instead of redundantly cached. Endpoint derivatives are
+precombined before gather. --legacy-composite-cache restores the old cache;
+--legacy-composite-scratch still independently controls pixel/component layout.
+See [COMPOSITOR_MEMORY_OPTIMIZATIONS.md](COMPOSITOR_MEMORY_OPTIMIZATIONS.md).
+This adapts lifetime/memory-traffic principles, not Gaussian-specific equations.
+All possible article optimizations have not been implemented; no new hardware
+profiling or parity/performance validation is claimed.

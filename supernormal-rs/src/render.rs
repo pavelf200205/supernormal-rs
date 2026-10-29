@@ -1304,6 +1304,7 @@ pub fn composite_device(
     pixel_den: f32,
     sample_den: f32,
     coalesced_scratch: bool,
+    compact_cache: bool,
     reuse_endpoints: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use crate::field::tensor;
@@ -1362,7 +1363,7 @@ pub fn composite_device(
             tensor(mapping, [count, 18], &device),
             tensor(packed, [patches.len(), 123], &device),
             Tensor::empty([1, 2], &device),
-            Tensor::empty([vis_cap, 90], &device),
+            Tensor::empty([vis_cap, if compact_cache { 63 } else { 90 }], &device),
             Tensor::empty([n, 1], &device),
             Tensor::empty([patches.len() * 9, 5], &device),
             tensor(reverse, [n, 2], &device),
@@ -1370,6 +1371,7 @@ pub fn composite_device(
         n,
         false,
         coalesced_scratch,
+        compact_cache,
         reuse_endpoints,
     );
     let stats = stats.sum_dim(0);
@@ -1402,6 +1404,7 @@ pub fn composite_device_tables(
     pixel_den: f32,
     sample_den: f32,
     coalesced_scratch: bool,
+    compact_cache: bool,
     reuse_endpoints: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use crate::field::tensor;
@@ -1443,7 +1446,7 @@ pub fn composite_device_tables(
             mapping,
             patches_tensor,
             vis_prefix,
-            Tensor::empty([vis_cap, 90], &device),
+            Tensor::empty([vis_cap, if compact_cache { 63 } else { 90 }], &device),
             Tensor::empty([n, 1], &device),
             Tensor::empty([patch_count * 9, 5], &device),
             reverse,
@@ -1451,6 +1454,7 @@ pub fn composite_device_tables(
         n,
         true,
         coalesced_scratch,
+        compact_cache,
         reuse_endpoints,
     );
     let stats = stats.sum_dim(0);

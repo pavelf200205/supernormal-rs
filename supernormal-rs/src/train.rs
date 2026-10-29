@@ -78,6 +78,10 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_composite_scratch: bool,
+    /// Restore ten-float compositor records and separate endpoint derivative loads.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_composite_cache: bool,
     #[arg(long)]
     #[serde(default)]
     pub legacy_adam_dispatch: bool,
@@ -627,6 +631,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         pixel_den,
                         sample_den,
                         !args.legacy_composite_scratch,
+                        !args.legacy_composite_cache,
                         !args.no_endpoint_reuse,
                     )
                 } else {
@@ -641,6 +646,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         pixel_den,
                         sample_den,
                         !args.legacy_composite_scratch,
+                        !args.legacy_composite_cache,
                         !args.no_endpoint_reuse,
                     )
                 };

@@ -1,5 +1,12 @@
 # SuperNormal reconstruction in Rust + Burn
 
+Latest compositor update: scratch capacity is 63 rather than 90 floats per
+sample (30% less), with consumed slots reused for four derivative outputs.
+Use `--legacy-composite-cache` to restore the previous cache and gather;
+`--legacy-composite-scratch` independently selects pixel-major layout. See
+[COMPOSITOR_MEMORY_OPTIMIZATIONS.md](COMPOSITOR_MEMORY_OPTIMIZATIONS.md) for
+traffic accounting. Rebuild and test yourself: speedup/parity are unverified.
+
 Native reconstruction for the `pure_pytorch_version` branch's `own_objects.conf` configuration. Python, CUDA, tiny-cuda-nn and nerfacc are not runtime dependencies. Development comparison scripts in `tools/` use the existing Python environment.
 
 Implemented: EXR/PNG/NPZ ingestion, camera decomposition and patch rays, progressive hash encoding, weight-normalized SDF MLP, occupancy updates, sphere marching, visibility filtering, directional finite differences, packed normal/mask integration, all three training losses, analytical renderer and MLP backward, WGPU hash-grid backward, Adam, native checkpoint/resume, and streaming marching cubes with largest-component filtering.
