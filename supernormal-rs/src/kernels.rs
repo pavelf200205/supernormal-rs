@@ -1329,6 +1329,7 @@ fn fused_field_kernel(
     #[comptime] subgroup_width: usize,
     #[comptime] selective_weights: bool,
     #[comptime] occupancy: bool,
+    #[comptime] device_ep_count: bool,
 ) {
     // CubeCL workgroup coordinates are u32; tensor/shared indices are usize.
     let mut unit = usize::cast_from(UNIT_POS);
@@ -1341,6 +1342,11 @@ fn fused_field_kernel(
     let mut n_valid = usize::cast_from(valid_n);
     if occupancy {
         n_valid = usize::cast_from(count_prefix[count_prefix.shape(0) - 1]);
+    } else if device_ep_count {
+        n_valid = usize::cast_from(count_prefix[count_prefix.shape(0) * 2 - 1]);
+        if n_valid > points.shape(0) {
+            terminate!();
+        }
     }
     // Uniform workgroup exit before any barrier, weights or point reads.
     // Occupancy uses a bounded grid; the actual workload remains device-resident.
@@ -1600,6 +1606,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             ScalarIr::UInt(subgroup_reduce),
             ScalarIr::UInt(selective_weights),
             ScalarIr::UInt(occupancy),
+            ScalarIr::UInt(device_ep_count),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid fused field arguments")
@@ -1674,6 +1681,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             subgroup_width,
             *selective_weights != 0,
             *occupancy != 0,
+            *device_ep_count != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&oy.id, output);
         handles.register_float_tensor::<CubeBackend>(&of.id, features);
@@ -1719,7 +1727,46 @@ pub fn fused_field(
         subgroup_reduce,
         selective_weights,
         false,
+        false,
     )
+}
+
+/// Evaluate visibility SDFs `[ep_cap, 1]` directly from `march_prefix` on the GPU
+/// without waiting for a host readback of `unique_ep_count`.
+pub fn fused_visibility_field(
+    inputs: [burn::tensor::Tensor<2>; 5],
+    active: usize,
+    local_hash: bool,
+    corner_parallel: bool,
+    point_tiles: usize,
+    subgroup_reduce: bool,
+    selective_weights: bool,
+) -> burn::tensor::Tensor<2> {
+    use burn::tensor::Tensor as BT;
+    let [points, tables, metadata, weights, march_prefix] = inputs;
+    let cap = points.dims()[0];
+    let device = points.device();
+    let dummy = points.clone();
+    let [sdf, _, _] = fused_field_op(
+        [points, tables, metadata, weights, march_prefix, dummy],
+        [
+            BT::empty([cap.max(1), 1], &device),
+            BT::empty([1, 31], &device),
+            BT::empty([1, 64], &device),
+        ],
+        cap,
+        active,
+        false,
+        false,
+        local_hash,
+        corner_parallel,
+        point_tiles,
+        subgroup_reduce,
+        selective_weights,
+        false,
+        true,
+    );
+    sdf
 }
 
 /// Capacity-bounded occupancy evaluation + EMA, without an SDF buffer or count readback.
@@ -1756,10 +1803,12 @@ pub fn fused_occupancy_field(
         subgroup_reduce,
         selective_weights,
         true,
+        false,
     );
     values
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fused_field_op(
     inputs: [burn::tensor::Tensor<2>; 6],
     buffers: [burn::tensor::Tensor<2>; 3],
@@ -1773,6 +1822,7 @@ fn fused_field_op(
     subgroup_reduce: bool,
     selective_weights: bool,
     occupancy: bool,
+    device_ep_count: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     let inputs: Vec<_> = inputs
         .into_iter()
@@ -1799,6 +1849,7 @@ fn fused_field_op(
             ScalarIr::UInt(subgroup_reduce as u64),
             ScalarIr::UInt(selective_weights as u64),
             ScalarIr::UInt(occupancy as u64),
+            ScalarIr::UInt(device_ep_count as u64),
         ],
     );
     let result: [_; 3] = client
@@ -2108,6 +2159,63 @@ fn composite_kernel(
     stats[ray * 5 + 4] = bias;
 }
 
+#[cube(launch)]
+fn reduce_composite_stats_kernel(
+    stats_scratch: &Tensor<f32>,
+    stats_out: &mut Tensor<f32>,
+    n_rays: u32,
+    vscale_bits: u32,
+) {
+    let unit = usize::cast_from(UNIT_POS);
+    let rays = usize::cast_from(n_rays);
+    let mut smem0 = Shared::new_slice(256usize);
+    let mut smem1 = Shared::new_slice(256usize);
+    let mut smem2 = Shared::new_slice(256usize);
+    let mut smem3 = Shared::new_slice(256usize);
+    let mut smem4 = Shared::new_slice(256usize);
+    let mut s0 = 0.0_f32;
+    let mut s1 = 0.0_f32;
+    let mut s2 = 0.0_f32;
+    let mut s3 = 0.0_f32;
+    let mut s4 = 0.0_f32;
+    let tiles = (rays + 255usize) / 256usize;
+    for t in 0..tiles {
+        let r = t * 256usize + unit;
+        if r < rays {
+            let b = r * 5usize;
+            s0 += stats_scratch[b];
+            s1 += stats_scratch[b + 1usize];
+            s2 += stats_scratch[b + 2usize];
+            s3 += stats_scratch[b + 3usize];
+            s4 += stats_scratch[b + 4usize];
+        }
+    }
+    smem0[unit] = s0;
+    smem1[unit] = s1;
+    smem2[unit] = s2;
+    smem3[unit] = s3;
+    smem4[unit] = s4;
+    sync_cube();
+    for step in 0..8usize {
+        let off = 128usize >> step;
+        if unit < off {
+            smem0[unit] += smem0[unit + off];
+            smem1[unit] += smem1[unit + off];
+            smem2[unit] += smem2[unit + off];
+            smem3[unit] += smem3[unit + off];
+            smem4[unit] += smem4[unit + off];
+        }
+        sync_cube();
+    }
+    if unit == 0usize {
+        stats_out[0] = smem0[0];
+        stats_out[1] = smem1[0];
+        stats_out[2] = smem2[0];
+        stats_out[3] = smem3[0] * f32::reinterpret(vscale_bits);
+        stats_out[4] = smem4[0];
+    }
+}
+
 #[derive(Debug)]
 struct CompositeOp {
     desc: CustomOpIr,
@@ -2117,19 +2225,20 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([s, g, i, p, vp, w, d, l, r], [od, ol]) = self.desc.as_fixed();
+        let ([s, g, i, p, vp, w, d, l, r, so], [od, oso]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(valid_points),
             ScalarIr::UInt(compact_tables),
             ScalarIr::UInt(coalesced_scratch),
             ScalarIr::UInt(compact_cache),
             ScalarIr::UInt(reuse_endpoints),
+            ScalarIr::UInt(vscale_bits),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid composite scalars")
         };
-        let [s, g, i, p, vp, w, d, l, r] =
-            [s, g, i, p, vp, w, d, l, r].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [s, g, i, p, vp, w, d, l, r, so] =
+            [s, g, i, p, vp, w, d, l, r, so].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = s.client.clone();
         let rays = (p.meta.shape().dims::<2>()[0] * 9).max(1);
         let dim_rays = CubeDim::new(&client, rays);
@@ -2167,8 +2276,17 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             *coalesced_scratch != 0,
             *compact_cache != 0,
         );
+        reduce_composite_stats_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(256),
+            l.into_tensor_arg(),
+            so.clone().into_tensor_arg(),
+            rays as u32,
+            *vscale_bits as u32,
+        );
         handles.register_float_tensor::<CubeBackend>(&od.id, d);
-        handles.register_float_tensor::<CubeBackend>(&ol.id, l);
+        handles.register_float_tensor::<CubeBackend>(&oso.id, so);
         Ok(())
     }
 }
@@ -2179,17 +2297,30 @@ pub fn composite_gpu(
     coalesced_scratch: bool,
     compact_cache: bool,
     reuse_endpoints: bool,
+    vscale: f32,
 ) -> [burn::tensor::Tensor<2>; 2] {
     assert_eq!(inputs[5].dims()[1], if compact_cache { 63 } else { 90 });
-    let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let device = inputs[0].device();
+    let stats_out = burn::tensor::Tensor::<2>::empty([1, 5], &device);
+    let inputs: Vec<_> = inputs
+        .into_iter()
+        .chain([stats_out])
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
+        .collect();
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = inputs[6..8]
-        .iter()
-        .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
+    let outputs: Vec<_> = [6usize, 9usize]
+        .into_iter()
+        .map(|i| {
+            TensorIr::uninit(
+                client.create_empty_handle(),
+                inputs[i].shape.clone(),
+                inputs[i].dtype,
+            )
+        })
         .collect();
     let desc = CustomOpIr::with_scalars(
         "supernormal_composite",
-        &inputs.map(|t| t.into_ir()),
+        &inputs.into_iter().map(|t| t.into_ir()).collect::<Vec<_>>(),
         &outputs,
         vec![
             ScalarIr::UInt(valid_points as u64),
@@ -2197,6 +2328,7 @@ pub fn composite_gpu(
             ScalarIr::UInt(coalesced_scratch as u64),
             ScalarIr::UInt(compact_cache as u64),
             ScalarIr::UInt(reuse_endpoints as u64),
+            ScalarIr::UInt(vscale.to_bits() as u64),
         ],
     );
     let result: [_; 2] = client
@@ -2675,6 +2807,29 @@ fn field_backward_kernel(
     }
 }
 
+#[cube(launch)]
+fn reduce_dw1_kernel(dw1_partials: &Tensor<f32>, dw1_out: &mut Tensor<f32>, n_rows: u32) {
+    let unit = usize::cast_from(UNIT_POS);
+    let col = unit & 63usize;
+    let sub = unit >> 6usize;
+    let rows = usize::cast_from(n_rows);
+    let mut smem = Shared::new_slice(256usize);
+    let mut acc = 0.0_f32;
+    let tiles = (rows + 3usize) / 4usize;
+    for t in 0..tiles {
+        let r = t * 4usize + sub;
+        if r < rows {
+            acc += dw1_partials[r * 64usize + col];
+        }
+    }
+    smem[unit] = acc;
+    sync_cube();
+    if sub == 0usize {
+        dw1_out[col] =
+            (smem[col] + smem[col + 64usize]) + (smem[col + 128usize] + smem[col + 192usize]);
+    }
+}
+
 #[derive(Debug)]
 struct FieldBackwardOp {
     desc: CustomOpIr,
@@ -2684,7 +2839,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([p, d, w, x, m, f, t, e, h, g], [ot, oh, og, of]) = self.desc.as_fixed();
+        let ([p, d, w, x, m, f, t, e, h, g, go], [ot, oh, og, of]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(active),
             ScalarIr::UInt(valid_n),
@@ -2703,8 +2858,9 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
         else {
             panic!("invalid backward scalars")
         };
-        let [p, d, w, x, m, f, t, e, h, g] =
-            [p, d, w, x, m, f, t, e, h, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [p, d, w, x, m, f, t, e, h, g, go] =
+            [p, d, w, x, m, f, t, e, h, g, go].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let dw1_rows = g.meta.shape().dims::<2>()[0];
         let t = if t.can_mut() {
             t
         } else {
@@ -2812,13 +2968,22 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *replay_hash != 0,
             );
         }
+        reduce_dw1_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(256),
+            g.into_tensor_arg(),
+            go.clone().into_tensor_arg(),
+            dw1_rows as u32,
+        );
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
         handles.register_float_tensor::<CubeBackend>(&oh.id, h);
-        handles.register_float_tensor::<CubeBackend>(&og.id, g);
+        handles.register_float_tensor::<CubeBackend>(&og.id, go);
         handles.register_float_tensor::<CubeBackend>(&of.id, f);
         Ok(())
     }
 }
+#[allow(clippy::too_many_arguments)]
 pub fn field_backward(
     inputs: [burn::tensor::Tensor<2>; 8],
     valid_n: usize,
@@ -2854,11 +3019,12 @@ pub fn field_backward(
         .chain([
             BT::empty([if write_dh { n } else { 1 }, 64], &device),
             BT::empty([dw1_rows, 64], &device),
+            BT::empty([1, 64], &device),
         ])
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = [6usize, 8, 9, 5]
+    let outputs: Vec<_> = [6usize, 8, 10, 5]
         .into_iter()
         .map(|i| &inputs[i])
         .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
@@ -3865,4 +4031,289 @@ pub fn cached_mlp_preactivation(
         )
         .outputs();
     BT::<2>::from_primitive::<GpuBackend>(out)
+}
+
+/// Fused single-workgroup (256-thread) MLP WeightNorm backward + 7-parameter Adam
+/// + WeightNorm forward + `packed_mlp` `[1, 2113]` transpose/pack kernel.
+/// Layout of `mlp_val` / `mlp_m` / `mlp_v` (`[2179, 1]`):
+/// - `0..1984`: `lin0.weight_v` `[64, 31]`
+/// - `1984..2048`: `lin0.weight_g` `[64, 1]`
+/// - `2048..2112`: `lin0.bias` `[1, 64]`
+/// - `2112..2176`: `lin1.weight_v` `[1, 64]`
+/// - `2176`: `lin1.weight_g` `[1, 1]`
+/// - `2177`: `lin1.bias` `[1, 1]`
+/// - `2178`: `variance` `[1, 1]`
+#[cube(launch)]
+fn fused_mlp_adam_and_pack_kernel(
+    mlp_val: &mut Tensor<f32>,
+    mlp_m: &mut Tensor<f32>,
+    mlp_v: &mut Tensor<f32>,
+    dw0: &Tensor<f32>,
+    db0: &Tensor<f32>,
+    dw1: &Tensor<f32>,
+    stats: &Tensor<f32>,
+    packed_mlp: &mut Tensor<f32>,
+    var_out: &mut Tensor<f32>,
+    bc1_bits: u32,
+    bc2_bits: u32,
+    lr_bits: u32,
+) {
+    let unit = usize::cast_from(UNIT_POS);
+    let row = unit / 4usize;
+    let sub = unit % 4usize;
+    let mut smem_norm = Shared::new_slice(256usize);
+    let mut smem_dot = Shared::new_slice(256usize);
+    let mut smem_scale = Shared::new_slice(128usize);
+    let mut smem_dg = Shared::new_slice(68usize);
+
+    // Phase 1A: Layer 0 WeightNorm backward (64 rows x 31 cols, 4 threads per row)
+    let mut n0_sq_part = 0.0_f32;
+    let mut dot0_part = 0.0_f32;
+    for k in 0..8usize {
+        let col = sub + k * 4usize;
+        if col < 31usize {
+            let idx = row * 31usize + col;
+            let v = mlp_val[idx];
+            let dw = dw0[idx];
+            n0_sq_part += v * v;
+            dot0_part += dw * v;
+        }
+    }
+    smem_norm[unit] = n0_sq_part;
+    smem_dot[unit] = dot0_part;
+    sync_cube();
+    if sub == 0usize {
+        let b = row * 4usize;
+        let n_sq = (smem_norm[b] + smem_norm[b + 1usize])
+            + (smem_norm[b + 2usize] + smem_norm[b + 3usize]);
+        let dot =
+            (smem_dot[b] + smem_dot[b + 1usize]) + (smem_dot[b + 2usize] + smem_dot[b + 3usize]);
+        let norm = f32::sqrt(n_sq);
+        let g = mlp_val[1984usize + row];
+        smem_dg[row] = dot / norm;
+        smem_scale[row] = g / norm;
+        smem_scale[64usize + row] = dot / n_sq;
+    }
+    sync_cube();
+
+    // Phase 1B: Layer 1 WeightNorm backward (1 row x 64 cols)
+    if unit < 64usize {
+        let v1 = mlp_val[2112usize + unit];
+        let dw1_c = dw1[unit];
+        smem_norm[unit] = v1 * v1;
+        smem_dot[unit] = dw1_c * v1;
+    }
+    sync_cube();
+    for s in 0..6usize {
+        let off = 32usize >> s;
+        if unit < off {
+            smem_norm[unit] += smem_norm[unit + off];
+            smem_dot[unit] += smem_dot[unit + off];
+        }
+        sync_cube();
+    }
+    if unit == 0usize {
+        let n1_sq = smem_norm[0];
+        let dot1 = smem_dot[0];
+        let norm1 = f32::sqrt(n1_sq);
+        let g1 = mlp_val[2176usize];
+        smem_dg[64usize] = dot1 / norm1;
+        smem_dg[65usize] = g1 / norm1;
+        smem_dg[66usize] = dot1 / n1_sq;
+    }
+    sync_cube();
+
+    // Phase 2: In-place Adam update across all 2,179 parameters
+    let bc1 = f32::reinterpret(bc1_bits);
+    let bc2 = f32::reinterpret(bc2_bits);
+    let lr = f32::reinterpret(lr_bits);
+    for tile in 0..9usize {
+        let idx = unit + tile * 256usize;
+        if idx < 2179usize {
+            let mut grad = stats[3usize];
+            if idx < 1984usize {
+                let r = idx / 31usize;
+                let v = mlp_val[idx];
+                let dw = dw0[idx];
+                grad = (dw - v * smem_scale[64usize + r]) * smem_scale[r];
+            } else if idx < 2048usize {
+                grad = smem_dg[idx - 1984usize];
+            } else if idx < 2112usize {
+                grad = db0[idx - 2048usize];
+            } else if idx < 2176usize {
+                let c = idx - 2112usize;
+                let v1 = mlp_val[idx];
+                let dw1_c = dw1[c];
+                grad = (dw1_c - v1 * smem_dg[66usize]) * smem_dg[65usize];
+            } else if idx == 2176usize {
+                grad = smem_dg[64usize];
+            } else if idx == 2177usize {
+                grad = stats[4usize];
+            }
+            let m_new = mlp_m[idx] * 0.9_f32 + grad * 0.1_f32;
+            let v_new = mlp_v[idx] * 0.999_f32 + grad * grad * 0.001_f32;
+            mlp_m[idx] = m_new;
+            mlp_v[idx] = v_new;
+            let m_hat = m_new / bc1;
+            let v_hat = v_new / bc2;
+            let val_new = mlp_val[idx] - (m_hat / (f32::sqrt(v_hat) + 1e-8_f32)) * lr;
+            mlp_val[idx] = val_new;
+        }
+    }
+    sync_cube();
+
+    // Phase 3: Re-normalize updated Layer 0 & Layer 1 weights and pack `[1, 2113]`
+    let mut new_n0_sq = 0.0_f32;
+    for k in 0..8usize {
+        let col = sub + k * 4usize;
+        if col < 31usize {
+            let v = mlp_val[row * 31usize + col];
+            new_n0_sq += v * v;
+        }
+    }
+    smem_norm[unit] = new_n0_sq;
+    sync_cube();
+    if sub == 0usize {
+        let b = row * 4usize;
+        let n_sq = (smem_norm[b] + smem_norm[b + 1usize])
+            + (smem_norm[b + 2usize] + smem_norm[b + 3usize]);
+        smem_scale[row] = mlp_val[1984usize + row] / f32::sqrt(n_sq);
+    }
+    sync_cube();
+
+    if unit < 64usize {
+        let v1 = mlp_val[2112usize + unit];
+        smem_norm[unit] = v1 * v1;
+    }
+    sync_cube();
+    for s in 0..6usize {
+        let off = 32usize >> s;
+        if unit < off {
+            smem_norm[unit] += smem_norm[unit + off];
+        }
+        sync_cube();
+    }
+    if unit == 0usize {
+        smem_dg[65usize] = mlp_val[2176usize] / f32::sqrt(smem_norm[0]);
+    }
+    sync_cube();
+
+    for tile in 0..8usize {
+        let idx = unit + tile * 256usize;
+        if idx < 1984usize {
+            let r = idx / 31usize;
+            let c = idx % 31usize;
+            packed_mlp[c * 64usize + r] = mlp_val[idx] * smem_scale[r];
+        }
+    }
+    if unit < 64usize {
+        packed_mlp[1984usize + unit] = mlp_val[2048usize + unit];
+        packed_mlp[2048usize + unit] = mlp_val[2112usize + unit] * smem_dg[65usize];
+    }
+    if unit == 0usize {
+        packed_mlp[2112usize] = mlp_val[2177usize];
+        var_out[0] = mlp_val[2178usize];
+    }
+}
+
+#[derive(Debug)]
+struct FusedMlpAdamAndPackOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for FusedMlpAdamAndPackOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([val, m, v, dw0, db0, dw1, st, pm, vo], [oval, om, ov, opm, ovo]) =
+            self.desc.as_fixed();
+        let [
+            ScalarIr::UInt(bc1_bits),
+            ScalarIr::UInt(bc2_bits),
+            ScalarIr::UInt(lr_bits),
+        ] = self.desc.scalars.as_slice()
+        else {
+            panic!("invalid fused_mlp_adam_and_pack scalars")
+        };
+        let [val, m, v, dw0, db0, dw1, st, pm, vo] =
+            [val, m, v, dw0, db0, dw1, st, pm, vo]
+                .map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let val = if val.can_mut() { val } else { val.copy() };
+        let m = if m.can_mut() { m } else { m.copy() };
+        let v = if v.can_mut() { v } else { v.copy() };
+        let client = val.client.clone();
+        let _timing = crate::diagnostics::start(&client, "mlp_adam_and_pack");
+        fused_mlp_adam_and_pack_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(256),
+            val.clone().into_tensor_arg(),
+            m.clone().into_tensor_arg(),
+            v.clone().into_tensor_arg(),
+            dw0.into_tensor_arg(),
+            db0.into_tensor_arg(),
+            dw1.into_tensor_arg(),
+            st.into_tensor_arg(),
+            pm.clone().into_tensor_arg(),
+            vo.clone().into_tensor_arg(),
+            *bc1_bits as u32,
+            *bc2_bits as u32,
+            *lr_bits as u32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&oval.id, val);
+        handles.register_float_tensor::<CubeBackend>(&om.id, m);
+        handles.register_float_tensor::<CubeBackend>(&ov.id, v);
+        handles.register_float_tensor::<CubeBackend>(&opm.id, pm);
+        handles.register_float_tensor::<CubeBackend>(&ovo.id, vo);
+        Ok(())
+    }
+}
+#[allow(clippy::too_many_arguments)]
+pub fn fused_mlp_adam_and_pack(
+    mlp_val: burn::tensor::Tensor<2>,
+    mlp_m: burn::tensor::Tensor<2>,
+    mlp_v: burn::tensor::Tensor<2>,
+    dw0: burn::tensor::Tensor<2>,
+    db0: burn::tensor::Tensor<2>,
+    dw1: burn::tensor::Tensor<2>,
+    stats: burn::tensor::Tensor<2>,
+    bc1: f32,
+    bc2: f32,
+    lr: f32,
+) -> [burn::tensor::Tensor<2>; 5] {
+    use burn::tensor::Tensor as BT;
+    let device = mlp_val.device();
+    let pm_buf = BT::empty([1, 2113], &device);
+    let vo_buf = BT::empty([1, 1], &device);
+    let inputs = [mlp_val, mlp_m, mlp_v, dw0, db0, dw1, stats, pm_buf, vo_buf]
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let outputs: Vec<_> = [0usize, 1, 2, 7, 8]
+        .into_iter()
+        .map(|i| {
+            TensorIr::uninit(
+                client.create_empty_handle(),
+                inputs[i].shape.clone(),
+                inputs[i].dtype,
+            )
+        })
+        .collect();
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_fused_mlp_adam_and_pack",
+        &inputs.map(|t| t.into_ir()),
+        &outputs,
+        vec![
+            ScalarIr::UInt(bc1.to_bits() as u64),
+            ScalarIr::UInt(bc2.to_bits() as u64),
+            ScalarIr::UInt(lr.to_bits() as u64),
+        ],
+    );
+    let result: [_; 5] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            FusedMlpAdamAndPackOp { desc },
+        )
+        .outputs();
+    result.map(BT::<2>::from_primitive::<GpuBackend>)
 }

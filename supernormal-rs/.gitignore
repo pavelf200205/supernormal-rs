@@ -1,5 +1,6 @@
 /target/
 /experiments/
+/experiments_no_checkpoints_no_meshes/
 /runs/
 /dist/
 __pycache__/
