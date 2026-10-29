@@ -45,6 +45,10 @@ pub struct Field {
     pub corner_parallel: bool,
     pub aggregate_hash: bool,
     pub level_adam: bool,
+    pub skip_untouched_adam: bool,
+    pub direct_adjoint_views: bool,
+    pub active_parameter_columns: bool,
+    pub selective_backward_weights: bool,
     pub point_tiles: usize,
     pub subgroup_reduce: bool,
     pub aggregation_levels: usize,
@@ -325,6 +329,10 @@ impl Field {
             corner_parallel: true,
             aggregate_hash: true,
             level_adam: true,
+            skip_untouched_adam: true,
+            direct_adjoint_views: true,
+            active_parameter_columns: true,
+            selective_backward_weights: true,
             point_tiles: 1,
             subgroup_reduce: true,
             aggregation_levels: 14,
@@ -421,6 +429,10 @@ impl Field {
             corner_parallel: true,
             aggregate_hash: true,
             level_adam: true,
+            skip_untouched_adam: true,
+            direct_adjoint_views: true,
+            active_parameter_columns: true,
+            selective_backward_weights: true,
             point_tiles: 1,
             subgroup_reduce: true,
             aggregation_levels: 14,
@@ -1209,13 +1221,37 @@ impl Field {
             let n = chunk.point_count;
             crate::diagnostics::count("field.backward_points", n);
             let padded_n = chunk.padded_count;
-            let mut ds_tensor = if single_chunk && adjoints.dims()[0] == n {
+            // The default fused training kernel can address its chunk inside
+            // the shared global adjoint buffer. Reference/recompute/bias paths
+            // still receive a local slice with their existing semantics.
+            let direct_adjoints = self.direct_adjoint_views
+                && self.fused_field
+                && !need_bias
+                && !self.recompute_parameter_gradients;
+            let adjoint_offset = if direct_adjoints { offset } else { 0 };
+            let mut ds_tensor = if direct_adjoints || (single_chunk && adjoints.dims()[0] == n) {
                 adjoints.clone()
             } else {
                 adjoints.clone().slice([offset..offset + n, 0..1])
             };
             offset += n;
-            crate::diagnostics::sample_addresses(&chunk.pts_tensor, &ds_tensor, n, active_levels);
+            if crate::diagnostics::enabled() {
+                // Address diagnostics inspect chunk-local adjoints. This debug
+                // slice does not replace the direct buffer used by backward.
+                let sampled_ds = if direct_adjoints {
+                    ds_tensor
+                        .clone()
+                        .slice([adjoint_offset..adjoint_offset + n, 0..1])
+                } else {
+                    ds_tensor.clone()
+                };
+                crate::diagnostics::sample_addresses(
+                    &chunk.pts_tensor,
+                    &sampled_ds,
+                    n,
+                    active_levels,
+                );
+            }
 
             let mut replay_features = false;
             let (feat, preactivation) = match (chunk.feat, chunk.preactivation) {
@@ -1290,6 +1326,8 @@ impl Field {
                     self.cross_corners,
                     !recompute,
                     replay_features,
+                    adjoint_offset,
+                    self.selective_backward_weights,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
                 (
@@ -1343,6 +1381,11 @@ impl Field {
                         n,
                         self.wide_gradient_tiles,
                         self.register_gradient_tiles,
+                        if self.fused_field && self.active_parameter_columns {
+                            3 + 2 * active_levels
+                        } else {
+                            31
+                        },
                     )
                 }
             } else {
@@ -1467,6 +1510,7 @@ impl Field {
                         .max()
                         .unwrap(),
                     self.level_adam,
+                    self.skip_untouched_adam,
                 );
                 self.packed_embedding = Some(Parameter {
                     value,

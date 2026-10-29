@@ -1,5 +1,12 @@
 # SuperNormal reconstruction in Rust + Burn
 
+Latest training update: zero-state hash Adam, active-column parameter gradients,
+direct chunk adjoints, and selective backward weight staging are on by default.
+Independent fallback flags: `--dense-hash-adam`, `--dense-parameter-gradients`,
+`--legacy-adjoint-slicing`, and `--dense-backward-weight-loads`. See
+[TRAINING_TRAFFIC_UPGRADES.md](TRAINING_TRAFFIC_UPGRADES.md) for semantics and
+tradeoffs. Rebuild and test yourself; no new speedup/parity measurements yet.
+
 Latest compositor update: scratch capacity is 63 rather than 90 floats per
 sample (30% less), with consumed slots reused for four derivative outputs.
 Use `--legacy-composite-cache` to restore the previous cache and gather;

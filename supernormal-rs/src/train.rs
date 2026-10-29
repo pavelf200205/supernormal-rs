@@ -85,6 +85,22 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_adam_dispatch: bool,
+    /// Update/write every active hash entry, including entirely zero Adam state.
+    #[arg(long)]
+    #[serde(default)]
+    pub dense_hash_adam: bool,
+    /// Restore per-query adjoint slice/copy operations in fused training backward.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_adjoint_slicing: bool,
+    /// Compute first-layer gradients for all 31 features before levels activate.
+    #[arg(long)]
+    #[serde(default)]
+    pub dense_parameter_gradients: bool,
+    /// Stage all packed MLP weights in backward, including unused columns/bias.
+    #[arg(long)]
+    #[serde(default)]
+    pub dense_backward_weight_loads: bool,
     #[arg(long)]
     #[serde(default)]
     pub no_endpoint_reuse: bool,
@@ -370,6 +386,10 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.cross_corners = args.hash_aggregation_cross_corners;
     field.recompute_parameter_gradients = args.recompute_parameter_gradients;
     field.level_adam = !args.legacy_adam_dispatch;
+    field.skip_untouched_adam = !args.dense_hash_adam;
+    field.direct_adjoint_views = !args.legacy_adjoint_slicing;
+    field.active_parameter_columns = !args.dense_parameter_gradients;
+    field.selective_backward_weights = !args.dense_backward_weight_loads;
     field.reuse_endpoints = !args.no_endpoint_reuse;
     field.feature_only_cache = !args.legacy_activation_cache;
     field.fused_feature_replay = !args.legacy_feature_replay;

@@ -359,6 +359,7 @@ fn packed_adam_kernel(
     corrections: &Tensor<f32>,
     active_elems: u32,
     #[comptime] level_dispatch: bool,
+    #[comptime] skip_untouched: bool,
 ) {
     let mut index = ABSOLUTE_POS;
     let mut level = 0usize;
@@ -384,12 +385,21 @@ fn packed_adam_kernel(
             }
         }
     }
+    let g = gradient[index];
+    let old_m = first[index];
+    let old_v = second[index];
+    // A zero gradient alone is not enough: historical moments must still
+    // decay and move the parameter. Only an entirely zero Adam state is idle.
+    if skip_untouched && g == 0.0_f32 && old_m == 0.0_f32 && old_v == 0.0_f32 {
+        terminate!();
+    }
+    if !skip_untouched || g != 0.0_f32 {
+        gradient[index] = 0.0_f32;
+    }
     let step_scale = corrections[level * 3 + 1];
     let inv_bc2_sqrt = corrections[level * 3 + 2];
-    let g = gradient[index];
-    gradient[index] = 0.0_f32;
-    let m = first[index] * 0.9 + g * 0.1;
-    let v = second[index] * 0.999 + g * g * 0.001;
+    let m = old_m * 0.9 + g * 0.1;
+    let v = old_v * 0.999 + g * g * 0.001;
     value[index] = value[index] - m * step_scale / (f32::sqrt(v) * inv_bc2_sqrt + 1e-8);
     first[index] = m;
     second[index] = v;
@@ -410,6 +420,7 @@ impl Operation<FusionCubeRuntime> for PackedAdamOp {
             ScalarIr::UInt(active_rows),
             ScalarIr::UInt(max_level_rows),
             ScalarIr::UInt(level_dispatch),
+            ScalarIr::UInt(skip_untouched),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("Invalid scalar arguments for packed_adam")
@@ -485,6 +496,7 @@ impl Operation<FusionCubeRuntime> for PackedAdamOp {
             corrections.into_tensor_arg(),
             n as u32,
             *level_dispatch != 0,
+            *skip_untouched != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&ov_ir.id, value);
         handles.register_float_tensor::<CubeBackend>(&om_ir.id, first);
@@ -503,6 +515,7 @@ pub fn adam_packed(
     active_rows: usize,
     max_level_rows: usize,
     level_dispatch: bool,
+    skip_untouched: bool,
 ) -> [burn::tensor::Tensor<2>; 4] {
     let [v, m, s, g, c] = [value, first, second, gradient, corrections]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
@@ -523,6 +536,7 @@ pub fn adam_packed(
             ScalarIr::UInt(active_rows as u64),
             ScalarIr::UInt(max_level_rows as u64),
             ScalarIr::UInt(level_dispatch as u64),
+            ScalarIr::UInt(skip_untouched as u64),
         ],
     );
     let result: [_; 4] = client
@@ -2014,6 +2028,7 @@ fn field_backward_kernel(
     active: u32,
     valid_n: u32,
     aggregation_levels: u32,
+    adjoint_offset: u32,
     #[comptime] local_hash: bool,
     #[comptime] compact_gradients: bool,
     #[comptime] corner_parallel: bool,
@@ -2021,18 +2036,31 @@ fn field_backward_kernel(
     #[comptime] cross_corners: bool,
     #[comptime] write_dh: bool,
     #[comptime] replay_features: bool,
+    #[comptime] selective_weights: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
     for tile in 0..9usize {
         let index = unit + tile * 256;
         if index < 2113 {
-            let target = if local_hash && index < 1984 {
-                (index % 64) * 31 + index / 64
-            } else {
-                index
-            };
-            shared_weights[target] = weights[index];
+            let mut needed = false;
+            if index < 1984 {
+                let column = index / 64;
+                needed =
+                    column < 3 + usize::cast_from(active) * 2 && (replay_features || column >= 3);
+            } else if index < 2048 {
+                needed = replay_features;
+            } else if index < 2112 {
+                needed = true;
+            }
+            if !selective_weights || needed {
+                let target = if local_hash && index < 1984 {
+                    (index % 64) * 31 + index / 64
+                } else {
+                    index
+                };
+                shared_weights[target] = weights[index];
+            }
         }
     }
     let lane = unit % 64;
@@ -2071,7 +2099,7 @@ fn field_backward_kernel(
     let mut v = 0.0_f32;
     let mut ds_val = 0.0_f32;
     if point < n_valid {
-        ds_val = ds[point];
+        ds_val = ds[(point + usize::cast_from(adjoint_offset)) * ds.stride(0)];
         if ds_val != 0.0_f32 {
             let mut h = 0.0_f32;
             if replay_features {
@@ -2437,6 +2465,8 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
             ScalarIr::UInt(cross_corners),
             ScalarIr::UInt(write_dh),
             ScalarIr::UInt(replay_features),
+            ScalarIr::UInt(adjoint_offset),
+            ScalarIr::UInt(selective_weights),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid backward scalars")
@@ -2503,6 +2533,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *active as u32,
                 *valid_n as u32,
                 *aggregation_levels as u32,
+                *adjoint_offset as u32,
                 *local_hash != 0,
                 *compact_gradients != 0,
                 *corner_parallel != 0,
@@ -2510,6 +2541,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *cross_corners != 0,
                 *write_dh != 0,
                 *replay_features != 0,
+                *selective_weights != 0,
             );
         } else {
             field_backward_kernel::launch(
@@ -2528,6 +2560,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *active as u32,
                 *valid_n as u32,
                 *aggregation_levels as u32,
+                *adjoint_offset as u32,
                 *local_hash != 0,
                 *compact_gradients != 0,
                 *corner_parallel != 0,
@@ -2535,6 +2568,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
                 *cross_corners != 0,
                 *write_dh != 0,
                 *replay_features != 0,
+                *selective_weights != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
@@ -2555,8 +2589,14 @@ pub fn field_backward(
     cross_corners: bool,
     write_dh: bool,
     replay_features: bool,
+    adjoint_offset: usize,
+    selective_weights: bool,
 ) -> [burn::tensor::Tensor<2>; 3] {
     use burn::tensor::Tensor as BT;
+    assert!(
+        adjoint_offset <= inputs[1].dims()[0] && valid_n <= inputs[1].dims()[0] - adjoint_offset
+    );
+    assert!(adjoint_offset <= u32::MAX as usize);
     let n = inputs[0].dims()[0];
     let device = inputs[0].device();
     let dw1_rows = if compact_gradients {
@@ -2592,6 +2632,8 @@ pub fn field_backward(
             ScalarIr::UInt(cross_corners as u64),
             ScalarIr::UInt(write_dh as u64),
             ScalarIr::UInt(replay_features as u64),
+            ScalarIr::UInt(adjoint_offset as u64),
+            ScalarIr::UInt(selective_weights as u64),
         ],
     );
     let result: [_; 3] = client
@@ -3026,6 +3068,7 @@ fn field_backward_native_kernel(
     active: u32,
     valid_n: u32,
     aggregation_levels: u32,
+    adjoint_offset: u32,
     #[comptime] local_hash: bool,
     #[comptime] compact_gradients: bool,
     #[comptime] corner_parallel: bool,
@@ -3033,18 +3076,31 @@ fn field_backward_native_kernel(
     #[comptime] cross_corners: bool,
     #[comptime] write_dh: bool,
     #[comptime] replay_features: bool,
+    #[comptime] selective_weights: bool,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let mut shared_weights = Shared::new_slice(2113usize);
     for tile in 0..9usize {
         let index = unit + tile * 256;
         if index < 2113 {
-            let target = if local_hash && index < 1984 {
-                (index % 64) * 31 + index / 64
-            } else {
-                index
-            };
-            shared_weights[target] = weights[index];
+            let mut needed = false;
+            if index < 1984 {
+                let column = index / 64;
+                needed =
+                    column < 3 + usize::cast_from(active) * 2 && (replay_features || column >= 3);
+            } else if index < 2048 {
+                needed = replay_features;
+            } else if index < 2112 {
+                needed = true;
+            }
+            if !selective_weights || needed {
+                let target = if local_hash && index < 1984 {
+                    (index % 64) * 31 + index / 64
+                } else {
+                    index
+                };
+                shared_weights[target] = weights[index];
+            }
         }
     }
     let lane = unit % 64;
@@ -3083,7 +3139,7 @@ fn field_backward_native_kernel(
     let mut v = 0.0_f32;
     let mut ds_val = 0.0_f32;
     if point < n_valid {
-        ds_val = ds[point];
+        ds_val = ds[(point + usize::cast_from(adjoint_offset)) * ds.stride(0)];
         if ds_val != 0.0_f32 {
             let mut h = 0.0_f32;
             if replay_features {

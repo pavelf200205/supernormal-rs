@@ -1221,6 +1221,7 @@ fn parameter_register_kernel(
     features: &Tensor<f32>,
     partials: &mut Tensor<f32>,
     valid_rows: u32,
+    active_columns: u32,
 ) {
     let unit = usize::cast_from(UNIT_POS);
     let row_base = usize::cast_from(CUBE_POS_X) * 16;
@@ -1228,6 +1229,11 @@ fn parameter_register_kernel(
     let row = unit / 16;
     let col = unit % 16;
     let valid_n = usize::cast_from(valid_rows);
+    let active_cols = usize::cast_from(active_columns);
+    // Pack active input features followed by bias into the left of the tile.
+    // This avoids executing a second half-tile just to process column-31 bias.
+    let first_active = col <= active_cols;
+    let second_active = col + 16 <= active_cols;
     let mut hs = Shared::new_slice(512usize);
     let mut xs = Shared::new_slice(1024usize);
     let mut sum00 = 0.0_f32;
@@ -1252,24 +1258,38 @@ fn parameter_register_kernel(
             let feature = index % 32;
             let mut x = 0.0_f32;
             if sample < valid_n {
-                if feature == 31 {
+                if feature == active_cols {
                     x = 1.0_f32;
-                } else {
+                } else if feature < active_cols {
                     x = features[sample * features.stride(0) + feature * features.stride(1)];
                 }
             }
             xs[index] = x;
         }
         sync_cube();
-        for j in 0..32usize {
-            let h0 = hs[j * 16 + row];
-            let h1 = hs[j * 16 + row + 8];
-            let x0 = xs[j * 32 + col];
-            let x1 = xs[j * 32 + col + 16];
-            sum00 += h0 * x0;
-            sum01 += h0 * x1;
-            sum10 += h1 * x0;
-            sum11 += h1 * x1;
+        if first_active && second_active {
+            for j in 0..32usize {
+                let h0 = hs[j * 16 + row];
+                let h1 = hs[j * 16 + row + 8];
+                let x0 = xs[j * 32 + col];
+                let x1 = xs[j * 32 + col + 16];
+                sum00 += h0 * x0;
+                sum01 += h0 * x1;
+                sum10 += h1 * x0;
+                sum11 += h1 * x1;
+            }
+        } else if first_active {
+            for j in 0..32usize {
+                let x = xs[j * 32 + col];
+                sum00 += hs[j * 16 + row] * x;
+                sum10 += hs[j * 16 + row + 8] * x;
+            }
+        } else if second_active {
+            for j in 0..32usize {
+                let x = xs[j * 32 + col + 16];
+                sum01 += hs[j * 16 + row] * x;
+                sum11 += hs[j * 16 + row + 8] * x;
+            }
         }
         // No next tile overwrites shared storage after the final block;
         // each thread writes only its own output accumulators below.
@@ -1277,11 +1297,34 @@ fn parameter_register_kernel(
             sync_cube();
         }
     }
-    let first = part * 2048 + (row_base + row) * 32 + col;
-    partials[first] = sum00;
-    partials[first + 16] = sum01;
-    partials[first + 256] = sum10;
-    partials[first + 272] = sum11;
+    let row0 = part * 2048 + (row_base + row) * 32;
+    let row1 = row0 + 256;
+    // Every inactive dense output has a unique zero writer. Active/bias
+    // locations are excluded, so remapped bias stores cannot race with zeroes.
+    if col >= active_cols && col != 31 {
+        partials[row0 + col] = 0.0_f32;
+        partials[row1 + col] = 0.0_f32;
+    }
+    if col + 16 >= active_cols && col + 16 != 31 {
+        partials[row0 + col + 16] = 0.0_f32;
+        partials[row1 + col + 16] = 0.0_f32;
+    }
+    if first_active {
+        let mut output_col = col;
+        if col == active_cols {
+            output_col = 31usize;
+        }
+        partials[row0 + output_col] = sum00;
+        partials[row1 + output_col] = sum10;
+    }
+    if second_active {
+        let mut output_col = col + 16;
+        if col + 16 == active_cols {
+            output_col = 31usize;
+        }
+        partials[row0 + output_col] = sum01;
+        partials[row1 + output_col] = sum11;
+    }
 }
 
 #[derive(Debug)]
@@ -1301,6 +1344,7 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
             ScalarIr::UInt(valid_rows),
             ScalarIr::UInt(recompute),
             ScalarIr::UInt(register_tiles),
+            ScalarIr::UInt(active_columns),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid parameter-gradient arguments")
@@ -1318,6 +1362,7 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
                 f.into_tensor_arg(),
                 p.clone().into_tensor_arg(),
                 *valid_rows as u32,
+                *active_columns as u32,
             );
         } else {
             parameter_kernel::launch(
@@ -1345,6 +1390,7 @@ pub fn parameter_gradients(
     valid_rows: usize,
     wide: bool,
     register_tiles: bool,
+    active_columns: usize,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     parameter_gradients_impl(
         dh.clone(),
@@ -1355,6 +1401,7 @@ pub fn parameter_gradients(
         valid_rows,
         wide,
         register_tiles,
+        active_columns,
         false,
     )
 }
@@ -1377,6 +1424,7 @@ pub fn parameter_gradients_recompute(
         valid_rows,
         wide,
         register_tiles,
+        31,
         true,
     )
 }
@@ -1390,9 +1438,11 @@ fn parameter_gradients_impl(
     valid_rows: usize,
     wide: bool,
     register_tiles: bool,
+    active_columns: usize,
     recompute: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use burn::tensor::Tensor;
+    assert!(active_columns <= 31);
     let parts = valid_rows.div_ceil(256).max(1);
     assert!(parts <= 65535, "parameter-gradient query too large");
     // Use uninitialized output allocation instead of zero-filling before full overwrite.
@@ -1414,6 +1464,7 @@ fn parameter_gradients_impl(
             ScalarIr::UInt(valid_rows as u64),
             ScalarIr::UInt(recompute as u64),
             ScalarIr::UInt(register_tiles as u64),
+            ScalarIr::UInt(active_columns as u64),
         ],
     );
     let [out] = client
