@@ -1,5 +1,9 @@
 # Run 7 comparison and follow-up
 
+The follow-up implementation below produced a correctness regression in run 8.
+Its defaults and normalization kernel have been superseded; see
+[RUN8_ANALYSIS.md](RUN8_ANALYSIS.md) for current behavior and limitations.
+
 Sources: `experiments/after_george_kopanas_upgrades6` and
 `experiments/after_george_kopanas_upgrades7`, using each run's `metrics.csv`,
 `config.json`, and `wall_time.json`. Both completed 30,000 iterations with

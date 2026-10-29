@@ -96,11 +96,15 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub legacy_parameter_kernel: bool,
-    /// Leave spare feature-cache capacity unused instead of caching preactivations.
+    /// Experimental: fill spare feature-cache capacity with full preactivations.
+    #[arg(long, conflicts_with = "no_hybrid_cache")]
+    #[serde(default)]
+    pub hybrid_activation_cache: bool,
+    /// Explicitly disable experimental hybrid caching (already off by default).
     #[arg(long)]
     #[serde(default)]
     pub no_hybrid_cache: bool,
-    /// Normalize, transpose and concatenate packed MLP weights with Burn operations.
+    /// Use Burn transpose and concatenation instead of direct packing of normalized weights.
     #[arg(long)]
     #[serde(default)]
     pub legacy_mlp_packing: bool,
@@ -366,7 +370,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.feature_only_cache = !args.legacy_activation_cache;
     field.fused_feature_replay = !args.legacy_feature_replay;
     field.register_gradient_tiles = !args.legacy_parameter_kernel;
-    field.hybrid_activation_cache = !args.no_hybrid_cache;
+    field.hybrid_activation_cache = args.hybrid_activation_cache && !args.no_hybrid_cache;
     field.fused_mlp_packing = !args.legacy_mlp_packing;
     field.chunked_eval = args.chunked_eval;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);

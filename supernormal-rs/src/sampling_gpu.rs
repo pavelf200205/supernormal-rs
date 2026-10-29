@@ -1203,7 +1203,11 @@ fn parameter_kernel(
         for j in 0..32usize {
             sum += hs[j * 8 + row] * xs[j * tile_cols + col];
         }
-        sync_cube();
+        // No next tile overwrites shared storage after the final block;
+        // each thread writes only its own output accumulators below.
+        if block < 7usize {
+            sync_cube();
+        }
     }
     partials[part * 2048 + (row_base + row) * 32 + col_base + col] = sum;
 }
@@ -1267,7 +1271,11 @@ fn parameter_register_kernel(
             sum10 += h1 * x0;
             sum11 += h1 * x1;
         }
-        sync_cube();
+        // No next tile overwrites shared storage after the final block;
+        // each thread writes only its own output accumulators below.
+        if block < 7usize {
+            sync_cube();
+        }
     }
     let first = part * 2048 + (row_base + row) * 32 + col;
     partials[first] = sum00;

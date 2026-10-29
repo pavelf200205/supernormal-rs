@@ -496,7 +496,10 @@ for this update. Sampling, loss and mesh extraction settings remain unchanged.
 
 ### Hybrid cache and fused MLP weight preparation
 
-Enabled by default. After retaining feature chunks within the existing cache
+Hybrid caching is **experimental and off by default** following the run-8
+correctness regression. Opt in with `--hybrid-activation-cache` only for isolated
+comparisons; `--no-hybrid-cache` remains accepted. These flags conflict.
+After retaining feature chunks within the existing cache
 budget, unused bytes now retain preactivations for some of those same chunks.
 This avoids first-layer replay without reducing feature coverage. For four
 full query-131072 chunks, the planner retains all four feature chunks and two
@@ -504,20 +507,23 @@ preactivation chunks (126 MiB within the existing 142.5 MiB ceiling). Padded
 tail shapes and the legacy replay workspace are accounted for. Pooling may
 still affect observed driver VRAM.
 
-The fused field now prepares its packed weights with one GPU kernel that
-normalizes rows and writes the input-major layout directly. This replaces
-separate effective-weight, transpose and concatenation operations. Packed
-weights are still cached until the next optimizer update. The normalization
-formula is unchanged, but reduction grouping may introduce small floating-point
-differences, including during mesh inference.
+The default fused field now uses the established Burn weight normalization,
+then packs those values and biases directly with a copy-only tiled transpose
+kernel. The run-8 custom normalization kernel has been removed. Packing performs
+no floating-point weight arithmetic and avoids separate transpose/concatenation
+outputs. Packed weights remain cached until the next optimizer update.
 
-For comparisons, `--no-hybrid-cache` restores run 7's feature-only cache policy;
-`--legacy-mlp-packing` restores the Burn packing operations. These are independent
-of earlier fallback flags. Diagnostics add a `pack_mlp_weights` timing window and
+For comparisons, `--legacy-mlp-packing` restores all run-7 Burn packing operations.
+With hybrid caching off, this restores the established cache/packing paths.
+Diagnostics provide a `pack_mlp_weights` timing window and
 the cumulative `field.retained_activation_bytes` counter for feature-cache
 batches; this counter is not a peak-memory measurement.
 
-See [RUN7_ANALYSIS.md](RUN7_ANALYSIS.md) for run measurements and limitations.
-Rebuild and test the same command with a fresh output directory. No builds,
-tests or GPU runs were performed for this update; new gains and numerical
-parity require measurement.
+Both parameter-gradient kernels also omit the final shared-memory barrier
+after their last sample block, when storage will no longer be reused.
+
+See [RUN8_ANALYSIS.md](RUN8_ANALYSIS.md) for the regression evidence and current
+mitigation. Rebuild and validate short training from scratch or a known-good
+checkpoint before a full comparison; run-8 checkpoints contain failed training.
+No builds, tests or GPU runs were performed for this update. Correctness recovery,
+speed and memory use still require measurement.

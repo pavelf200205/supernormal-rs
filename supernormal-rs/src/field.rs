@@ -335,7 +335,7 @@ impl Field {
             feature_only_cache: true,
             fused_feature_replay: true,
             register_gradient_tiles: true,
-            hybrid_activation_cache: true,
+            hybrid_activation_cache: false,
             fused_mlp_packing: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
@@ -431,7 +431,7 @@ impl Field {
             feature_only_cache: true,
             fused_feature_replay: true,
             register_gradient_tiles: true,
-            hybrid_activation_cache: true,
+            hybrid_activation_cache: false,
             fused_mlp_packing: true,
             packed_mlp: std::cell::RefCell::new(None),
             inference_weights: std::cell::RefCell::new(None),
@@ -900,11 +900,9 @@ impl Field {
         if self.packed_mlp.borrow().is_none() {
             let weights = if self.fused_mlp_packing {
                 crate::kernels::pack_mlp_weights([
-                    self.p("lin0.weight_v").without_autodiff(),
-                    self.p("lin0.weight_g").without_autodiff(),
+                    self.effective_weight(0, false),
                     self.p("lin0.bias").without_autodiff(),
-                    self.p("lin1.weight_v").without_autodiff(),
-                    self.p("lin1.weight_g").without_autodiff(),
+                    self.effective_weight(1, false),
                     self.p("lin1.bias").without_autodiff(),
                 ])
             } else {
@@ -1008,50 +1006,34 @@ impl Field {
                 .unwrap_or(0)
         };
         let feature_budget = budget.saturating_sub(pre_workspace);
-        // First maximize hash-feature coverage, then spend spare bytes on
-        // preactivations. This avoids replay without sacrificing retained
-        // feature chunks or raising the old cache budget.
-        let mut feature_retained = 0usize;
-        let keep_features: Vec<bool> = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, (_, points))| {
-                if !feature_only {
-                    return index < MAX_CACHED_CHUNKS;
-                }
-                let cost = bytes(points.dims()[0], 31);
-                let keep = cost <= feature_budget.saturating_sub(feature_retained);
-                if keep {
-                    feature_retained += cost;
-                }
-                keep
-            })
-            .collect();
-        let mut spare = feature_budget.saturating_sub(feature_retained);
-        let keep_preactivations: Vec<bool> = inputs
-            .iter()
-            .zip(&keep_features)
-            .map(|((_, points), &keep)| {
-                if !feature_only {
-                    return keep;
-                }
-                if !self.hybrid_activation_cache || !keep {
-                    return false;
-                }
+        // The established/default cache path does not need planning vectors.
+        // Only the opt-in hybrid path computes a two-pass storage plan.
+        let hybrid_plan = if feature_only && self.hybrid_activation_cache {
+            let mut used = 0usize;
+            let mut plan: Vec<(bool, bool)> = inputs
+                .iter()
+                .map(|(_, points)| {
+                    let cost = bytes(points.dims()[0], 31);
+                    let keep = cost <= feature_budget.saturating_sub(used);
+                    if keep {
+                        used += cost;
+                    }
+                    (keep, false)
+                })
+                .collect();
+            let mut spare = feature_budget.saturating_sub(used);
+            for ((_, points), (keep, cache_pre)) in inputs.iter().zip(&mut plan) {
                 let cost = bytes(points.dims()[0], 64);
-                if cost > spare {
-                    return false;
+                if *keep && cost <= spare {
+                    *cache_pre = true;
+                    spare -= cost;
                 }
-                spare -= cost;
-                true
-            })
-            .collect();
-        if feature_only {
-            crate::diagnostics::count(
-                "field.retained_activation_bytes",
-                feature_budget.saturating_sub(spare),
-            );
-        }
+            }
+            Some(plan)
+        } else {
+            None
+        };
+        let mut retained_bytes = 0usize;
         if feature_only {
             crate::diagnostics::count("field.feature_only_batches", 1);
         }
@@ -1072,8 +1054,20 @@ impl Field {
             crate::diagnostics::count("field.cached_forward_points", n);
             crate::diagnostics::count("field.cached_capacity_points", padded_n);
             if self.fused_field {
-                let keep_cache = keep_features[chunk_idx];
-                let cache_pre = keep_preactivations[chunk_idx];
+                let (keep_cache, cache_pre) = if let Some(plan) = &hybrid_plan {
+                    plan[chunk_idx]
+                } else if feature_only {
+                    (
+                        bytes(padded_n, 31) <= feature_budget.saturating_sub(retained_bytes),
+                        false,
+                    )
+                } else {
+                    let keep = chunk_idx < MAX_CACHED_CHUNKS;
+                    (keep, keep)
+                };
+                if keep_cache {
+                    retained_bytes += bytes(padded_n, if cache_pre { 95 } else { 31 });
+                }
                 let [y, feat, preactivation] =
                     self.fused_forward_cache_valid(pts_tensor.clone(), n, keep_cache, cache_pre);
                 if keep_cache {
@@ -1111,6 +1105,9 @@ impl Field {
             }
         }
 
+        if feature_only {
+            crate::diagnostics::count("field.retained_activation_bytes", retained_bytes);
+        }
         PendingEvaluation {
             outputs: pending_outputs,
             cache: chunks,
