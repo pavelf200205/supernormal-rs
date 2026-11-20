@@ -13,6 +13,24 @@ pub struct ParameterMeta {
 fn default_scale_cutoff() -> f32 {
     0.45
 }
+fn default_base_resolution() -> usize {
+    32
+}
+fn default_max_resolution() -> usize {
+    1175
+}
+fn default_log2_hashmap_size() -> u32 {
+    19
+}
+
+pub fn hash_level_resolution(base_res: usize, max_res: usize, level: usize) -> usize {
+    if base_res == 32 && max_res == 1175 {
+        (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as usize
+    } else {
+        let growth = (max_res as f64 / base_res as f64).powf(1.0 / 13.0);
+        (base_res as f64 * growth.powi(level as i32)).floor() as usize
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
@@ -24,6 +42,12 @@ pub struct Manifest {
     pub scale_encoding: bool,
     #[serde(default = "default_scale_cutoff")]
     pub scale_cutoff: f32,
+    #[serde(default = "default_base_resolution")]
+    pub base_resolution: usize,
+    #[serde(default = "default_max_resolution")]
+    pub max_resolution: usize,
+    #[serde(default = "default_log2_hashmap_size")]
+    pub log2_hashmap_size: u32,
 }
 
 pub struct Parameter {
@@ -76,6 +100,9 @@ pub struct Field {
     pub fused_backward_params: bool,
     pub scale_encoding: bool,
     pub scale_cutoff: f32,
+    pub base_resolution: usize,
+    pub max_resolution: usize,
+    pub log2_hashmap_size: u32,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     packed_mlp_state: Option<(Tensor<2>, usize)>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
@@ -212,8 +239,15 @@ impl PendingEvaluation {
 const MAX_CACHED_CHUNKS: usize = 6;
 
 impl Field {
+    #[inline]
+    pub fn hashmap_size(&self) -> usize {
+        1usize << self.log2_hashmap_size
+    }
+
     fn build_packed_embedding(
         params: &BTreeMap<String, Parameter>,
+        base_resolution: usize,
+        max_resolution: usize,
         device: &Device,
     ) -> (Parameter, Tensor<2>, Vec<usize>, Vec<usize>) {
         let mut values = Vec::with_capacity(14);
@@ -226,7 +260,7 @@ impl Field {
         offsets.push(0);
 
         for level in 0..14 {
-            let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as usize;
+            let res = hash_level_resolution(base_resolution, max_resolution, level);
             let name = format!("encoding.embeddings.{level}");
             let p = &params[&name];
             let rows = p.value.dims()[0];
@@ -340,7 +374,24 @@ impl Field {
         self.sync_packed_mlp_to_params();
     }
 
+    #[allow(dead_code)]
     pub fn new(device: Device, seed: u64) -> Self {
+        Self::new_with_encoding(
+            device,
+            seed,
+            default_base_resolution(),
+            default_max_resolution(),
+            default_log2_hashmap_size(),
+        )
+    }
+
+    pub fn new_with_encoding(
+        device: Device,
+        seed: u64,
+        base_resolution: usize,
+        max_resolution: usize,
+        log2_hashmap_size: u32,
+    ) -> Self {
         use rand::{Rng, SeedableRng};
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
         let mut params = BTreeMap::new();
@@ -355,9 +406,10 @@ impl Field {
                 },
             );
         };
-        for l in 0..14 {
-            let res = (32f64 * 1.3195079107728942f64.powi(l)).floor() as usize;
-            let entries = ((res + 1).pow(3)).min(524288);
+        let hashmap_size = 1usize << log2_hashmap_size;
+        for l in 0..14usize {
+            let res = hash_level_resolution(base_resolution, max_resolution, l);
+            let entries = (res + 1).saturating_pow(3).min(hashmap_size);
             add(
                 format!("encoding.embeddings.{l}"),
                 (0..entries * 2)
@@ -400,7 +452,7 @@ impl Field {
         add("variance".into(), vec![0.5], [1, 1]);
 
         let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
-            Self::build_packed_embedding(&params, &device);
+            Self::build_packed_embedding(&params, base_resolution, max_resolution, &device);
         let packed_mlp_state = Self::build_packed_mlp_state(&params);
 
         let _ = device.sync();
@@ -452,6 +504,9 @@ impl Field {
             fused_backward_params: true,
             scale_encoding: false,
             scale_cutoff: default_scale_cutoff(),
+            base_resolution,
+            max_resolution,
+            log2_hashmap_size,
             packed_mlp: std::cell::RefCell::new(None),
             packed_mlp_state,
             inference_weights: std::cell::RefCell::new(None),
@@ -509,7 +564,7 @@ impl Field {
             .without_autodiff()
             .into_scalar();
         let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
-            Self::build_packed_embedding(&params, &device);
+            Self::build_packed_embedding(&params, m.base_resolution, m.max_resolution, &device);
         let packed_mlp_state = Self::build_packed_mlp_state(&params);
 
         let _ = device.sync();
@@ -561,6 +616,9 @@ impl Field {
             fused_backward_params: true,
             scale_encoding: m.scale_encoding,
             scale_cutoff: m.scale_cutoff,
+            base_resolution: m.base_resolution,
+            max_resolution: m.max_resolution,
+            log2_hashmap_size: m.log2_hashmap_size,
             packed_mlp: std::cell::RefCell::new(None),
             packed_mlp_state,
             inference_weights: std::cell::RefCell::new(None),
@@ -578,6 +636,9 @@ impl Field {
             parameters: vec![],
             scale_encoding: self.scale_encoding,
             scale_cutoff: self.scale_cutoff,
+            base_resolution: self.base_resolution,
+            max_resolution: self.max_resolution,
+            log2_hashmap_size: self.log2_hashmap_size,
         };
         for (name, p) in &self.params {
             let file = format!("{}.bin", name.replace('.', "_"));
@@ -852,11 +913,15 @@ impl Field {
             &self.device,
         );
         let active_levels = self.active.min(14);
+        let base_res = self.base_resolution;
+        let max_res = self.max_resolution;
+        let hashmap_size = self.hashmap_size();
+        let hash_mask = (hashmap_size - 1) as u32;
         let (all_indices, all_weights): (Vec<Vec<i32>>, Vec<Vec<f32>>) = (0..active_levels)
             .into_par_iter()
             .map(|level| {
-                let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as u32;
-                let dense = (res as usize + 1).pow(3) <= 524288;
+                let res = hash_level_resolution(base_res, max_res, level) as u32;
+                let dense = (res as usize + 1).saturating_pow(3) <= hashmap_size;
                 let mut indices = Vec::with_capacity(n * 8);
                 let mut weights = Vec::with_capacity(n * 8);
                 for point in points {
@@ -879,7 +944,7 @@ impl Field {
                             v[0] + v[1] * (res + 1) + v[2] * (res + 1) * (res + 1)
                         } else {
                             (v[0] ^ v[1].wrapping_mul(2654435761) ^ v[2].wrapping_mul(805459861))
-                                & 524287
+                                & hash_mask
                         };
                         indices.push(idx as i32);
                         weights.push(weight);
@@ -1069,6 +1134,7 @@ impl Field {
             self.point_tiles,
             self.subgroup_reduce,
             self.selective_forward_weights,
+            self.hashmap_size(),
         )
     }
 
@@ -1092,6 +1158,7 @@ impl Field {
             self.point_tiles,
             self.subgroup_reduce,
             self.selective_forward_weights,
+            self.hashmap_size(),
             self.scale_cutoff,
         )
     }
@@ -1508,6 +1575,7 @@ impl Field {
                     self.selective_backward_weights,
                     accumulate,
                     self.active_parameter_columns,
+                    self.hashmap_size(),
                     self.scale_cutoff,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
@@ -1882,7 +1950,12 @@ impl Field {
             p.value = updated.autodiff().require_grad();
         }
         let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
-            Self::build_packed_embedding(&self.params, &self.device);
+            Self::build_packed_embedding(
+                &self.params,
+                self.base_resolution,
+                self.max_resolution,
+                &self.device,
+            );
         self.packed_embedding = Some(packed_embedding);
         self.packed_metadata = Some(packed_metadata);
         self.level_offsets = level_offsets;

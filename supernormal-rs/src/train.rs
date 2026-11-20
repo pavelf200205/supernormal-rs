@@ -216,10 +216,59 @@ pub struct TrainArgs {
     #[arg(long, default_value_t = 0.45)]
     #[serde(default = "default_scale_cutoff")]
     pub scale_cutoff: f32,
+    /// Coarsest hash-grid resolution (own_objects.conf: encoding.base_resolution).
+    #[arg(long, default_value_t = 32)]
+    #[serde(default = "default_base_hash_res")]
+    pub base_hash_res: usize,
+    /// Finest hash-grid resolution across the 14 levels (default 1175; use 2048 or 4096 for 2K/4K or close-up datasets).
+    #[arg(long, default_value_t = 1175)]
+    #[serde(default = "default_max_hash_res")]
+    pub max_hash_res: usize,
+    /// log2 of hash table entries per level (own_objects.conf: encoding.log2_hashmap_size; default 19 = 524k, use 20 or 21 for high max-hash-res).
+    #[arg(long, default_value_t = 19)]
+    #[serde(default = "default_log2_hashmap_size")]
+    pub log2_hashmap_size: u32,
+    /// Base Adam learning rate (own_objects.conf: train.learning_rate).
+    #[arg(long, default_value_t = 5e-4)]
+    #[serde(default = "default_lr")]
+    pub lr: f64,
+    /// Steps between unveiling each finer hash level (own_objects.conf: train.increase_bindwidth_every).
+    #[arg(long, default_value_t = 2000)]
+    #[serde(default = "default_increase_bandwidth_every")]
+    pub increase_bandwidth_every: usize,
+    /// Initial ray-marching step size (own_objects.conf: ray_marching.start_step_size).
+    #[arg(long, default_value_t = 1e-2)]
+    #[serde(default = "default_start_step_size")]
+    pub start_step_size: f32,
+    /// Final ray-marching step size (own_objects.conf: ray_marching.end_step_size; e.g. 5e-4 for 2K/4K datasets).
+    #[arg(long, default_value_t = 1e-3)]
+    #[serde(default = "default_end_step_size")]
+    pub end_step_size: f32,
 }
 
 fn default_scale_cutoff() -> f32 {
     0.45
+}
+fn default_base_hash_res() -> usize {
+    32
+}
+fn default_max_hash_res() -> usize {
+    1175
+}
+fn default_log2_hashmap_size() -> u32 {
+    19
+}
+fn default_lr() -> f64 {
+    5e-4
+}
+fn default_increase_bandwidth_every() -> usize {
+    2000
+}
+fn default_start_step_size() -> f32 {
+    1e-2
+}
+fn default_end_step_size() -> f32 {
+    1e-3
 }
 
 fn default_field_points() -> usize {
@@ -392,10 +441,32 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         dataset.views[0].width,
         dataset.views[0].height
     );
+    ensure!(
+        args.base_hash_res >= 16 && args.max_hash_res >= args.base_hash_res,
+        "require 16 <= base-hash-res <= max-hash-res"
+    );
+    ensure!(
+        (14..=22).contains(&args.log2_hashmap_size),
+        "log2-hashmap-size must be in 14..=22"
+    );
+    ensure!(
+        args.increase_bandwidth_every > 0,
+        "increase-bandwidth-every must be > 0"
+    );
+    ensure!(
+        args.start_step_size > 0.0 && args.end_step_size > 0.0,
+        "start-step-size and end-step-size must be > 0"
+    );
     let mut field = if let Some(path) = &args.model {
         Field::load(path, device)?
     } else {
-        Field::new(device, args.seed)
+        Field::new_with_encoding(
+            device,
+            args.seed,
+            args.base_hash_res,
+            args.max_hash_res,
+            args.log2_hashmap_size,
+        )
     };
     field.fused_field = !args.unfused_field;
     field.cpu_visibility = args.cpu_visibility;
@@ -537,7 +608,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         }
         first = false;
         let occupancy_seconds = started.elapsed().as_secs_f64();
-        field.active = (step / 2000 + 1).min(14);
+        field.active = (step / args.increase_bandwidth_every + 1).min(14);
         let (patches, patch_coords, normal_den) = if use_gpu_patch_gather {
             let (coords, nd) = dataset.random_patch_coords(args.batch, &mut rng);
             (Vec::new(), Some(coords), nd)
@@ -547,7 +618,10 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             (p, None, nd)
         };
         let total_patches = args.batch;
-        let step_size = 10f32.powf(-2. - step as f32 / args.end_iter as f32);
+        let log_start = args.start_step_size.log10();
+        let log_end = args.end_step_size.log10();
+        let step_size =
+            10f32.powf(log_start + (log_end - log_start) * (step as f32 / args.end_iter as f32));
 
         let group_size = if args.pipeline_patches == 0 {
             args.microbatch
@@ -848,7 +922,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             field.apply_gradients_packed_with_stats(
                 gradients,
                 device_stats.as_ref(),
-                5e-4 * factor,
+                args.lr * factor,
             );
         } else {
             if let Some(stats) = &device_stats {
@@ -870,7 +944,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     tensor(vec![sdf_bias_grad as f32], [1, 1], &field.device),
                 );
             }
-            field.apply_gradients_packed(gradients, 5e-4 * factor);
+            field.apply_gradients_packed(gradients, args.lr * factor);
         }
         field.step += 1;
 

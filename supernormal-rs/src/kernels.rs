@@ -1154,6 +1154,7 @@ fn field_hash_tile(
     group: usize,
     n_valid: usize,
     active: u32,
+    hashmap_size: u32,
     scale_cutoff: f32,
     #[comptime] local_hash: bool,
     #[comptime] corner_parallel: bool,
@@ -1210,7 +1211,8 @@ fn field_hash_tile(
             let base1 = u32::cast_from(b1);
             let base2 = u32::cast_from(b2);
             let r1 = res + 1;
-            let dense = r1 * r1 * r1 <= 524288;
+            let hash_mask = hashmap_size - 1u32;
+            let dense = r1 <= 256u32 && r1 * r1 * r1 <= hashmap_size;
             let bit1 = u32::cast_from(corner_pair) & 1u32;
             let bit2 = (u32::cast_from(corner_pair) >> 1u32) & 1u32;
             let v1 = base1 + bit1;
@@ -1226,12 +1228,12 @@ fn field_hash_tile(
             let idx0 = if dense {
                 base0 + v1 * r1 + v2 * r1 * r1
             } else {
-                (base0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                (base0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & hash_mask
             };
             let idx1 = if dense {
                 idx0 + 1u32
             } else {
-                ((base0 + 1u32) ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                ((base0 + 1u32) ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & hash_mask
             };
             let entry0 = usize::cast_from(offset + idx0) * 2;
             let entry1 = usize::cast_from(offset + idx1) * 2;
@@ -1294,7 +1296,8 @@ fn field_hash_tile(
             let base1 = u32::cast_from(b1);
             let base2 = u32::cast_from(b2);
             let r1 = res + 1;
-            let dense = r1 * r1 * r1 <= 524288;
+            let hash_mask = hashmap_size - 1u32;
+            let dense = r1 <= 256u32 && r1 * r1 * r1 <= hashmap_size;
             let mut feat0 = 0.0_f32;
             let mut feat1 = 0.0_f32;
             for corner in 0..8u32 {
@@ -1311,7 +1314,7 @@ fn field_hash_tile(
                 let idx = if dense {
                     v0 + v1 * r1 + v2 * r1 * r1
                 } else {
-                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & hash_mask
                 };
                 let entry = usize::cast_from(offset + idx) * 2;
                 feat0 += weight * tables[entry];
@@ -1360,6 +1363,7 @@ fn fused_field_kernel(
     preactivation: &mut Tensor<f32>,
     active: u32,
     valid_n: u32,
+    hashmap_size: u32,
     scale_cutoff: f32,
     #[comptime] cache: bool,
     #[comptime] cache_preactivation: bool,
@@ -1437,6 +1441,7 @@ fn fused_field_kernel(
                 group,
                 n_valid,
                 active,
+                hashmap_size,
                 scale_cutoff,
                 local_hash,
                 corner_parallel,
@@ -1678,6 +1683,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             ScalarIr::UInt(selective_weights),
             ScalarIr::UInt(occupancy),
             ScalarIr::UInt(scale_encoding),
+            ScalarIr::UInt(hashmap_size),
             ScalarIr::Float(scale_cutoff),
         ] = self.desc.scalars.as_slice()
         else {
@@ -1745,6 +1751,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             hidden.clone().into_tensor_arg(),
             *active as u32,
             *valid_n as u32,
+            *hashmap_size as u32,
             *scale_cutoff as f32,
             *cache != 0,
             *cache_preactivation != 0,
@@ -1775,6 +1782,7 @@ pub fn fused_field(
     point_tiles: usize,
     subgroup_reduce: bool,
     selective_weights: bool,
+    hashmap_size: usize,
     scale_cutoff: f32,
 ) -> [burn::tensor::Tensor<2>; 3] {
     let dims = inputs[0].dims();
@@ -1806,12 +1814,14 @@ pub fn fused_field(
         selective_weights,
         false,
         scale_encoding,
+        hashmap_size,
         scale_cutoff,
     )
 }
 
 /// Capacity-bounded occupancy evaluation + EMA, without an SDF buffer or count readback.
 /// Inputs: compact points, hash table, metadata, MLP, count prefix, unique cell IDs, values.
+#[allow(clippy::too_many_arguments)]
 pub fn fused_occupancy_field(
     inputs: [burn::tensor::Tensor<2>; 7],
     active: usize,
@@ -1820,6 +1830,7 @@ pub fn fused_occupancy_field(
     point_tiles: usize,
     subgroup_reduce: bool,
     selective_weights: bool,
+    hashmap_size: usize,
 ) -> burn::tensor::Tensor<2> {
     use burn::tensor::Tensor as BT;
     let [points, tables, metadata, weights, prefix, ids, values] = inputs;
@@ -1845,6 +1856,7 @@ pub fn fused_occupancy_field(
         selective_weights,
         true,
         false,
+        hashmap_size,
         0.0,
     );
     values
@@ -1865,6 +1877,7 @@ fn fused_field_op(
     selective_weights: bool,
     occupancy: bool,
     scale_encoding: bool,
+    hashmap_size: usize,
     scale_cutoff: f32,
 ) -> [burn::tensor::Tensor<2>; 3] {
     let inputs: Vec<_> = inputs
@@ -1893,6 +1906,7 @@ fn fused_field_op(
             ScalarIr::UInt(selective_weights as u64),
             ScalarIr::UInt(occupancy as u64),
             ScalarIr::UInt(scale_encoding as u64),
+            ScalarIr::UInt(hashmap_size as u64),
             ScalarIr::Float(scale_cutoff as f64),
         ],
     );
@@ -2475,6 +2489,7 @@ fn field_backward_kernel(
             group,
             n_valid,
             active,
+            524288u32,
             0.0_f32,
             local_hash,
             corner_parallel,
@@ -3567,6 +3582,7 @@ fn field_backward_native_kernel(
             group,
             n_valid,
             active,
+            524288u32,
             0.0_f32,
             local_hash,
             corner_parallel,
@@ -4078,6 +4094,7 @@ fn field_backward_fused_native_kernel(
     valid_n: u32,
     aggregation_levels: u32,
     adjoint_offset: u32,
+    hashmap_size: u32,
     scale_cutoff: f32,
     #[comptime] local_hash: bool,
     #[comptime] aggregate_hash: bool,
@@ -4350,7 +4367,7 @@ fn field_backward_fused_native_kernel(
                 let w2 = c2 - b2;
                 base0 = u32::cast_from(b0);
                 let r1 = level_res + 1u32;
-                dense = r1 * r1 * r1 <= 524288u32;
+                dense = r1 <= 256u32 && r1 * r1 * r1 <= hashmap_size;
                 let bit1 = u32::cast_from(sub_part) & 1u32;
                 let bit2 = (u32::cast_from(sub_part) >> 1u32) & 1u32;
                 let v1 = u32::cast_from(b1) + bit1;
@@ -4376,7 +4393,7 @@ fn field_backward_fused_native_kernel(
                     let idx = if dense {
                         v0 + dense_yz
                     } else {
-                        (v0 ^ hash_yz) & 524287u32
+                        (v0 ^ hash_yz) & (hashmap_size - 1u32)
                     };
                     let t0 = weight * g0;
                     let t1 = weight * g1;
@@ -4485,6 +4502,7 @@ fn field_backward_fused_cas_kernel(
     valid_n: u32,
     aggregation_levels: u32,
     adjoint_offset: u32,
+    hashmap_size: u32,
     scale_cutoff: f32,
     #[comptime] local_hash: bool,
     #[comptime] aggregate_hash: bool,
@@ -4753,7 +4771,7 @@ fn field_backward_fused_cas_kernel(
                 let w2 = c2 - b2;
                 base0 = u32::cast_from(b0);
                 let r1 = level_res + 1u32;
-                dense = r1 * r1 * r1 <= 524288u32;
+                dense = r1 <= 256u32 && r1 * r1 * r1 <= hashmap_size;
                 let bit1 = u32::cast_from(sub_part) & 1u32;
                 let bit2 = (u32::cast_from(sub_part) >> 1u32) & 1u32;
                 let v1 = u32::cast_from(b1) + bit1;
@@ -4778,7 +4796,7 @@ fn field_backward_fused_cas_kernel(
                     let idx = if dense {
                         v0 + dense_yz
                     } else {
-                        (v0 ^ hash_yz) & 524287u32
+                        (v0 ^ hash_yz) & (hashmap_size - 1u32)
                     };
                     let t0 = weight * g0;
                     let t1 = weight * g1;
@@ -4891,6 +4909,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
             ScalarIr::UInt(accumulate),
             ScalarIr::UInt(active_columns_only),
             ScalarIr::UInt(scale_encoding),
+            ScalarIr::UInt(hashmap_size),
             ScalarIr::Float(scale_cutoff),
         ] = self.desc.scalars.as_slice()
         else {
@@ -4962,6 +4981,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 *valid_n as u32,
                 *aggregation_levels as u32,
                 *adjoint_offset as u32,
+                *hashmap_size as u32,
                 *scale_cutoff as f32,
                 *local_hash != 0,
                 *aggregate_hash != 0 && *aggregation_levels > 0,
@@ -4989,6 +5009,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 *valid_n as u32,
                 *aggregation_levels as u32,
                 *adjoint_offset as u32,
+                *hashmap_size as u32,
                 *scale_cutoff as f32,
                 *local_hash != 0,
                 *aggregate_hash != 0 && *aggregation_levels > 0,
@@ -5020,6 +5041,7 @@ pub fn field_backward_fused(
     selective_weights: bool,
     accumulate: bool,
     active_columns_only: bool,
+    hashmap_size: usize,
     scale_cutoff: f32,
 ) -> [burn::tensor::Tensor<2>; 3] {
     use burn::tensor::Tensor as BT;
@@ -5051,6 +5073,7 @@ pub fn field_backward_fused(
             ScalarIr::UInt(accumulate as u64),
             ScalarIr::UInt(active_columns_only as u64),
             ScalarIr::UInt(scale_encoding as u64),
+            ScalarIr::UInt(hashmap_size as u64),
             ScalarIr::Float(scale_cutoff as f64),
         ],
     );
