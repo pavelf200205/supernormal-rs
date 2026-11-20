@@ -147,8 +147,44 @@ fn polygonize_cell(
     }
 }
 
+fn build_view_proj_table(
+    dataset: &crate::data::Dataset,
+    device: &burn::tensor::Device,
+) -> (burn::tensor::Tensor<2>, usize) {
+    let num_views = dataset.views.len();
+    let mut flat = Vec::with_capacity(num_views * 16);
+    for view in &dataset.views {
+        let k = view.inv_k.try_inverse().expect("invertible inv_k");
+        let rt = view.rotation.transpose();
+        let a = k * rt;
+        let b = -(a * view.origin);
+        let focal = 0.5 * (k[(0, 0)].abs() + k[(1, 1)].abs());
+        flat.extend([
+            a[(0, 0)],
+            a[(0, 1)],
+            a[(0, 2)],
+            b[0],
+            a[(1, 0)],
+            a[(1, 1)],
+            a[(1, 2)],
+            b[1],
+            a[(2, 0)],
+            a[(2, 1)],
+            a[(2, 2)],
+            b[2],
+            view.width as f32,
+            view.height as f32,
+            focal,
+            0.0_f32,
+        ]);
+    }
+    (crate::field::tensor(flat, [num_views, 16], device), num_views)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn extract_sparse_cells(
     field: &Field,
+    view_proj: Option<&(burn::tensor::Tensor<2>, usize)>,
     res: usize,
     query: usize,
     scale: f32,
@@ -167,7 +203,10 @@ fn extract_sparse_cells(
     // skipping ~95% of empty 3D blocks.
     let band_margin = 3.0_f32 * block_diag;
 
-    let coarse_pts = crate::sampling_gpu::mesh_coarse_points(res, BLOCK_SIZE, &field.device);
+    let mut coarse_pts = crate::sampling_gpu::mesh_coarse_points(res, BLOCK_SIZE, &field.device);
+    if let Some((vp, nv)) = view_proj {
+        coarse_pts = crate::sampling_gpu::attach_mesh_scales(coarse_pts, vp.clone(), *nv);
+    }
     let coarse_sdf = (-field.evaluate_device_tensor(coarse_pts, query)).try_into_vec_as::<f32>()?;
     let c_plane = c_res * c_res;
 
@@ -318,7 +357,11 @@ fn extract_sparse_cells(
         let k = plan.xy_indices.len();
         let z_count = plan.z1 - plan.z0 + 1;
         let xy_tensor = crate::field::tensor(plan.xy_flat.clone(), [k, 2], &field.device);
-        let pts = crate::sampling_gpu::mesh_sparse_band_points(xy_tensor, res, plan.z0, z_count);
+        let mut pts =
+            crate::sampling_gpu::mesh_sparse_band_points(xy_tensor, res, plan.z0, z_count);
+        if let Some((vp, nv)) = view_proj {
+            pts = crate::sampling_gpu::attach_mesh_scales(pts, vp.clone(), *nv);
+        }
         let neg_sdf = -field.evaluate_device_tensor(pts, query);
         let _ = field.device.flush();
         neg_sdf
@@ -409,6 +452,7 @@ fn extract_sparse_cells(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn extract(
     field: &Field,
     path: &Path,
@@ -417,12 +461,38 @@ pub fn extract(
     scale: f32,
     offset: [f32; 3],
 ) -> Result<()> {
+    extract_with_dataset(field, None, path, res, query, scale, offset)
+}
+
+pub fn extract_with_dataset(
+    field: &Field,
+    dataset: Option<&crate::data::Dataset>,
+    path: &Path,
+    res: usize,
+    query: usize,
+    scale: f32,
+    offset: [f32; 3],
+) -> Result<()> {
     ensure!(res >= 2 && query > 0, "invalid mesh resolution/query size");
+    let view_proj = if field.scale_encoding {
+        dataset.map(|ds| build_view_proj_table(ds, &field.device))
+    } else {
+        None
+    };
     let mut vertices: Vec<[f32; 3]> = vec![];
     let mut faces: Vec<[u32; 3]> = vec![];
 
     if res >= 128 {
-        extract_sparse_cells(field, res, query, scale, offset, &mut vertices, &mut faces)?;
+        extract_sparse_cells(
+            field,
+            view_proj.as_ref(),
+            res,
+            query,
+            scale,
+            offset,
+            &mut vertices,
+            &mut faces,
+        )?;
     } else {
         let plane_size = res * res;
         let mut xy_lower = vec![u32::MAX; 2 * plane_size];
@@ -436,15 +506,21 @@ pub fn extract(
                 return None;
             }
             let count = (res - z_start).min(BATCH_SLABS);
-            let pts =
+            let mut pts =
                 crate::sampling_gpu::mesh_slab_points_batch(res, z_start, count, &field.device);
+            if let Some((vp, nv)) = view_proj.as_ref() {
+                pts = crate::sampling_gpu::attach_mesh_scales(pts, vp.clone(), *nv);
+            }
             let sdf = field.evaluate_device_tensor(pts, query);
             let neg_sdf = -sdf;
             let _ = field.device.flush();
             Some((count, neg_sdf))
         };
 
-        let first_slab = crate::sampling_gpu::mesh_slab_points(res, 0, &field.device);
+        let mut first_slab = crate::sampling_gpu::mesh_slab_points(res, 0, &field.device);
+        if let Some((vp, nv)) = view_proj.as_ref() {
+            first_slab = crate::sampling_gpu::attach_mesh_scales(first_slab, vp.clone(), *nv);
+        }
         let first_sdf = -field.evaluate_device_tensor(first_slab, query);
         let _ = field.device.flush();
         let mut next_batch = enqueue_batch(1);

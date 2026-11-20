@@ -1889,6 +1889,7 @@ pub fn prepare_geometry_from_device_batch(
     normal_den: f32,
     pixel_den: f32,
     sample_den: f32,
+    scale_encoding: bool,
     device: &burn::tensor::Device,
 ) -> Option<DevicePreparedGeometry> {
     use crate::field::tensor;
@@ -1956,23 +1957,38 @@ pub fn prepare_geometry_from_device_batch(
         (gr, Some(pp))
     } else {
         let sub_patches = &patches[start..end];
-        let mut rays = Vec::with_capacity(sub_patches.len() * 39);
+        let mut rays = Vec::with_capacity(sub_patches.len() * 40);
         for p in sub_patches {
             rays.extend(p.origin);
             rays.extend(p.dirs.iter().flatten().copied());
             let center = dot(p.dirs[4], p.plane);
-            rays.extend(p.dirs.iter().map(|&d| center / dot(d, p.plane)));
+            let ratios: [f32; 9] = std::array::from_fn(|j| center / dot(p.dirs[j], p.plane));
+            rays.extend(ratios);
+            let dx = std::array::from_fn::<f32, 3, _>(|k| {
+                p.dirs[5][k] * ratios[5] - p.dirs[3][k] * ratios[3]
+            });
+            let dy = std::array::from_fn::<f32, 3, _>(|k| {
+                p.dirs[7][k] * ratios[7] - p.dirs[1][k] * ratios[1]
+            });
+            let ang = 0.25 * (dot(dx, dx).sqrt() + dot(dy, dy).sqrt());
+            let cos_v = if p.mask[4] > 0.5 {
+                (-dot(p.dirs[4], p.normals[4])).clamp(0.15, 1.0)
+            } else {
+                1.0
+            };
+            rays.push(ang / cos_v.sqrt());
         }
-        (tensor(rays, [sub_patches.len(), 39], device), None)
+        (tensor(rays, [sub_patches.len(), 40], device), None)
     };
     let padded_pts = Field::padded_point_capacity(valid_points, query);
     let vis_cap = crate::sampling_gpu::bucket_capacity(vis_count);
+    let pt_cols = if scale_encoding { 4 } else { 3 };
     let [unique_points, geometry] = crate::sampling_gpu::geometry(
         [
             geom_rays,
             endpoints,
             descriptors,
-            Tensor::empty([padded_pts, 3], device),
+            Tensor::empty([padded_pts, pt_cols], device),
             Tensor::empty([vis_cap, 27], device),
         ],
         valid_points,
@@ -2008,12 +2024,13 @@ pub fn prepare_geometry_device(
     use crate::field::tensor;
     use burn::tensor::Tensor;
     assert!(!samples.is_empty());
-    let mut rays = Vec::with_capacity(patches.len() * 39);
+    let mut rays = Vec::with_capacity(patches.len() * 40);
     for p in patches {
         rays.extend(p.origin);
         rays.extend(p.dirs.iter().flatten().copied());
         let center = dot(p.dirs[4], p.plane);
         rays.extend(p.dirs.iter().map(|&d| center / dot(d, p.plane)));
+        rays.push(0.0);
     }
     let mut endpoints = Vec::with_capacity(samples.len() * 4);
     let mut descriptors = Vec::with_capacity(samples.len() * 5);
@@ -2053,7 +2070,7 @@ pub fn prepare_geometry_device(
     let vis_cap = crate::sampling_gpu::bucket_capacity(samples.len());
     let [points, geometry] = crate::sampling_gpu::geometry(
         [
-            tensor(rays, [patches.len(), 39], device),
+            tensor(rays, [patches.len(), 40], device),
             tensor(endpoints, [count, 2], device),
             tensor(descriptors, [samples.len(), 5], device),
             Tensor::empty([padded_pts, 3], device),

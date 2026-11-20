@@ -1694,6 +1694,7 @@ fn points_kernel(
     endpoints: &Tensor<f32>,
     points: &mut Tensor<f32>,
     valid_points: u32,
+    #[comptime] scale_encoding: bool,
 ) {
     let id = ABSOLUTE_POS;
     if id >= usize::cast_from(valid_points) {
@@ -1702,18 +1703,24 @@ fn points_kernel(
     let endpoint = id / 9;
     let pixel = id % 9;
     let patch = usize::cast_from(endpoints[endpoint * 2]);
-    let base = patch * 39;
-    let t = endpoints[endpoint * 2 + 1] * rays[base + 30 + pixel];
+    let base = patch * 40;
+    let t_center = endpoints[endpoint * 2 + 1];
+    let t = t_center * rays[base + 30 + pixel];
+    let p_stride = if scale_encoding { 4usize } else { 3usize };
     for d in 0..3usize {
-        points[id * 3 + d] = rays[base + d] + rays[base + 3 + pixel * 3 + d] * t;
+        points[id * p_stride + d] = rays[base + d] + rays[base + 3 + pixel * 3 + d] * t;
+    }
+    if scale_encoding {
+        points[id * 4 + 3] = t_center * rays[base + 39];
     }
 }
 
 #[cube]
 fn point_distance(points: &Tensor<f32>, a: usize, b: usize) -> f32 {
-    let x = points[a * 3] - points[b * 3];
-    let y = points[a * 3 + 1] - points[b * 3 + 1];
-    let z = points[a * 3 + 2] - points[b * 3 + 2];
+    let stride = points.stride(0);
+    let x = points[a * stride] - points[b * stride];
+    let y = points[a * stride + 1] - points[b * stride + 1];
+    let z = points[a * stride + 2] - points[b * stride + 2];
     (x * x + y * y + z * z).sqrt()
 }
 
@@ -1763,7 +1770,7 @@ fn geometry_kernel(
     } else {
         point_distance(points, base + u, base + d)
     };
-    let dt = (samples[sample * 5 + 2] - samples[sample * 5 + 1]) * rays[patch * 39 + 30 + pixel];
+    let dt = (samples[sample * 5 + 2] - samples[sample * 5 + 1]) * rays[patch * 40 + 30 + pixel];
     geometry[id * 3] = 1.0_f32 / dt;
     geometry[id * 3 + 1] = 1.0_f32 / dx;
     geometry[id * 3 + 2] = 1.0_f32 / dy;
@@ -1785,6 +1792,7 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
             panic!("invalid geometry scalars")
         };
         let [r, e, s, p, g] = [r, e, s, p, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let scale_encoding = p.meta.shape().dims::<2>()[1] == 4;
         let client = r.client.clone();
         let _timing = crate::diagnostics::start(&client, "geometry");
         let n_pts = (*valid_points as usize).max(1);
@@ -1797,6 +1805,7 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
             e.into_tensor_arg(),
             p.clone().into_tensor_arg(),
             *valid_points as u32,
+            scale_encoding,
         );
         let n_sp = ((*valid_samples as usize) * 9).max(1);
         let dim_sp = CubeDim::new(&client, n_sp);
@@ -1909,7 +1918,7 @@ fn gather_patch_tables_kernel(
     let k21 = view_meta[vm + 22];
     let k22 = view_meta[vm + 23];
 
-    let gr = p * 39;
+    let gr = p * 40;
     let pb = p * 123;
     if i == 0 {
         geom_rays[gr] = ox;
@@ -1933,6 +1942,20 @@ fn gather_patch_tables_kernel(
     let d4y = (uy * c_cx + vy * c_cy + ply * c_cz) * c_inv_len;
     let d4z = (uz * c_cx + vz * c_cy + plz * c_cz) * c_inv_len;
     let center_dot = d4x * plx + d4y * ply + d4z * plz;
+    if i == 4 {
+        let ang_pix = 0.5_f32 * (f32::abs(k00) + f32::abs(k11)) * center_dot;
+        let t_base_c = c_idx + 3 + 16;
+        let gnx = coords[t_base_c];
+        let gny = coords[t_base_c + 1];
+        let gnz = coords[t_base_c + 2];
+        let gmask = coords[t_base_c + 3];
+        let cos_view = if gmask > 0.5_f32 {
+            f32::clamp(-(d4x * gnx + d4y * gny + d4z * gnz), 0.15_f32, 1.0_f32)
+        } else {
+            1.0_f32
+        };
+        geom_rays[gr + 39] = ang_pix / f32::sqrt(cos_view);
+    }
 
     let px = f32::cast_from(i % 3) - 1.0_f32;
     let py = f32::cast_from(i / 3) - 1.0_f32;
@@ -2041,7 +2064,7 @@ pub fn gather_patch_tables(
     patch_count: usize,
 ) -> [burn::tensor::Tensor<2>; 2] {
     let device = coords.device();
-    let gr_buf = burn::tensor::Tensor::<2>::empty([patch_count, 39], &device);
+    let gr_buf = burn::tensor::Tensor::<2>::empty([patch_count, 40], &device);
     let pp_buf = burn::tensor::Tensor::<2>::empty([patch_count, 123], &device);
     let inputs = [coords, view_meta, gr_buf, pp_buf]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
@@ -2608,6 +2631,130 @@ pub fn mesh_sparse_band_points(
             StreamId::current(),
             OperationIr::Custom(desc.clone()),
             MeshSparseBandPointsOp { desc },
+        )
+        .outputs();
+    burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)
+}
+
+/// SNSR scale-aware mesh extraction helper: for each 3D query point `p`, compute
+/// the finest observed pixel footprint `s_min = min_{v: visible} (qz / focal)`
+/// across all training cameras (`view_proj` `[V, 16]`) and emit `[N, 4]` `[x, y, z, s_min]`.
+#[cube(launch)]
+fn attach_mesh_scales_kernel(
+    points_xyz: &Tensor<f32>,
+    view_proj: &Tensor<f32>,
+    points_xyzw: &mut Tensor<f32>,
+    num_views: u32,
+) {
+    let idx = ABSOLUTE_POS;
+    let n = points_xyz.shape(0);
+    if idx >= n {
+        terminate!();
+    }
+    let px = points_xyz[idx * 3];
+    let py = points_xyz[idx * 3 + 1];
+    let pz = points_xyz[idx * 3 + 2];
+    let n_views = usize::cast_from(num_views);
+    let mut min_in_view = 1e9_f32;
+    let mut min_any = 1e9_f32;
+    for v in 0..n_views {
+        let vb = v * 16;
+        let qx = view_proj[vb] * px
+            + view_proj[vb + 1] * py
+            + view_proj[vb + 2] * pz
+            + view_proj[vb + 3];
+        let qy = view_proj[vb + 4] * px
+            + view_proj[vb + 5] * py
+            + view_proj[vb + 6] * pz
+            + view_proj[vb + 7];
+        let qz = view_proj[vb + 8] * px
+            + view_proj[vb + 9] * py
+            + view_proj[vb + 10] * pz
+            + view_proj[vb + 11];
+        if qz > 1e-4_f32 {
+            let w = view_proj[vb + 12];
+            let h = view_proj[vb + 13];
+            let focal = view_proj[vb + 14];
+            let s = qz / focal;
+            min_any = f32::min(min_any, s);
+            let u = qx / qz;
+            let vv = qy / qz;
+            if u >= 0.0_f32 && u < w && vv >= 0.0_f32 && vv < h {
+                min_in_view = f32::min(min_in_view, s);
+            }
+        }
+    }
+    let best_s = if min_in_view < 1e8_f32 {
+        min_in_view
+    } else if min_any < 1e8_f32 {
+        min_any
+    } else {
+        0.0_f32
+    };
+    points_xyzw[idx * 4] = px;
+    points_xyzw[idx * 4 + 1] = py;
+    points_xyzw[idx * 4 + 2] = pz;
+    points_xyzw[idx * 4 + 3] = best_s;
+}
+
+#[derive(Debug)]
+struct AttachMeshScalesOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for AttachMeshScalesOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([px, vp, pw], [opw]) = self.desc.as_fixed();
+        let [ScalarIr::UInt(num_views)] = self.desc.scalars.as_slice() else {
+            panic!("invalid attach_mesh_scales scalars")
+        };
+        let [px, vp, pw] = [px, vp, pw].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let client = px.client.clone();
+        let n = px.meta.shape().dims::<2>()[0];
+        let dim = CubeDim::new(&client, n);
+        attach_mesh_scales_kernel::launch(
+            &client,
+            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            dim,
+            px.into_tensor_arg(),
+            vp.into_tensor_arg(),
+            pw.clone().into_tensor_arg(),
+            *num_views as u32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&opw.id, pw);
+        Ok(())
+    }
+}
+
+pub fn attach_mesh_scales(
+    points_xyz: burn::tensor::Tensor<2>,
+    view_proj: burn::tensor::Tensor<2>,
+    num_views: usize,
+) -> burn::tensor::Tensor<2> {
+    let n = points_xyz.dims()[0];
+    let device = points_xyz.device();
+    let pw_buf = burn::tensor::Tensor::<2>::empty([n, 4], &device);
+    let inputs = [points_xyz, view_proj, pw_buf]
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        inputs[2].shape.clone(),
+        inputs[2].dtype,
+    );
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_attach_mesh_scales",
+        &inputs.map(|t| t.into_ir()),
+        &[out],
+        vec![ScalarIr::UInt(num_views as u64)],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            AttachMeshScalesOp { desc },
         )
         .outputs();
     burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)

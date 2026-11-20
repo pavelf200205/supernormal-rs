@@ -1130,6 +1130,17 @@ fn field_feature_index(slot: usize, feature: usize, #[comptime] local_hash: bool
     }
 }
 
+/// SNSR (Scale-encoded Neural Surface Representation) Butterworth low-pass
+/// anti-aliasing weight for hash-grid level `res` given physical pixel footprint `scale`:
+/// `u = 0.5 * cutoff * scale * res`. Flat passband (~1.0) when `scale <= cell_size`,
+/// smooth roll-off to 0 for sub-pixel / grazing / far-view levels.
+#[cube]
+fn scale_level_weight(scale: f32, res: u32, cutoff: f32) -> f32 {
+    let u = 0.5_f32 * cutoff * scale * f32::cast_from(res);
+    let u2 = u * u;
+    1.0_f32 / (1.0_f32 + u2 * u2)
+}
+
 // Identical interpolation and reduction order for forward and backward replay.
 // All callers use a complete 256-thread group and uniform barriers.
 #[cube]
@@ -1143,20 +1154,23 @@ fn field_hash_tile(
     group: usize,
     n_valid: usize,
     active: u32,
+    scale_cutoff: f32,
     #[comptime] local_hash: bool,
     #[comptime] corner_parallel: bool,
     #[comptime] subgroup_width: usize,
+    #[comptime] scale_encoding: bool,
 ) {
     let lane = unit % 64;
     let slot = unit / 64;
     let point_idx = group * 4 + slot;
     let valid = point_idx < n_valid;
     let active_cols = 3usize + usize::cast_from(active) * 2usize;
+    let p_stride = if scale_encoding { 4usize } else { 3usize };
     // Disjoint writes to xyz [0..3] and inactive tail [active_cols..32] require
     // no pre-hash barrier: hash threads only write [3..active_cols].
     if lane < 3usize {
         shared_features[field_feature_index(slot, lane, local_hash)] = if valid {
-            points[point_idx * 3 + lane]
+            points[point_idx * p_stride + lane]
         } else {
             0.0_f32
         };
@@ -1175,9 +1189,9 @@ fn field_hash_tile(
         let mut feat0 = 0.0_f32;
         let mut feat1 = 0.0_f32;
         if hash_point < n_valid && level < usize::cast_from(active) {
-            let p0 = points[hash_point * 3];
-            let p1 = points[hash_point * 3 + 1];
-            let p2 = points[hash_point * 3 + 2];
+            let p0 = points[hash_point * p_stride];
+            let p1 = points[hash_point * p_stride + 1];
+            let p2 = points[hash_point * p_stride + 2];
             let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
             let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
             let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
@@ -1203,7 +1217,10 @@ fn field_hash_tile(
             let v2 = base2 + bit2;
             let kw1 = if bit1 == 0u32 { 1.0_f32 - w1 } else { w1 };
             let kw2 = if bit2 == 0u32 { 1.0_f32 - w2 } else { w2 };
-            let kw12 = kw1 * kw2;
+            let mut kw12 = kw1 * kw2;
+            if scale_encoding {
+                kw12 *= scale_level_weight(points[hash_point * 4 + 3], res, scale_cutoff);
+            }
             let weight0 = (1.0_f32 - w0) * kw12;
             let weight1 = w0 * kw12;
             let idx0 = if dense {
@@ -1256,9 +1273,9 @@ fn field_hash_tile(
         let level = if local_hash { unit / 4 } else { lane };
         let hash_point = group * 4 + hash_slot;
         if hash_point < n_valid && level < usize::cast_from(active) {
-            let p0 = points[hash_point * 3];
-            let p1 = points[hash_point * 3 + 1];
-            let p2 = points[hash_point * 3 + 2];
+            let p0 = points[hash_point * p_stride];
+            let p1 = points[hash_point * p_stride + 1];
+            let p2 = points[hash_point * p_stride + 2];
             let norm0 = f32::clamp((p0 + 1.) * 0.5, 0., 1. - 1e-7);
             let norm1 = f32::clamp((p1 + 1.) * 0.5, 0., 1. - 1e-7);
             let norm2 = f32::clamp((p2 + 1.) * 0.5, 0., 1. - 1e-7);
@@ -1300,6 +1317,11 @@ fn field_hash_tile(
                 feat0 += weight * tables[entry];
                 feat1 += weight * tables[entry + 1];
             }
+            if scale_encoding {
+                let sw = scale_level_weight(points[hash_point * 4 + 3], res, scale_cutoff);
+                feat0 *= sw;
+                feat1 *= sw;
+            }
             shared_features[field_feature_index(hash_slot, 3 + level * 2, local_hash)] = feat0;
             shared_features[field_feature_index(hash_slot, 4 + level * 2, local_hash)] = feat1;
         }
@@ -1338,6 +1360,7 @@ fn fused_field_kernel(
     preactivation: &mut Tensor<f32>,
     active: u32,
     valid_n: u32,
+    scale_cutoff: f32,
     #[comptime] cache: bool,
     #[comptime] cache_preactivation: bool,
     #[comptime] local_hash: bool,
@@ -1346,6 +1369,7 @@ fn fused_field_kernel(
     #[comptime] subgroup_width: usize,
     #[comptime] selective_weights: bool,
     #[comptime] occupancy: bool,
+    #[comptime] scale_encoding: bool,
 ) {
     // CubeCL workgroup coordinates are u32; tensor/shared indices are usize.
     let mut unit = usize::cast_from(UNIT_POS);
@@ -1413,9 +1437,11 @@ fn fused_field_kernel(
                 group,
                 n_valid,
                 active,
+                scale_cutoff,
                 local_hash,
                 corner_parallel,
                 subgroup_width,
+                scale_encoding,
             );
             let mut contribution = 0.0_f32;
             if valid {
@@ -1430,9 +1456,12 @@ fn fused_field_kernel(
                     preactivation[point_idx * 64 + lane] = h;
                 }
                 if cache {
+                    let f_stride = if scale_encoding { 32usize } else { 31usize };
                     if lane < 31 {
-                        features[point_idx * 31 + lane] =
+                        features[point_idx * f_stride + lane] =
                             shared_features[field_feature_index(slot, lane, local_hash)];
+                    } else if scale_encoding && lane == 31 {
+                        features[point_idx * 32 + 31] = points[point_idx * 4 + 3];
                     }
                 }
                 let scaled = h * 100.;
@@ -1648,6 +1677,8 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             ScalarIr::UInt(subgroup_reduce),
             ScalarIr::UInt(selective_weights),
             ScalarIr::UInt(occupancy),
+            ScalarIr::UInt(scale_encoding),
+            ScalarIr::Float(scale_cutoff),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid fused field arguments")
@@ -1714,6 +1745,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             hidden.clone().into_tensor_arg(),
             *active as u32,
             *valid_n as u32,
+            *scale_cutoff as f32,
             *cache != 0,
             *cache_preactivation != 0,
             *local_hash != 0,
@@ -1722,6 +1754,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             subgroup_width,
             *selective_weights != 0,
             *occupancy != 0,
+            *scale_encoding != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&oy.id, output);
         handles.register_float_tensor::<CubeBackend>(&of.id, features);
@@ -1730,6 +1763,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fused_field(
     inputs: [burn::tensor::Tensor<2>; 4],
     valid_n: usize,
@@ -1741,15 +1775,19 @@ pub fn fused_field(
     point_tiles: usize,
     subgroup_reduce: bool,
     selective_weights: bool,
+    scale_cutoff: f32,
 ) -> [burn::tensor::Tensor<2>; 3] {
-    let n = inputs[0].dims()[0];
+    let dims = inputs[0].dims();
+    let n = dims[0];
+    let scale_encoding = dims[1] == 4;
+    let feat_cols = if scale_encoding { 32 } else { 31 };
     let device = inputs[0].device();
     // `fused_field_kernel` zeroes all 32 `shared_features` slots and writes all
-    // 31 columns of `features` for every valid point, so `Tensor::empty` is safe
+    // columns of `features` for every valid point, so `Tensor::empty` is safe
     // regardless of `active`.
     let buffers = [
         burn::tensor::Tensor::<2>::empty([valid_n.max(1), 1], &device),
-        burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 31], &device),
+        burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, feat_cols], &device),
         burn::tensor::Tensor::<2>::empty([if cache_preactivation { n } else { 1 }, 64], &device),
     ];
     let [points, tables, metadata, weights] = inputs;
@@ -1767,6 +1805,8 @@ pub fn fused_field(
         subgroup_reduce,
         selective_weights,
         false,
+        scale_encoding,
+        scale_cutoff,
     )
 }
 
@@ -1804,10 +1844,13 @@ pub fn fused_occupancy_field(
         subgroup_reduce,
         selective_weights,
         true,
+        false,
+        0.0,
     );
     values
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fused_field_op(
     inputs: [burn::tensor::Tensor<2>; 6],
     buffers: [burn::tensor::Tensor<2>; 3],
@@ -1821,6 +1864,8 @@ fn fused_field_op(
     subgroup_reduce: bool,
     selective_weights: bool,
     occupancy: bool,
+    scale_encoding: bool,
+    scale_cutoff: f32,
 ) -> [burn::tensor::Tensor<2>; 3] {
     let inputs: Vec<_> = inputs
         .into_iter()
@@ -1847,6 +1892,8 @@ fn fused_field_op(
             ScalarIr::UInt(subgroup_reduce as u64),
             ScalarIr::UInt(selective_weights as u64),
             ScalarIr::UInt(occupancy as u64),
+            ScalarIr::UInt(scale_encoding as u64),
+            ScalarIr::Float(scale_cutoff as f64),
         ],
     );
     let result: [_; 3] = client
@@ -2428,9 +2475,11 @@ fn field_backward_kernel(
             group,
             n_valid,
             active,
+            0.0_f32,
             local_hash,
             corner_parallel,
             0usize,
+            false,
         );
         // Parameter gradients consume these features after this dispatch.
         // All 31 columns are initialized, including inactive hash levels.
@@ -3518,9 +3567,11 @@ fn field_backward_native_kernel(
             group,
             n_valid,
             active,
+            0.0_f32,
             local_hash,
             corner_parallel,
             0usize,
+            false,
         );
         // Parameter gradients consume these features after this dispatch.
         // All 31 columns are initialized, including inactive hash levels.
@@ -4027,6 +4078,7 @@ fn field_backward_fused_native_kernel(
     valid_n: u32,
     aggregation_levels: u32,
     adjoint_offset: u32,
+    scale_cutoff: f32,
     #[comptime] local_hash: bool,
     #[comptime] aggregate_hash: bool,
     #[comptime] replay_features: bool,
@@ -4034,6 +4086,7 @@ fn field_backward_fused_native_kernel(
     #[comptime] accumulate: bool,
     #[comptime] subgroup_width: usize,
     #[comptime] active_columns_only: bool,
+    #[comptime] scale_encoding: bool,
 ) {
     let mut unit = usize::cast_from(UNIT_POS);
     if subgroup_width > 0 {
@@ -4087,6 +4140,7 @@ fn field_backward_fused_native_kernel(
     let mut shared_dh = Shared::new_slice(272usize);
     let mut shared_feat = Shared::new_slice(128usize);
     let mut slot_ds = Shared::new_slice(4usize);
+    let mut slot_scale = Shared::new_slice(4usize);
     let mut fallback_partials = Shared::new_slice(if subgroup_width == 0 { 448usize } else { 1usize });
     sync_cube();
 
@@ -4124,6 +4178,13 @@ fn field_backward_fused_native_kernel(
             } else {
                 0.0_f32
             };
+            if scale_encoding {
+                slot_scale[unit] = if p < n_valid {
+                    features[p * features.stride(0) + 31usize * features.stride(1)]
+                } else {
+                    0.0_f32
+                };
+            }
         }
         if unit < 128usize {
             let s = unit / 32;
@@ -4297,6 +4358,9 @@ fn field_backward_fused_native_kernel(
                 let kw1 = if bit1 == 0u32 { 1.0_f32 - w1 } else { w1 };
                 let kw2 = if bit2 == 0u32 { 1.0_f32 - w2 } else { w2 };
                 kw12 = kw1 * kw2;
+                if scale_encoding {
+                    kw12 *= scale_level_weight(slot_scale[hash_slot], level_res, scale_cutoff);
+                }
                 dense_yz = v1 * r1 + v2 * r1 * r1;
                 hash_yz = (v1 * 2654435761u32) ^ (v2 * 805459861u32);
             }
@@ -4421,6 +4485,7 @@ fn field_backward_fused_cas_kernel(
     valid_n: u32,
     aggregation_levels: u32,
     adjoint_offset: u32,
+    scale_cutoff: f32,
     #[comptime] local_hash: bool,
     #[comptime] aggregate_hash: bool,
     #[comptime] replay_features: bool,
@@ -4428,6 +4493,7 @@ fn field_backward_fused_cas_kernel(
     #[comptime] accumulate: bool,
     #[comptime] subgroup_width: usize,
     #[comptime] active_columns_only: bool,
+    #[comptime] scale_encoding: bool,
 ) {
     let mut unit = usize::cast_from(UNIT_POS);
     if subgroup_width > 0 {
@@ -4480,6 +4546,7 @@ fn field_backward_fused_cas_kernel(
     let mut shared_dh = Shared::new_slice(272usize);
     let mut shared_feat = Shared::new_slice(128usize);
     let mut slot_ds = Shared::new_slice(4usize);
+    let mut slot_scale = Shared::new_slice(4usize);
     let mut fallback_partials = Shared::new_slice(if subgroup_width == 0 { 448usize } else { 1usize });
     sync_cube();
 
@@ -4517,6 +4584,13 @@ fn field_backward_fused_cas_kernel(
             } else {
                 0.0_f32
             };
+            if scale_encoding {
+                slot_scale[unit] = if p < n_valid {
+                    features[p * features.stride(0) + 31usize * features.stride(1)]
+                } else {
+                    0.0_f32
+                };
+            }
         }
         if unit < 128usize {
             let s = unit / 32;
@@ -4687,6 +4761,9 @@ fn field_backward_fused_cas_kernel(
                 let kw1 = if bit1 == 0u32 { 1.0_f32 - w1 } else { w1 };
                 let kw2 = if bit2 == 0u32 { 1.0_f32 - w2 } else { w2 };
                 kw12 = kw1 * kw2;
+                if scale_encoding {
+                    kw12 *= scale_level_weight(slot_scale[hash_slot], level_res, scale_cutoff);
+                }
                 dense_yz = v1 * r1 + v2 * r1 * r1;
                 hash_yz = (v1 * 2654435761u32) ^ (v2 * 805459861u32);
             }
@@ -4813,6 +4890,8 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
             ScalarIr::UInt(selective_weights),
             ScalarIr::UInt(accumulate),
             ScalarIr::UInt(active_columns_only),
+            ScalarIr::UInt(scale_encoding),
+            ScalarIr::Float(scale_cutoff),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid fused backward scalars")
@@ -4883,6 +4962,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 *valid_n as u32,
                 *aggregation_levels as u32,
                 *adjoint_offset as u32,
+                *scale_cutoff as f32,
                 *local_hash != 0,
                 *aggregate_hash != 0 && *aggregation_levels > 0,
                 *replay_features != 0,
@@ -4890,6 +4970,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 *accumulate != 0,
                 subgroup_width,
                 *active_columns_only != 0,
+                *scale_encoding != 0,
             );
         } else {
             field_backward_fused_cas_kernel::launch(
@@ -4908,6 +4989,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 *valid_n as u32,
                 *aggregation_levels as u32,
                 *adjoint_offset as u32,
+                *scale_cutoff as f32,
                 *local_hash != 0,
                 *aggregate_hash != 0 && *aggregation_levels > 0,
                 *replay_features != 0,
@@ -4915,6 +4997,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 *accumulate != 0,
                 subgroup_width,
                 *active_columns_only != 0,
+                *scale_encoding != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
@@ -4937,12 +5020,14 @@ pub fn field_backward_fused(
     selective_weights: bool,
     accumulate: bool,
     active_columns_only: bool,
+    scale_cutoff: f32,
 ) -> [burn::tensor::Tensor<2>; 3] {
     use burn::tensor::Tensor as BT;
     assert!(
         adjoint_offset <= inputs[2].dims()[0] && valid_n <= inputs[2].dims()[0] - adjoint_offset
     );
     assert!(valid_n <= inputs[1].dims()[0]);
+    let scale_encoding = inputs[1].dims()[1] == 32;
     let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let outputs: Vec<_> = [5usize, 6, 7]
@@ -4965,6 +5050,8 @@ pub fn field_backward_fused(
             ScalarIr::UInt(selective_weights as u64),
             ScalarIr::UInt(accumulate as u64),
             ScalarIr::UInt(active_columns_only as u64),
+            ScalarIr::UInt(scale_encoding as u64),
+            ScalarIr::Float(scale_cutoff as f64),
         ],
     );
     let result: [_; 3] = client

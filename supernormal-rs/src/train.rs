@@ -208,6 +208,18 @@ pub struct TrainArgs {
     #[arg(long, default_value_t = 10)]
     #[serde(default = "default_log_every")]
     pub log_every: usize,
+    /// Enable SNSR pixel-footprint scale-encoded hash gating and scale-aware mesh extraction.
+    #[arg(long)]
+    #[serde(default)]
+    pub scale_encoding: bool,
+    /// SNSR Butterworth anti-aliasing cutoff factor (default 0.45: flat passband when footprint <= cell_size).
+    #[arg(long, default_value_t = 0.45)]
+    #[serde(default = "default_scale_cutoff")]
+    pub scale_cutoff: f32,
+}
+
+fn default_scale_cutoff() -> f32 {
+    0.45
 }
 
 fn default_field_points() -> usize {
@@ -272,6 +284,7 @@ fn prepare_batch(
             normal_den,
             pixel_den,
             sample_den,
+            field.scale_encoding,
             &field.device,
         ) {
             let count = prep.valid_points;
@@ -422,6 +435,14 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.fused_mlp_packing = !args.legacy_mlp_packing;
     field.fused_backward_params = !args.legacy_fused_backward;
     field.chunked_eval = args.chunked_eval;
+    field.scale_encoding = args.scale_encoding;
+    field.scale_cutoff = args.scale_cutoff;
+    if field.scale_encoding {
+        println!(
+            "SNSR scale encoding enabled (cutoff={:.3}, scale-aware mesh extraction active)",
+            field.scale_cutoff
+        );
+    }
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
     let mut restored_state = false;
@@ -993,8 +1014,9 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 flush_deferred(dm, None, &mut progress, &mut metrics)?;
             }
             progress.clear();
-            crate::mesh::extract(
+            crate::mesh::extract_with_dataset(
                 &field,
+                Some(&dataset),
                 &args.out.join(format!("mesh_{:06}.ply", field.step)),
                 args.mesh_resolution,
                 args.query,

@@ -10,12 +10,20 @@ pub struct ParameterMeta {
     pub file: String,
 }
 
+fn default_scale_cutoff() -> f32 {
+    0.45
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
     pub format_version: u32,
     pub step: usize,
     pub active_levels: usize,
     pub parameters: Vec<ParameterMeta>,
+    #[serde(default)]
+    pub scale_encoding: bool,
+    #[serde(default = "default_scale_cutoff")]
+    pub scale_cutoff: f32,
 }
 
 pub struct Parameter {
@@ -66,6 +74,8 @@ pub struct Field {
     pub hybrid_activation_cache: bool,
     pub fused_mlp_packing: bool,
     pub fused_backward_params: bool,
+    pub scale_encoding: bool,
+    pub scale_cutoff: f32,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     packed_mlp_state: Option<(Tensor<2>, usize)>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
@@ -440,6 +450,8 @@ impl Field {
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
             fused_backward_params: true,
+            scale_encoding: false,
+            scale_cutoff: default_scale_cutoff(),
             packed_mlp: std::cell::RefCell::new(None),
             packed_mlp_state,
             inference_weights: std::cell::RefCell::new(None),
@@ -547,6 +559,8 @@ impl Field {
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
             fused_backward_params: true,
+            scale_encoding: m.scale_encoding,
+            scale_cutoff: m.scale_cutoff,
             packed_mlp: std::cell::RefCell::new(None),
             packed_mlp_state,
             inference_weights: std::cell::RefCell::new(None),
@@ -562,6 +576,8 @@ impl Field {
             step: self.step,
             active_levels: self.active,
             parameters: vec![],
+            scale_encoding: self.scale_encoding,
+            scale_cutoff: self.scale_cutoff,
         };
         for (name, p) in &self.params {
             let file = format!("{}.bin", name.replace('.', "_"));
@@ -702,6 +718,7 @@ impl Field {
                 }
             };
         }
+        let pt_cols = points.dims()[1];
         let mut outputs: Vec<Tensor<2>> = (0..valid_count)
             .step_by(chunk)
             .map(|start| {
@@ -710,13 +727,16 @@ impl Field {
                 let xyz = if start == 0 && total_rows == padded_n {
                     points.clone()
                 } else if start + padded_n <= total_rows {
-                    points.clone().slice([start..start + padded_n, 0..3])
+                    points.clone().slice([start..start + padded_n, 0..pt_cols])
                 } else {
-                    let pts = points.clone().slice([start..start + n, 0..3]);
+                    let pts = points.clone().slice([start..start + n, 0..pt_cols]);
                     if padded_n == n {
                         pts
                     } else {
-                        Tensor::cat(vec![pts, Tensor::empty([padded_n - n, 3], &self.device)], 0)
+                        Tensor::cat(
+                            vec![pts, Tensor::empty([padded_n - n, pt_cols], &self.device)],
+                            0,
+                        )
                     }
                 };
                 if self.fused_field {
@@ -1072,6 +1092,7 @@ impl Field {
             self.point_tiles,
             self.subgroup_reduce,
             self.selective_forward_weights,
+            self.scale_cutoff,
         )
     }
 
@@ -1086,7 +1107,7 @@ impl Field {
         self.enqueue_cached_inputs(inputs)
     }
 
-    /// Consume generated GPU coordinates `[padded_cap, 3]` with `valid_count`
+    /// Consume generated GPU coordinates `[padded_cap, 3|4]` with `valid_count`
     /// points in static power-of-two `chunk` buckets without downloading/re-uploading
     /// or issuing `Tensor::zeros` + `Tensor::cat` padding copies.
     pub fn enqueue_cached_device_valid(
@@ -1095,20 +1116,25 @@ impl Field {
         valid_count: usize,
         chunk: usize,
     ) -> PendingEvaluation {
-        let total_rows = points.dims()[0];
+        let dims = points.dims();
+        let total_rows = dims[0];
+        let pt_cols = dims[1];
         let inputs = (0..valid_count).step_by(chunk).map(|start| {
             let n = (valid_count - start).min(chunk);
             let padded = Self::static_bucket_size(n, chunk);
             let pts = if start == 0 && total_rows == padded {
                 points.clone()
             } else if start + padded <= total_rows {
-                points.clone().slice([start..start + padded, 0..3])
+                points.clone().slice([start..start + padded, 0..pt_cols])
             } else {
-                let sub = points.clone().slice([start..start + n, 0..3]);
+                let sub = points.clone().slice([start..start + n, 0..pt_cols]);
                 if padded == n {
                     sub
                 } else {
-                    Tensor::cat(vec![sub, Tensor::empty([padded - n, 3], &self.device)], 0)
+                    Tensor::cat(
+                        vec![sub, Tensor::empty([padded - n, pt_cols], &self.device)],
+                        0,
+                    )
                 }
             };
             (n, pts)
@@ -1482,6 +1508,7 @@ impl Field {
                     self.selective_backward_weights,
                     accumulate,
                     self.active_parameter_columns,
+                    self.scale_cutoff,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
                 fused_partials = Some((next_dw0p, next_dw1p));

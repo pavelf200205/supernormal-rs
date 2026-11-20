@@ -93,13 +93,24 @@ fn main() -> Result<()> {
             data,
         } => {
             let field = field::Field::load(&model, device)?;
-            let (scale, offset) = if let Some(path) = data {
-                let dataset = data::Dataset::load(&path)?;
-                (dataset.scale, dataset.offset)
+            let dataset = if let Some(path) = data {
+                Some(data::Dataset::load(&path)?)
             } else {
-                (1., [0.; 3])
+                None
             };
-            return mesh::extract(&field, &out, resolution, query, scale, offset);
+            let (scale, offset) = dataset
+                .as_ref()
+                .map(|d| (d.scale, d.offset))
+                .unwrap_or((1., [0.; 3]));
+            return mesh::extract_with_dataset(
+                &field,
+                dataset.as_ref(),
+                &out,
+                resolution,
+                query,
+                scale,
+                offset,
+            );
         }
         Command::VerifyRender { fixture, data } => {
             return render::verify(&fixture, data.as_deref());
