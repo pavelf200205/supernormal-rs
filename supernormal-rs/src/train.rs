@@ -145,9 +145,13 @@ pub struct TrainArgs {
     #[serde(default)]
     pub legacy_mlp_packing: bool,
     /// Forward workgroup weight-reuse tile: 4, 8, or 16 points.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 16)]
     #[serde(default = "default_field_points")]
     pub field_points_per_group: usize,
+    /// Restore separate field_backward and parameter_gradients dispatches with global dh buffer.
+    #[arg(long)]
+    #[serde(default)]
+    pub legacy_fused_backward: bool,
     #[arg(long)]
     #[serde(default)]
     pub legacy_field_reduction: bool,
@@ -207,7 +211,7 @@ pub struct TrainArgs {
 }
 
 fn default_field_points() -> usize {
-    4
+    16
 }
 fn default_aggregation_levels() -> usize {
     14
@@ -416,6 +420,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.wide_parameter_rows = !args.legacy_parameter_rows;
     field.hybrid_activation_cache = args.hybrid_activation_cache && !args.no_hybrid_cache;
     field.fused_mlp_packing = !args.legacy_mlp_packing;
+    field.fused_backward_params = !args.legacy_fused_backward;
     field.chunked_eval = args.chunked_eval;
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut occ = Occupancy::new(args.occupancy_resolution);
@@ -804,27 +809,6 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             }
         }
 
-        // Keep the two optimizer scalars device-resident. Reading loss before
-        // Adam used to force an idle gap between backward and the update.
-        if let Some(stats) = &device_stats {
-            gradients.insert(
-                "variance".into(),
-                stats.clone().slice([0..1, 3..4]) + variance_grad,
-            );
-            gradients.insert(
-                "lin1.bias".into(),
-                stats.clone().slice([0..1, 4..5]) + sdf_bias_grad as f32,
-            );
-        } else {
-            gradients.insert(
-                "variance".into(),
-                tensor(vec![variance_grad], [1, 1], &field.device),
-            );
-            gradients.insert(
-                "lin1.bias".into(),
-                tensor(vec![sdf_bias_grad as f32], [1, 1], &field.device),
-            );
-        }
         let factor = if step < 500 {
             step as f64 / 500.
         } else {
@@ -832,7 +816,41 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             ((progress * std::f64::consts::PI).cos() + 1.) * 0.5 * 0.95 + 0.05
         };
         let t_adam_start = std::time::Instant::now();
-        field.apply_gradients_packed(gradients, 5e-4 * factor);
+        // Keep the two optimizer scalars device-resident. When all MLP gradients
+        // came from the fused device path, hand `device_stats` directly to the
+        // single-workgroup fused MLP WeightNorm + Adam + pack kernel.
+        if !args.cpu_composite
+            && variance_grad == 0.0
+            && sdf_bias_grad == 0.0
+            && device_stats.is_some()
+        {
+            field.apply_gradients_packed_with_stats(
+                gradients,
+                device_stats.as_ref(),
+                5e-4 * factor,
+            );
+        } else {
+            if let Some(stats) = &device_stats {
+                gradients.insert(
+                    "variance".into(),
+                    stats.clone().slice([0..1, 3..4]) + variance_grad,
+                );
+                gradients.insert(
+                    "lin1.bias".into(),
+                    stats.clone().slice([0..1, 4..5]) + sdf_bias_grad as f32,
+                );
+            } else {
+                gradients.insert(
+                    "variance".into(),
+                    tensor(vec![variance_grad], [1, 1], &field.device),
+                );
+                gradients.insert(
+                    "lin1.bias".into(),
+                    tensor(vec![sdf_bias_grad as f32], [1, 1], &field.device),
+                );
+            }
+            field.apply_gradients_packed(gradients, 5e-4 * factor);
+        }
         field.step += 1;
 
         if field.step == 1000 {

@@ -42,6 +42,12 @@ fn march_kernel(
         terminate!();
     }
     let b = ray * 12;
+    let ox = rays[b];
+    let oy = rays[b + 1];
+    let oz = rays[b + 2];
+    let dx = rays[b + 3];
+    let dy = rays[b + 4];
+    let dz = rays[b + 5];
     let near = rays[b + 6];
     let far = rays[b + 7];
     let step = rays[b + 8];
@@ -49,6 +55,26 @@ fn march_kernel(
     let capacity = usize::cast_from(rays[b + 10]);
     let r = usize::cast_from(rays[b + 11]);
     let half_r = f32::cast_from(r) * 0.5_f32;
+    let r_max = f32::cast_from(r - 1);
+    let safe_dx = if f32::abs(dx) < 1e-10_f32 {
+        1e-10_f32
+    } else {
+        dx
+    };
+    let safe_dy = if f32::abs(dy) < 1e-10_f32 {
+        1e-10_f32
+    } else {
+        dy
+    };
+    let safe_dz = if f32::abs(dz) < 1e-10_f32 {
+        1e-10_f32
+    } else {
+        dz
+    };
+    let inv_dx = 1.0_f32 / (safe_dx * half_r);
+    let inv_dy = 1.0_f32 / (safe_dy * half_r);
+    let inv_dz = 1.0_f32 / (safe_dz * half_r);
+    let inv_step = 1.0_f32 / step;
     let mut count = 0usize;
     let mut ep_count = 0usize;
     let mut prev_end_bits = 0u32;
@@ -60,31 +86,22 @@ fn march_kernel(
         if mid >= far {
             break;
         }
-        let mut cell = 0usize;
-        let mut inside = true;
-        let mut dt_voxel = 3.402823466e38_f32;
-        for axis in 0..3usize {
-            let d = rays[b + 3 + axis];
-            let pt = rays[b + axis] + d * mid;
-            if pt < -1.0_f32 || pt > 1.0_f32 {
-                inside = false;
-            }
-            let grid = (pt + 1.0_f32) * half_r;
-            let c = usize::cast_from(f32::clamp(grid, 0.0_f32, f32::cast_from(r - 1)));
-            cell = cell * r + c;
-            let plane = if d >= 0.0_f32 {
-                f32::floor(grid) + 1.0_f32
-            } else {
-                f32::ceil(grid) - 1.0_f32
-            };
-            let safe_d = if f32::abs(d) < 1e-10_f32 {
-                1e-10_f32
-            } else {
-                d
-            };
-            let dt = (plane - grid) * (1.0_f32 / safe_d) / half_r;
-            dt_voxel = f32::min(dt_voxel, dt);
-        }
+        let px = ox + dx * mid;
+        let py = oy + dy * mid;
+        let pz = oz + dz * mid;
+        let inside = px >= -1.0_f32
+            && px <= 1.0_f32
+            && py >= -1.0_f32
+            && py <= 1.0_f32
+            && pz >= -1.0_f32
+            && pz <= 1.0_f32;
+        let gx = (px + 1.0_f32) * half_r;
+        let gy = (py + 1.0_f32) * half_r;
+        let gz = (pz + 1.0_f32) * half_r;
+        let cx = usize::cast_from(f32::clamp(gx, 0.0_f32, r_max));
+        let cy = usize::cast_from(f32::clamp(gy, 0.0_f32, r_max));
+        let cz = usize::cast_from(f32::clamp(gz, 0.0_f32, r_max));
+        let cell = (cx * r + cy) * r + cz;
         if inside && flags[cell] > 0.0_f32 {
             samples[(offset + count) * 2] = t;
             samples[(offset + count) * 2 + 1] = end;
@@ -97,18 +114,34 @@ fn march_kernel(
             prev_end_bits = u32::reinterpret(end);
             count += 1;
             s += 1;
-        } else {
-            let skip = if inside {
-                usize::cast_from(f32::clamp(
-                    f32::ceil(dt_voxel / step),
-                    1.0_f32,
-                    f32::cast_from(capacity - s),
-                ))
+        } else if inside {
+            let pl_x = if dx >= 0.0_f32 {
+                f32::floor(gx) + 1.0_f32
             } else {
-                1usize
+                f32::ceil(gx) - 1.0_f32
             };
-            // Clamp before addition to prevent overflow for nearly parallel rays.
+            let pl_y = if dy >= 0.0_f32 {
+                f32::floor(gy) + 1.0_f32
+            } else {
+                f32::ceil(gy) - 1.0_f32
+            };
+            let pl_z = if dz >= 0.0_f32 {
+                f32::floor(gz) + 1.0_f32
+            } else {
+                f32::ceil(gz) - 1.0_f32
+            };
+            let dt_voxel = f32::min(
+                (pl_x - gx) * inv_dx,
+                f32::min((pl_y - gy) * inv_dy, (pl_z - gz) * inv_dz),
+            );
+            let skip = usize::cast_from(f32::clamp(
+                f32::ceil(dt_voxel * inv_step),
+                1.0_f32,
+                f32::cast_from(capacity - s),
+            ));
             s += usize::min(skip, capacity - s);
+        } else {
+            s += 1;
         }
     }
     if counts.shape(1) == 2 {
@@ -177,12 +210,19 @@ fn compact_and_center_endpoints_kernel(
     ranges[ray * 2 + 1] = f32::cast_from(s_end);
     let offset = usize::cast_from(rays[ray * 12 + 9]);
     let rb = ray * 12;
+    let ox = rays[rb];
+    let oy = rays[rb + 1];
+    let oz = rays[rb + 2];
+    let dx = rays[rb + 3];
+    let dy = rays[rb + 4];
+    let dz = rays[rb + 5];
+    let ray_f = f32::cast_from(ray);
     let mut prev_end_bits = 0u32;
     for i in 0..s_end - s_begin {
         let t_start = samples[(offset + i) * 2];
         let t_end = samples[(offset + i) * 2 + 1];
         let m_idx = s_begin + i;
-        marched[m_idx * 3] = f32::cast_from(ray);
+        marched[m_idx * 3] = ray_f;
         marched[m_idx * 3 + 1] = t_start;
         marched[m_idx * 3 + 2] = t_end;
 
@@ -196,14 +236,14 @@ fn compact_and_center_endpoints_kernel(
             end_id = ep_cursor;
             ep_cursor += 1;
         } else {
-            for d in 0..3usize {
-                unique_pts[start_id * 3 + d] = rays[rb + d] + rays[rb + 3 + d] * t_start;
-            }
+            unique_pts[start_id * 3] = ox + dx * t_start;
+            unique_pts[start_id * 3 + 1] = oy + dy * t_start;
+            unique_pts[start_id * 3 + 2] = oz + dz * t_start;
             ep_cursor += 2;
         }
-        for d in 0..3usize {
-            unique_pts[end_id * 3 + d] = rays[rb + d] + rays[rb + 3 + d] * t_end;
-        }
+        unique_pts[end_id * 3] = ox + dx * t_end;
+        unique_pts[end_id * 3 + 1] = oy + dy * t_end;
+        unique_pts[end_id * 3 + 2] = oz + dz * t_end;
         pairs[m_idx * 2] = f32::cast_from(start_id);
         pairs[m_idx * 2 + 1] = f32::cast_from(end_id);
     }
@@ -482,10 +522,10 @@ impl Operation<FusionCubeRuntime> for MarchOp {
         let client = r.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.MarchOp");
         let n = r.meta.shape().dims::<2>()[0];
-        let dim = CubeDim::new(&client, n);
+        let dim = CubeDim::new_1d(32);
         march_kernel::launch(
             &client,
-            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            CubeCount::Static(n.div_ceil(32) as u32, 1, 1),
             dim,
             r.into_tensor_arg(),
             f.into_tensor_arg(),
@@ -598,10 +638,10 @@ impl Operation<FusionCubeRuntime> for CompactAndCenterEndpointsOp {
         let client = r.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.CompactAndCenterEndpointsOp");
         let n = r.meta.shape().dims::<2>()[0];
-        let dim = CubeDim::new(&client, n);
+        let dim = CubeDim::new_1d(32);
         compact_and_center_endpoints_kernel::launch(
             &client,
-            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            CubeCount::Static(n.div_ceil(32) as u32, 1, 1),
             dim,
             r.into_tensor_arg(),
             s.into_tensor_arg(),
@@ -686,10 +726,10 @@ impl Operation<FusionCubeRuntime> for BuildVisibleGeometryTablesOp {
         let client = m.client.clone();
         let _timing = crate::diagnostics::start(&client, "geometry_tables");
         let n_rays = (*patch_count as usize).max(1);
-        let dim = CubeDim::new(&client, n_rays);
+        let dim = CubeDim::new_1d(32);
         build_visible_geometry_tables_kernel::launch(
             &client,
-            cubecl::calculate_cube_count_elemwise(&client, n_rays, dim),
+            CubeCount::Static(n_rays.div_ceil(32) as u32, 1, 1),
             dim,
             m.into_tensor_arg(),
             mp.into_tensor_arg(),
@@ -1820,9 +1860,14 @@ pub fn geometry(
 fn gather_patch_tables_kernel(
     coords: &Tensor<f32>,
     view_meta: &Tensor<f32>,
-    params: &Tensor<f32>,
     geom_rays: &mut Tensor<f32>,
     packed_patches: &mut Tensor<f32>,
+    patch_start_u: u32,
+    s_base: f32,
+    inv: f32,
+    normal_den: f32,
+    pixel_den: f32,
+    sample_den: f32,
 ) {
     let id = ABSOLUTE_POS;
     let n_patches = geom_rays.shape(0);
@@ -1831,12 +1876,7 @@ fn gather_patch_tables_kernel(
     }
     let p = id / 9;
     let i = id % 9;
-    let patch_start = usize::cast_from(params[0]);
-    let s_base = params[1];
-    let inv = params[2];
-    let normal_den = params[3];
-    let pixel_den = params[4];
-    let sample_den = params[5];
+    let patch_start = usize::cast_from(patch_start_u);
 
     let c_idx = (patch_start + p) * 39;
     let v = usize::cast_from(coords[c_idx]);
@@ -1951,9 +1991,19 @@ impl Operation<FusionCubeRuntime> for GatherPatchTablesOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([c, vm, pr, gr, pp], [ogr, opp]) = self.desc.as_fixed();
-        let [c, vm, pr, gr, pp] =
-            [c, vm, pr, gr, pp].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let ([c, vm, gr, pp], [ogr, opp]) = self.desc.as_fixed();
+        let [
+            ScalarIr::UInt(patch_start),
+            ScalarIr::Float(s_base),
+            ScalarIr::Float(inv),
+            ScalarIr::Float(normal_den),
+            ScalarIr::Float(pixel_den),
+            ScalarIr::Float(sample_den),
+        ] = self.desc.scalars.as_slice()
+        else {
+            panic!("invalid gather_patch_tables scalars")
+        };
+        let [c, vm, gr, pp] = [c, vm, gr, pp].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = c.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.GatherPatchTablesOp");
         let n = gr.meta.shape().dims::<2>()[0] * 9;
@@ -1964,28 +2014,39 @@ impl Operation<FusionCubeRuntime> for GatherPatchTablesOp {
             dim,
             c.into_tensor_arg(),
             vm.into_tensor_arg(),
-            pr.into_tensor_arg(),
             gr.clone().into_tensor_arg(),
             pp.clone().into_tensor_arg(),
+            *patch_start as u32,
+            *s_base as f32,
+            *inv as f32,
+            *normal_den as f32,
+            *pixel_den as f32,
+            *sample_den as f32,
         );
         handles.register_float_tensor::<CubeBackend>(&ogr.id, gr);
         handles.register_float_tensor::<CubeBackend>(&opp.id, pp);
         Ok(())
     }
 }
+#[allow(clippy::too_many_arguments)]
 pub fn gather_patch_tables(
     coords: burn::tensor::Tensor<2>,
     view_meta: burn::tensor::Tensor<2>,
-    params: burn::tensor::Tensor<2>,
+    patch_start: usize,
+    s_base: usize,
+    inv: f32,
+    normal_den: f32,
+    pixel_den: f32,
+    sample_den: f32,
     patch_count: usize,
 ) -> [burn::tensor::Tensor<2>; 2] {
     let device = coords.device();
     let gr_buf = burn::tensor::Tensor::<2>::empty([patch_count, 39], &device);
     let pp_buf = burn::tensor::Tensor::<2>::empty([patch_count, 123], &device);
-    let inputs = [coords, view_meta, params, gr_buf, pp_buf]
+    let inputs = [coords, view_meta, gr_buf, pp_buf]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = [3usize, 4usize]
+    let outputs: Vec<_> = [2usize, 3usize]
         .into_iter()
         .map(|i| {
             TensorIr::uninit(
@@ -1999,7 +2060,14 @@ pub fn gather_patch_tables(
         "supernormal_gather_patch_tables",
         &inputs.map(|t| t.into_ir()),
         &outputs,
-        vec![],
+        vec![
+            ScalarIr::UInt(patch_start as u64),
+            ScalarIr::Float(s_base as f64),
+            ScalarIr::Float(inv as f64),
+            ScalarIr::Float(normal_den as f64),
+            ScalarIr::Float(pixel_den as f64),
+            ScalarIr::Float(sample_den as f64),
+        ],
     );
     let result: [_; 2] = client
         .register(
@@ -2096,6 +2164,450 @@ pub fn mesh_slab_points_batch(
             StreamId::current(),
             OperationIr::Custom(desc.clone()),
             MeshSlabPointsOp { desc },
+        )
+        .outputs();
+    burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)
+}
+
+/// Single-workgroup inclusive prefix scan of `[n, 2]` `(count, ep_count)` pairs
+/// fused with packing the scalar readback packet (`mode 0`: `[t0, t1]`,
+/// `mode 1`: `[t0, t1, extra[0..3]]`, `mode 2`: `[t0, t1, counts[n*2]]`),
+/// eliminating Burn's multi-dispatch `cumsum(0)`, `slice`, `reshape`, and `cat`.
+#[cube(launch)]
+fn scan_2d_pairs_and_pack_kernel(
+    counts: &Tensor<f32>,
+    extra: &Tensor<f32>,
+    prefix: &mut Tensor<f32>,
+    meta: &mut Tensor<f32>,
+    n_rows: u32,
+    #[comptime] mode: u32,
+) {
+    let unit = usize::cast_from(UNIT_POS);
+    let n = usize::cast_from(n_rows);
+    let chunk = (n + 255usize) / 256usize;
+    let start = unit * chunk;
+    let end = usize::min(start + chunk, n);
+    let mut s0 = 0.0_f32;
+    let mut s1 = 0.0_f32;
+    for i in start..end {
+        s0 += counts[i * 2];
+        s1 += counts[i * 2 + 1];
+    }
+    let mut sh0 = Shared::new_slice(256usize);
+    let mut sh1 = Shared::new_slice(256usize);
+    sh0[unit] = s0;
+    sh1[unit] = s1;
+    sync_cube();
+    let mut offset = 1usize;
+    for _ in 0..8usize {
+        let v0 = if unit >= offset {
+            sh0[unit - offset]
+        } else {
+            0.0_f32
+        };
+        let v1 = if unit >= offset {
+            sh1[unit - offset]
+        } else {
+            0.0_f32
+        };
+        sync_cube();
+        if unit >= offset {
+            sh0[unit] += v0;
+            sh1[unit] += v1;
+        }
+        sync_cube();
+        offset = offset * 2usize;
+    }
+    let mut base0 = if unit == 0usize {
+        0.0_f32
+    } else {
+        sh0[unit - 1usize]
+    };
+    let mut base1 = if unit == 0usize {
+        0.0_f32
+    } else {
+        sh1[unit - 1usize]
+    };
+    for i in start..end {
+        base0 += counts[i * 2];
+        base1 += counts[i * 2 + 1];
+        prefix[i * 2] = base0;
+        prefix[i * 2 + 1] = base1;
+    }
+    if unit == 0usize {
+        meta[0] = sh0[255];
+        meta[1] = sh1[255];
+        if mode == 1u32 {
+            meta[2] = extra[0];
+            meta[3] = extra[1];
+            meta[4] = extra[2];
+        } else if mode == 2u32 {
+            meta[2] = counts[n * 2];
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Scan2dPairsOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for Scan2dPairsOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([c, e, p, m], [op, om]) = self.desc.as_fixed();
+        let [ScalarIr::UInt(n_rows), ScalarIr::UInt(mode)] = self.desc.scalars.as_slice() else {
+            panic!("invalid scan_2d_pairs scalars")
+        };
+        let [c, e, p, m] = [c, e, p, m].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let client = c.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.Scan2dPairsOp");
+        scan_2d_pairs_and_pack_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(256),
+            c.into_tensor_arg(),
+            e.into_tensor_arg(),
+            p.clone().into_tensor_arg(),
+            m.clone().into_tensor_arg(),
+            *n_rows as u32,
+            *mode as u32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&op.id, p);
+        handles.register_float_tensor::<CubeBackend>(&om.id, m);
+        Ok(())
+    }
+}
+pub fn scan_2d_pairs_and_pack(
+    counts: burn::tensor::Tensor<2>,
+    extra: Option<burn::tensor::Tensor<2>>,
+    n_rows: usize,
+    mode: u32,
+) -> [burn::tensor::Tensor<2>; 2] {
+    let device = counts.device();
+    let meta_len = match mode {
+        1 => 5,
+        2 => 3,
+        _ => 2,
+    };
+    let extra_t = extra.unwrap_or_else(|| counts.clone());
+    let prefix_buf = burn::tensor::Tensor::<2>::empty([n_rows, 2], &device);
+    let meta_buf = burn::tensor::Tensor::<2>::empty([meta_len, 1], &device);
+    let inputs = [counts, extra_t, prefix_buf, meta_buf]
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let outputs: Vec<_> = [2usize, 3]
+        .into_iter()
+        .map(|i| {
+            TensorIr::uninit(
+                client.create_empty_handle(),
+                inputs[i].shape.clone(),
+                inputs[i].dtype,
+            )
+        })
+        .collect();
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_scan_2d_pairs",
+        &inputs.map(|t| t.into_ir()),
+        &outputs,
+        vec![ScalarIr::UInt(n_rows as u64), ScalarIr::UInt(mode as u64)],
+    );
+    let result: [_; 2] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            Scan2dPairsOp { desc },
+        )
+        .outputs();
+    result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
+}
+
+#[cube(launch)]
+fn scan_1d_kernel(counts: &Tensor<f32>, prefix: &mut Tensor<f32>, n_rows: u32) {
+    let unit = usize::cast_from(UNIT_POS);
+    let n = usize::cast_from(n_rows);
+    let chunk = (n + 255usize) / 256usize;
+    let start = unit * chunk;
+    let end = usize::min(start + chunk, n);
+    let mut s = 0.0_f32;
+    for i in start..end {
+        s += counts[i];
+    }
+    let mut sh = Shared::new_slice(256usize);
+    sh[unit] = s;
+    sync_cube();
+    let mut offset = 1usize;
+    for _ in 0..8usize {
+        let v = if unit >= offset {
+            sh[unit - offset]
+        } else {
+            0.0_f32
+        };
+        sync_cube();
+        if unit >= offset {
+            sh[unit] += v;
+        }
+        sync_cube();
+        offset = offset * 2usize;
+    }
+    let mut base = if unit == 0usize {
+        0.0_f32
+    } else {
+        sh[unit - 1usize]
+    };
+    for i in start..end {
+        base += counts[i];
+        prefix[i] = base;
+    }
+}
+
+#[derive(Debug)]
+struct Scan1dOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for Scan1dOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([c, p], [op]) = self.desc.as_fixed();
+        let [ScalarIr::UInt(n_rows)] = self.desc.scalars.as_slice() else {
+            panic!("invalid scan_1d scalars")
+        };
+        let [c, p] = [c, p].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let client = c.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.Scan1dOp");
+        scan_1d_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(256),
+            c.into_tensor_arg(),
+            p.clone().into_tensor_arg(),
+            *n_rows as u32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&op.id, p);
+        Ok(())
+    }
+}
+pub fn scan_1d(counts: burn::tensor::Tensor<2>) -> burn::tensor::Tensor<2> {
+    let n_rows = counts.dims()[0];
+    let device = counts.device();
+    let prefix_buf = burn::tensor::Tensor::<2>::empty([n_rows, 1], &device);
+    let inputs = [counts, prefix_buf].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        inputs[1].shape.clone(),
+        inputs[1].dtype,
+    );
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_scan_1d",
+        &inputs.map(|t| t.into_ir()),
+        &[out],
+        vec![ScalarIr::UInt(n_rows as u64)],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            Scan1dOp { desc },
+        )
+        .outputs();
+    burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)
+}
+
+/// Generate coarse probe grid coordinates `[(nb + 1)^3, 3]` directly on the GPU
+/// for conservative block-skipping Marching Cubes. Each coarse axis index `c` maps
+/// to exact fine grid index `min(c * block_size, res - 1)`.
+#[cube(launch)]
+fn mesh_coarse_points_kernel(
+    points: &mut Tensor<f32>,
+    res: u32,
+    block_size: u32,
+    c_res: u32,
+    inv_res_m1: f32,
+) {
+    let i = ABSOLUTE_POS;
+    if i >= points.shape(0) {
+        terminate!();
+    }
+    let cr = usize::cast_from(c_res);
+    let plane = cr * cr;
+    let cz = i / plane;
+    let rem = i % plane;
+    let cy = rem / cr;
+    let cx = rem % cr;
+    let max_idx = usize::cast_from(res - 1u32);
+    let bs = usize::cast_from(block_size);
+    let gx = usize::min(cx * bs, max_idx);
+    let gy = usize::min(cy * bs, max_idx);
+    let gz = usize::min(cz * bs, max_idx);
+    points[i * 3] = -1.0_f32 + 2.0_f32 * f32::cast_from(gx) * inv_res_m1;
+    points[i * 3 + 1] = -1.0_f32 + 2.0_f32 * f32::cast_from(gy) * inv_res_m1;
+    points[i * 3 + 2] = -1.0_f32 + 2.0_f32 * f32::cast_from(gz) * inv_res_m1;
+}
+
+#[derive(Debug)]
+struct MeshCoarsePointsOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for MeshCoarsePointsOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([p], [op]) = self.desc.as_fixed();
+        let [
+            ScalarIr::UInt(res),
+            ScalarIr::UInt(block_size),
+            ScalarIr::UInt(c_res),
+            ScalarIr::Float(inv_res_m1),
+        ] = self.desc.scalars.as_slice()
+        else {
+            panic!("invalid mesh_coarse_points scalars")
+        };
+        let p = handles.get_float_tensor::<CubeBackend>(p);
+        let client = p.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.MeshCoarsePointsOp");
+        let n = p.meta.shape().dims::<2>()[0];
+        let dim = CubeDim::new(&client, n);
+        mesh_coarse_points_kernel::launch(
+            &client,
+            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            dim,
+            p.clone().into_tensor_arg(),
+            *res as u32,
+            *block_size as u32,
+            *c_res as u32,
+            *inv_res_m1 as f32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&op.id, p);
+        Ok(())
+    }
+}
+pub fn mesh_coarse_points(
+    res: usize,
+    block_size: usize,
+    device: &burn::tensor::Device,
+) -> burn::tensor::Tensor<2> {
+    let nb = (res - 1).div_ceil(block_size);
+    let c_res = nb + 1;
+    let total = c_res * c_res * c_res;
+    let inv_res_m1 = 1.0_f32 / (res - 1) as f32;
+    let p_buf = burn::tensor::Tensor::<2>::empty([total, 3], device);
+    let p = p_buf.inner().try_into_primitive::<GpuBackend>().unwrap();
+    let client = p.client.clone();
+    let out = TensorIr::uninit(client.create_empty_handle(), p.shape.clone(), p.dtype);
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_mesh_coarse_points",
+        &[p.into_ir()],
+        &[out],
+        vec![
+            ScalarIr::UInt(res as u64),
+            ScalarIr::UInt(block_size as u64),
+            ScalarIr::UInt(c_res as u64),
+            ScalarIr::Float(inv_res_m1 as f64),
+        ],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            MeshCoarsePointsOp { desc },
+        )
+        .outputs();
+    burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)
+}
+
+/// Generate `[z_count * K, 3]` 3D fine-grid points for a sparse z-band directly on
+/// the GPU from a compact `[K, 2]` list of active `(x, y)` grid coordinates.
+#[cube(launch)]
+fn mesh_sparse_band_points_kernel(
+    xy_coords: &Tensor<f32>,
+    points: &mut Tensor<f32>,
+    z_start: u32,
+    inv_res_m1: f32,
+) {
+    let i = ABSOLUTE_POS;
+    if i >= points.shape(0) {
+        terminate!();
+    }
+    let k = xy_coords.shape(0);
+    let lz = i / k;
+    let idx = i % k;
+    let x = xy_coords[idx * 2];
+    let y = xy_coords[idx * 2 + 1];
+    let z = f32::cast_from(usize::cast_from(z_start) + lz);
+    points[i * 3] = -1.0_f32 + 2.0_f32 * x * inv_res_m1;
+    points[i * 3 + 1] = -1.0_f32 + 2.0_f32 * y * inv_res_m1;
+    points[i * 3 + 2] = -1.0_f32 + 2.0_f32 * z * inv_res_m1;
+}
+
+#[derive(Debug)]
+struct MeshSparseBandPointsOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for MeshSparseBandPointsOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([xy, p], [op]) = self.desc.as_fixed();
+        let [ScalarIr::UInt(z_start), ScalarIr::Float(inv_res_m1)] = self.desc.scalars.as_slice()
+        else {
+            panic!("invalid mesh_sparse_band_points scalars")
+        };
+        let [xy, p] = [xy, p].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let client = p.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.MeshSparseBandPointsOp");
+        let n = p.meta.shape().dims::<2>()[0];
+        let dim = CubeDim::new(&client, n);
+        mesh_sparse_band_points_kernel::launch(
+            &client,
+            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            dim,
+            xy.into_tensor_arg(),
+            p.clone().into_tensor_arg(),
+            *z_start as u32,
+            *inv_res_m1 as f32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&op.id, p);
+        Ok(())
+    }
+}
+pub fn mesh_sparse_band_points(
+    xy_coords: burn::tensor::Tensor<2>,
+    res: usize,
+    z_start: usize,
+    z_count: usize,
+) -> burn::tensor::Tensor<2> {
+    let k = xy_coords.dims()[0];
+    let total = k * z_count;
+    let inv_res_m1 = 1.0_f32 / (res - 1) as f32;
+    let device = xy_coords.device();
+    let p_buf = burn::tensor::Tensor::<2>::empty([total, 3], &device);
+    let inputs = [xy_coords, p_buf].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        inputs[1].shape.clone(),
+        inputs[1].dtype,
+    );
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_mesh_sparse_band_points",
+        &inputs.map(|t| t.into_ir()),
+        &[out],
+        vec![
+            ScalarIr::UInt(z_start as u64),
+            ScalarIr::Float(inv_res_m1 as f64),
+        ],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            MeshSparseBandPointsOp { desc },
         )
         .outputs();
     burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)

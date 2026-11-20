@@ -274,3 +274,42 @@ diagnostic counters and validation requirements. No build or tests were run.
 ### 4. 4-Slab Batched GPU Marching Cubes (`src/mesh.rs`, `src/sampling_gpu.rs`)
 - **Fix**: Extended `mesh_slab_points_kernel` (`mesh_slab_points_batch`) and `mesh::extract` to evaluate and read back `BATCH_SLABS = 4` slabs (`4 * res * res` points) per GPU dispatch with double-buffered lookahead (`enqueue_batch`), reducing GPU-to-host synchronization barriers during `1024^3` Marching Cubes extraction by **4x** (`256` readbacks instead of `1,024`).
 
+---
+
+## Update 8 — Warp-Shuffled Forward & Persistent Fused Backward, Single-Workgroup MLP Optimizer, Full-SM Ray Kernels, and Conservative Sparse Marching Cubes
+
+Deep kernel profiling (`--diagnostics`, `--profile-stages`) on an NVIDIA RTX 3060 (12 GB, 28 SMs, Vulkan/SPIR-V) against `experiments/after_george_kopanas_upgrades14` identified four remaining bottlenecks across forward, backward, per-step host/dispatch overhead, and `1024^3` mesh extraction:
+
+### 1. Warp-Shuffled Hash Forward, 16-Point Tiles, and Compositor Register Hoisting (`src/kernels.rs`, `src/field.rs`, `src/train.rs`)
+- **`field_hash_tile` & `fused_field_kernel`**:
+  - Removed the pre-hash `sync_cube()` zeroing barrier and 252 redundant `points` loads per tile (only `lane < 3` loads `xyz`), unrolled the 2-corner loop and hoisted `v1, v2, kw1*kw2, dense_yz, hash_yz`, and replaced the 512-float shared `partials` reduction + post-hash `sync_cube()` with subgroup `plane_shuffle_xor` (masks `4` and `8`) on 32-wide warps (preserving the portable shared fallback when `subgroup_width == 0`).
+  - Eliminated trailing inter-tile `sync_cube()` barriers for `point_tiles > 1` and occupancy mode, and increased the default `field_points_per_group` from `8` to `16` (`point_tiles = 4`).
+- **`composite_kernel`**: Added an immediate `begin >= end` fast-path exit for background rays and hoisted all 9 loop-invariant `patches[vb + 0..9]` inverse-basis entries into registers.
+- **Measured GPU impact (RTX 3060, step 30k)**: `field_forward` `-12.5%` (`133.2 -> 116.6 ms` / 128 calls), `occupancy.fused_field_apply` `-25.7%` (`51.3 -> 38.1 ms` / 5 calls), `composite` `-13.1%` (`46.5 -> 40.4 ms` / 40 calls).
+
+### 2. Persistent Fused Backward + In-Register Parameter Gradients (`src/kernels.rs`, `src/field.rs`, `src/train.rs`)
+- Added `field_backward_fused_native_kernel` / `field_backward_fused_cas_kernel` (`448` persistent workgroups over contiguous group ranges) plus `reduce_mlp_partials_kernel` (`17 x 128` single-wave reduction), with `--legacy-fused-backward` for A/B comparison.
+- Eliminates the global `[N, 64]` `dh` buffer (`~400+ MB/step` DRAM traffic), eliminates the separate `parameter_gradients` pass and double `features` reads, accumulates `dw0 + db0` (8 accumulators/thread) and `dw1` (1 accumulator/thread) in registers across chunks into a single end-of-step reduction, uses bank-conflict-free `shared_dh[slot * 68 + lane]`, replaces shared-memory Phase-1 reduction and 4-point hash aggregation with warp shuffles, and hoists loop-invariant hash-level metadata (`res`, `offset`).
+- Also resolves the `lin0.bias` packed gradient mismatch present in the legacy wide-row parameter kernel (`verify` `lin0.bias` max abs `2.98e-8`; `verify-step` `1.29e-5`).
+- **Measured GPU impact**: `field_backward` + `parameter_gradients` `275.1 ms -> 239.2 ms` (`-13.1%` across 128 chunks) plus removal of ~16 Burn `sum_dim` reductions per step.
+
+### 3. Single-Workgroup Fused MLP Step, Custom Scans, Full-SM Ray Kernels & CPU/GPU Overlap (`src/kernels.rs`, `src/sampling_gpu.rs`, `src/render.rs`, `src/field.rs`, `src/train.rs`)
+- **`fused_mlp_adam_pack_kernel`**: Single 128-thread workgroup (`0.03 ms/step`) operating on packed `[3, 2179]` MLP state to run Layer 0 & Layer 1 WeightNorm backward, 7-parameter Adam (`lin0/lin1` weights/biases + `variance`), WeightNorm forward, and transposed `packed_mlp` `[1, 2113]` packing in one dispatch (replacing ~118 Burn ops and ~20 tiny GPU launches/step).
+- **`reduce_composite_stats_kernel` & `scan_2d_pairs_and_pack_kernel` / `scan_1d_kernel`**: Replaced Burn `sum_dim(0)`, `cumsum(0)`, and `Tensor::cat` readback-packing ops with single-workgroup kernels and passed `vscale` and `gather_patch_tables` parameters as `ScalarIr` scalars (eliminating small host-to-device uploads).
+- **Full-SM 32-Thread Ray Kernels & Overlapped Patch Gather**: Switched `MarchOp`, `CompactAndCenterEndpointsOp`, `BuildVisibleGeometryTablesOp`, and `VisibilityOp` from 256-thread blocks (8 workgroups = 28% SM utilization on 2,048 rays) to 32-thread blocks (64 workgroups across all 28 SMs), hoisted loop-invariant ray origins/directions/reciprocals into registers, and parallelized `f16::to_f32` patch gathering overlapped underneath GPU visibility execution.
+- **Measured GPU impact**: `MarchOp` `-34.3%` (`24.5 -> 16.1 ms`), `CompactAndCenterEndpointsOp` `-40.3%` (`23.6 -> 14.1 ms`), `geometry_tables` `-5.7%` (`12.3 -> 11.6 ms`).
+
+### 4. Conservative Coarse-to-Fine Sparse Marching Cubes (`src/mesh.rs`, `src/sampling_gpu.rs`)
+- For `res >= 128`, evaluates a coarse `8`-stride probe grid (`129^3` at `res = 1024`) on GPU (`mesh_coarse_points_kernel`), marks `8x8x8` blocks active whenever coarse corners change sign OR `min(|sdf|) < 3.0 * block_diag` (plus 1-ring 26-neighbor dilation around sign-changing blocks), generates fine coordinates ONLY for active z-bands on GPU (`mesh_sparse_band_points_kernel`) with double-buffered lookahead, and polygonizes only active blocks with dirty-list `O(active)` edge-table resets.
+- **Measured impact (`res = 1024`, `horse_960` 30k checkpoint)**: evaluates only `4.61%` of `8x8x8` blocks (`96,657 / 2,097,152`), reducing warm in-training `1024^3` extraction from `~17.7s` to **`2.12s`** (**8.3x faster**, saving `~46.7s` across 3 meshes in a 30k run) with exact topology (`588,190` vertices, `1,176,380` triangles, `95.02%` bit-exact vertex coordinates, `max_nn_Linf = 1.35e-5`).
+
+### Measured End-to-End Summary (RTX 3060, `horse_960`, `--query 131072`, Full LTO Release)
+
+| Benchmark | HEAD (`6c20d58`) | Update 8 (Final LTO) | Improvement |
+| --- | --- | --- | --- |
+| **Step 30k steady-state (`active = 14`)** | `39.87 ms/step` (`25.08 it/s`) | **`34.08 ms/step` (`29.34 it/s`)** | **-14.5% time / +17.0% it/s** |
+| **Step 20k steady-state (`active = 11`)** | `~19.7 ms/step` (`~50.8 it/s`) | **`16.14 ms/step` (`61.95 it/s`)** | **-18.1% time / +22.0% it/s** |
+| **Warm `1024^3` mesh extraction** | `~17.70 s` / mesh (`53.09 s` / 3) | **`2.12 s` / mesh** (`~6.4 s` / 3) | **8.3x faster (~46.7 s saved)** |
+| **Verification (`doctor`, `verify`, `verify-render`, `verify-step`)** | `verify` & `verify-step` failed on `lin0.bias` | **All 4 pass** (`lin0.bias` `2.98e-8` / `1.29e-5`) | Exact parity restored |
+
+

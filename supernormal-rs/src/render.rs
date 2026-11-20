@@ -122,7 +122,11 @@ impl Occupancy {
                     cells_per_thread,
                     seed,
                 );
-                let prefix = counts.cumsum(0);
+                let prefix = if num_blocks <= 4096 {
+                    crate::sampling_gpu::scan_1d(counts)
+                } else {
+                    counts.cumsum(0)
+                };
                 // Bound temporary capacity to 32 MiB (IDs + XYZ at 128^3).
                 // Compaction emits each cell at most once, so N slots cannot overflow.
                 // Larger grids and explicit chunked evaluation retain the old path.
@@ -1379,6 +1383,11 @@ pub fn composite_device(
         reverse[slot] = occurrence as f32;
     }
     let vis_cap = crate::sampling_gpu::bucket_capacity(count);
+    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
+        10. * inv
+    } else {
+        0.
+    };
     let [adjoints, stats] = crate::kernels::composite_gpu(
         [
             sdf,
@@ -1396,14 +1405,8 @@ pub fn composite_device(
         coalesced_scratch,
         compact_cache,
         reuse_endpoints,
+        vscale,
     );
-    let stats = stats.sum_dim(0);
-    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
-        10. * inv
-    } else {
-        0.
-    };
-    let stats = stats * tensor(vec![1., 1., 1., vscale, 1.], [1, 5], &device);
     (adjoints, stats)
 }
 
@@ -1462,6 +1465,11 @@ pub fn composite_device_tables(
         tensor(packed, [patches.len(), 123], &device)
     };
     let vis_cap = crate::sampling_gpu::bucket_capacity(visible_count.max(1));
+    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
+        10. * inv
+    } else {
+        0.
+    };
     let [adjoints, stats] = crate::kernels::composite_gpu(
         [
             sdf,
@@ -1479,14 +1487,8 @@ pub fn composite_device_tables(
         coalesced_scratch,
         compact_cache,
         reuse_endpoints,
+        vscale,
     );
-    let stats = stats.sum_dim(0);
-    let vscale = if (1e-6..=1e6).contains(&(variance * 10.).exp()) {
-        10. * inv
-    } else {
-        0.
-    };
-    let stats = stats * tensor(vec![1., 1., 1., vscale, 1.], [1, 5], &device);
     (adjoints, stats)
 }
 
@@ -1604,7 +1606,6 @@ pub fn march_and_filter_device(
     let device = &field.device;
     let n_patches = coords.map(|c| c.len()).unwrap_or_else(|| patches.len());
     let mut rays = Vec::with_capacity(n_patches * 12);
-    let mut coords_flat = Vec::with_capacity(if coords.is_some() { n_patches * 39 } else { 0 });
     let mut capacity = 0usize;
     let r_f32 = occ.resolution as f32;
     if let Some(coord_slice) = coords {
@@ -1632,15 +1633,6 @@ pub fn march_and_filter_device(
             rays.extend(o);
             rays.extend(d);
             rays.extend([near, far, step_size, capacity as f32, count as f32, r_f32]);
-            coords_flat.extend([v as f32, x as f32, y as f32]);
-            for py in 0..3 {
-                let row_off = (y + py - 1) * view.width;
-                for px in 0..3 {
-                    let idx = row_off + (x + px - 1);
-                    coords_flat.extend(view.normals[idx].map(half::f16::to_f32));
-                    coords_flat.push(if view.mask[idx] { 1.0_f32 } else { 0.0_f32 });
-                }
-            }
             capacity = capacity
                 .checked_add(count)
                 .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
@@ -1681,11 +1673,6 @@ pub fn march_and_filter_device(
     if capacity == 0 {
         anyhow::bail!("empty march capacity");
     }
-    let coords_tensor = if coords.is_some() {
-        Some(tensor(coords_flat, [n_patches, 39], device))
-    } else {
-        None
-    };
     let flags = occ
         .device_flags
         .get_or_insert_with(|| {
@@ -1704,24 +1691,42 @@ pub fn march_and_filter_device(
         Tensor::empty([sample_cap, 2], device),
         Tensor::empty([n_patches, 2], device),
     ]);
-    let march_prefix = counts.cumsum(0);
-    let tail_totals = march_prefix.clone().slice([n_patches - 1..n_patches, 0..2]);
-    let (total_marched, unique_ep_count, prev_loss) = if let Some(ps) = prev_stats {
-        let loss_slice = ps.slice([0..1, 0..3]).reshape([3, 1]);
-        let flat_tail = tail_totals.reshape([2, 1]);
-        let combined = Tensor::cat(vec![flat_tail, loss_slice], 0).try_into_vec_as::<f32>()?;
-        (
-            combined[0] as usize,
-            combined[1] as usize,
+    let (march_prefix, total_marched, unique_ep_count, prev_loss) = if n_patches <= 4096 {
+        let mode = if prev_stats.is_some() { 1u32 } else { 0u32 };
+        let [mp, meta] =
+            crate::sampling_gpu::scan_2d_pairs_and_pack(counts, prev_stats, n_patches, mode);
+        let combined = meta.try_into_vec_as::<f32>()?;
+        let pl = if mode == 1u32 {
             Some(Loss {
                 normal: combined[2] as f64,
                 mask: combined[3] as f64,
                 eikonal: combined[4] as f64,
-            }),
-        )
+            })
+        } else {
+            None
+        };
+        (mp, combined[0] as usize, combined[1] as usize, pl)
     } else {
-        let v = tail_totals.try_into_vec_as::<f32>()?;
-        (v[0] as usize, v[1] as usize, None)
+        let march_prefix = counts.cumsum(0);
+        let tail_totals = march_prefix.clone().slice([n_patches - 1..n_patches, 0..2]);
+        let (tm, ue, pl) = if let Some(ps) = prev_stats {
+            let loss_slice = ps.slice([0..1, 0..3]).reshape([3, 1]);
+            let flat_tail = tail_totals.reshape([2, 1]);
+            let combined = Tensor::cat(vec![flat_tail, loss_slice], 0).try_into_vec_as::<f32>()?;
+            (
+                combined[0] as usize,
+                combined[1] as usize,
+                Some(Loss {
+                    normal: combined[2] as f64,
+                    mask: combined[3] as f64,
+                    eikonal: combined[4] as f64,
+                }),
+            )
+        } else {
+            let v = tail_totals.try_into_vec_as::<f32>()?;
+            (v[0] as usize, v[1] as usize, None)
+        };
+        (march_prefix, tm, ue, pl)
     };
     anyhow::ensure!(total_marched <= capacity, "invalid compacted sample count");
     if total_marched == 0 {
@@ -1734,7 +1739,7 @@ pub fn march_and_filter_device(
                 vis_ep_prefix_host: vec![0; n_patches],
                 total_visible: 0,
                 total_visible_endpoints: 0,
-                coords_tensor,
+                coords_tensor: None,
             },
             prev_loss,
             march_started.elapsed().as_secs_f64(),
@@ -1757,31 +1762,98 @@ pub fn march_and_filter_device(
 
     let vis_started = std::time::Instant::now();
     let vis_out = field.visibility_device(unique_pts, unique_ep_count, pairs, ranges, query);
-    let vis_counts = vis_out.clone().slice([0..n_patches, 0..2]);
-    let vis_prefix = vis_counts.cumsum(0);
-    let var_row = vis_out.slice([n_patches..n_patches + 1, 0..2]);
-
-    let (vis_prefix_host, vis_ep_prefix_host, total_visible, total_visible_endpoints) =
-        if group_size >= n_patches {
-            let tail = vis_prefix.clone().slice([n_patches - 1..n_patches, 0..2]);
-            let meta = Tensor::cat(vec![tail, var_row], 0).try_into_vec_as::<f32>()?;
-            let tot_s = meta[0] as usize;
-            let tot_ep = meta[1] as usize;
+    let (vis_prefix, vis_prefix_host, vis_ep_prefix_host, total_visible, total_visible_endpoints, coords_tensor) =
+        if group_size >= n_patches && n_patches <= 4096 {
+            let [vp, meta_t] =
+                crate::sampling_gpu::scan_2d_pairs_and_pack(vis_out, None, n_patches, 2u32);
+            // Submit visibility work immediately so CPU f16->f32 patch gather
+            // overlaps with GPU compact + field_forward + visibility execution.
+            let _ = field.device.flush();
+            let coords_tensor = coords.map(|coord_slice| {
+                let mut flat = vec![0.0_f32; n_patches * 39];
+                let views = &dataset.views;
+                flat.par_chunks_exact_mut(39)
+                    .zip(coord_slice.par_iter())
+                    .for_each(|(dst, &(v, x, y))| {
+                        let view = &views[v];
+                        dst[0] = v as f32;
+                        dst[1] = x as f32;
+                        dst[2] = y as f32;
+                        let mut k = 3usize;
+                        for py in 0..3 {
+                            let row_off = (y + py - 1) * view.width;
+                            for px in 0..3 {
+                                let idx = row_off + (x + px - 1);
+                                let n = view.normals[idx];
+                                dst[k] = n[0].to_f32();
+                                dst[k + 1] = n[1].to_f32();
+                                dst[k + 2] = n[2].to_f32();
+                                dst[k + 3] = if view.mask[idx] { 1.0_f32 } else { 0.0_f32 };
+                                k += 4;
+                            }
+                        }
+                    });
+                tensor(flat, [n_patches, 39], &field.device)
+            });
+            let meta = meta_t.try_into_vec_as::<f32>()?;
             field.variance_host = meta[2];
-            (vec![], vec![], tot_s, tot_ep)
+            (vp, vec![], vec![], meta[0] as usize, meta[1] as usize, coords_tensor)
         } else {
-            let meta =
-                Tensor::cat(vec![vis_prefix.clone(), var_row], 0).try_into_vec_as::<f32>()?;
-            field.variance_host = meta[n_patches * 2];
-            let mut s_host = Vec::with_capacity(n_patches);
-            let mut ep_host = Vec::with_capacity(n_patches);
-            for p in 0..n_patches {
-                s_host.push(meta[p * 2] as usize);
-                ep_host.push(meta[p * 2 + 1] as usize);
+            let coords_tensor = coords.map(|coord_slice| {
+                let mut flat = vec![0.0_f32; n_patches * 39];
+                let views = &dataset.views;
+                flat.par_chunks_exact_mut(39)
+                    .zip(coord_slice.par_iter())
+                    .for_each(|(dst, &(v, x, y))| {
+                        let view = &views[v];
+                        dst[0] = v as f32;
+                        dst[1] = x as f32;
+                        dst[2] = y as f32;
+                        let mut k = 3usize;
+                        for py in 0..3 {
+                            let row_off = (y + py - 1) * view.width;
+                            for px in 0..3 {
+                                let idx = row_off + (x + px - 1);
+                                let n = view.normals[idx];
+                                dst[k] = n[0].to_f32();
+                                dst[k + 1] = n[1].to_f32();
+                                dst[k + 2] = n[2].to_f32();
+                                dst[k + 3] = if view.mask[idx] { 1.0_f32 } else { 0.0_f32 };
+                                k += 4;
+                            }
+                        }
+                    });
+                tensor(flat, [n_patches, 39], &field.device)
+            });
+            let vis_counts = vis_out.clone().slice([0..n_patches, 0..2]);
+            let vis_prefix = vis_counts.cumsum(0);
+            let var_row = vis_out.slice([n_patches..n_patches + 1, 0..2]);
+            if group_size >= n_patches {
+                let tail = vis_prefix.clone().slice([n_patches - 1..n_patches, 0..2]);
+                let meta = Tensor::cat(vec![tail, var_row], 0).try_into_vec_as::<f32>()?;
+                field.variance_host = meta[2];
+                (
+                    vis_prefix,
+                    vec![],
+                    vec![],
+                    meta[0] as usize,
+                    meta[1] as usize,
+                    coords_tensor,
+                )
+            } else {
+                let meta =
+                    Tensor::cat(vec![vis_prefix.clone(), var_row], 0).try_into_vec_as::<f32>()?;
+                field.variance_host = meta[n_patches * 2];
+                let mut s_host = Vec::with_capacity(n_patches);
+                let mut ep_host = Vec::with_capacity(n_patches);
+                for p in 0..n_patches {
+                    s_host.push(meta[p * 2] as usize);
+                    ep_host.push(meta[p * 2 + 1] as usize);
+                }
+                let tot_s = *s_host.last().unwrap_or(&0);
+                let tot_ep = *ep_host.last().unwrap_or(&0);
+                (vis_prefix, s_host, ep_host, tot_s, tot_ep, coords_tensor)
             }
-            let tot_s = *s_host.last().unwrap_or(&0);
-            let tot_ep = *ep_host.last().unwrap_or(&0);
-            (s_host, ep_host, tot_s, tot_ep)
         };
     let vis_seconds = vis_started.elapsed().as_secs_f64();
     Ok((
@@ -1870,22 +1942,15 @@ pub fn prepare_geometry_from_device_batch(
     let (geom_rays, packed_patches) = if let Some(coords_tensor) = &vis_batch.coords_tensor {
         let dev_ds = dataset.device_dataset(device);
         let inv = (variance * 10.).exp().clamp(1e-6, 1e6);
-        let params = tensor(
-            vec![
-                start as f32,
-                s_begin as f32,
-                inv,
-                normal_den,
-                pixel_den,
-                sample_den,
-            ],
-            [6, 1],
-            device,
-        );
         let [gr, pp] = crate::sampling_gpu::gather_patch_tables(
             coords_tensor.clone(),
             dev_ds.view_meta,
-            params,
+            start,
+            s_begin,
+            inv,
+            normal_den,
+            pixel_den,
+            sample_den,
             patch_count,
         );
         (gr, Some(pp))

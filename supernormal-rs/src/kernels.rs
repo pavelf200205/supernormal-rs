@@ -1145,29 +1145,29 @@ fn field_hash_tile(
     active: u32,
     #[comptime] local_hash: bool,
     #[comptime] corner_parallel: bool,
+    #[comptime] subgroup_width: usize,
 ) {
     let lane = unit % 64;
     let slot = unit / 64;
     let point_idx = group * 4 + slot;
     let valid = point_idx < n_valid;
-    if lane < 32 {
+    let active_cols = 3usize + usize::cast_from(active) * 2usize;
+    // Disjoint writes to xyz [0..3] and inactive tail [active_cols..32] require
+    // no pre-hash barrier: hash threads only write [3..active_cols].
+    if lane < 3usize {
+        shared_features[field_feature_index(slot, lane, local_hash)] = if valid {
+            points[point_idx * 3 + lane]
+        } else {
+            0.0_f32
+        };
+    } else if lane < 32usize && lane >= active_cols {
         shared_features[field_feature_index(slot, lane, local_hash)] = 0.0_f32;
-    }
-    sync_cube();
-    if valid {
-        let p0 = points[point_idx * 3];
-        let p1 = points[point_idx * 3 + 1];
-        let p2 = points[point_idx * 3 + 2];
-        if lane == 0 {
-            shared_features[field_feature_index(slot, 0, local_hash)] = p0;
-            shared_features[field_feature_index(slot, 1, local_hash)] = p1;
-            shared_features[field_feature_index(slot, 2, local_hash)] = p2;
-        }
     }
     if corner_parallel {
         // Map 256 threads to (hash_slot in 0..4, corner_pair in 0..4, level in 0..16).
         // Up to 4 * 4 * 14 = 224 threads concurrently fetch 2 corners each (448 lookups
-        // in flight per workgroup), then reduce the 4 corner-pairs in shared memory.
+        // in flight per workgroup), then reduce the 4 corner-pairs via warp shuffles
+        // (zero shared traffic, zero barrier) or shared partials fallback.
         let hash_slot = unit & 3usize;
         let corner_pair = (unit >> 2) & 3usize;
         let level = unit >> 4;
@@ -1197,41 +1197,58 @@ fn field_hash_tile(
             let base2 = u32::cast_from(b2);
             let r1 = res + 1;
             let dense = r1 * r1 * r1 <= 524288;
-            for c_sub in 0..2u32 {
-                let corner = u32::cast_from(corner_pair) * 2 + c_sub;
-                let bit0 = corner & 1;
-                let bit1 = (corner >> 1) & 1;
-                let bit2 = (corner >> 2) & 1;
-                let v0 = base0 + bit0;
-                let v1 = base1 + bit1;
-                let v2 = base2 + bit2;
-                let kw0 = if bit0 == 0 { 1. - w0 } else { w0 };
-                let kw1 = if bit1 == 0 { 1. - w1 } else { w1 };
-                let kw2 = if bit2 == 0 { 1. - w2 } else { w2 };
-                let weight = kw0 * kw1 * kw2;
-                let idx = if dense {
-                    v0 + v1 * r1 + v2 * r1 * r1
-                } else {
-                    (v0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
-                };
-                let entry = usize::cast_from(offset + idx) * 2;
-                feat0 += weight * tables[entry];
-                feat1 += weight * tables[entry + 1];
-            }
+            let bit1 = u32::cast_from(corner_pair) & 1u32;
+            let bit2 = (u32::cast_from(corner_pair) >> 1u32) & 1u32;
+            let v1 = base1 + bit1;
+            let v2 = base2 + bit2;
+            let kw1 = if bit1 == 0u32 { 1.0_f32 - w1 } else { w1 };
+            let kw2 = if bit2 == 0u32 { 1.0_f32 - w2 } else { w2 };
+            let kw12 = kw1 * kw2;
+            let weight0 = (1.0_f32 - w0) * kw12;
+            let weight1 = w0 * kw12;
+            let idx0 = if dense {
+                base0 + v1 * r1 + v2 * r1 * r1
+            } else {
+                (base0 ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+            };
+            let idx1 = if dense {
+                idx0 + 1u32
+            } else {
+                ((base0 + 1u32) ^ (v1 * 2654435761u32) ^ (v2 * 805459861u32)) & 524287u32
+            };
+            let entry0 = usize::cast_from(offset + idx0) * 2;
+            let entry1 = usize::cast_from(offset + idx1) * 2;
+            feat0 = weight0 * tables[entry0] + weight1 * tables[entry1];
+            feat1 = weight0 * tables[entry0 + 1] + weight1 * tables[entry1 + 1];
         }
-        partials[unit * 2] = feat0;
-        partials[unit * 2 + 1] = feat1;
-        sync_cube();
-        let red_slot = unit & 3usize;
-        let red_level = unit >> 2;
-        if red_level < usize::cast_from(active) {
-            let base_p = (red_level * 16 + red_slot) * 2;
-            let sum0 = (partials[base_p] + partials[base_p + 8])
-                + (partials[base_p + 16] + partials[base_p + 24]);
-            let sum1 = (partials[base_p + 1] + partials[base_p + 9])
-                + (partials[base_p + 17] + partials[base_p + 25]);
-            shared_features[field_feature_index(red_slot, 3 + red_level * 2, local_hash)] = sum0;
-            shared_features[field_feature_index(red_slot, 4 + red_level * 2, local_hash)] = sum1;
+        if subgroup_width >= 32usize {
+            // Uniform across all lanes in every plane: unit = level*16 + corner_pair*4 + hash_slot.
+            // XOR 4 pairs (cp 0<->1, cp 2<->3); XOR 8 combines (0+1)<->(2+3), preserving exact order.
+            let s0 = feat0 + plane_shuffle_xor(feat0, 4u32);
+            let sum0 = s0 + plane_shuffle_xor(s0, 8u32);
+            let s1 = feat1 + plane_shuffle_xor(feat1, 4u32);
+            let sum1 = s1 + plane_shuffle_xor(s1, 8u32);
+            if corner_pair == 0usize && level < usize::cast_from(active) {
+                shared_features[field_feature_index(hash_slot, 3 + level * 2, local_hash)] = sum0;
+                shared_features[field_feature_index(hash_slot, 4 + level * 2, local_hash)] = sum1;
+            }
+        } else {
+            partials[unit * 2] = feat0;
+            partials[unit * 2 + 1] = feat1;
+            sync_cube();
+            let red_slot = unit & 3usize;
+            let red_level = unit >> 2;
+            if red_level < usize::cast_from(active) {
+                let base_p = (red_level * 16 + red_slot) * 2;
+                let sum0 = (partials[base_p] + partials[base_p + 8])
+                    + (partials[base_p + 16] + partials[base_p + 24]);
+                let sum1 = (partials[base_p + 1] + partials[base_p + 9])
+                    + (partials[base_p + 17] + partials[base_p + 25]);
+                shared_features[field_feature_index(red_slot, 3 + red_level * 2, local_hash)] =
+                    sum0;
+                shared_features[field_feature_index(red_slot, 4 + red_level * 2, local_hash)] =
+                    sum1;
+            }
         }
     } else {
         // Legacy 56-thread hash evaluation: one thread loops over all 8 corners.
@@ -1348,6 +1365,18 @@ fn fused_field_kernel(
         terminate!();
     }
     let mut shared_weights = Shared::new_slice(2113usize);
+    let mut shared_features = Shared::new_slice(128usize);
+    let mut partials = Shared::new_slice(if corner_parallel && subgroup_width >= 32usize {
+        if subgroup_width == 64usize {
+            1usize
+        } else {
+            8usize
+        }
+    } else if corner_parallel {
+        512usize
+    } else {
+        256usize
+    });
     for tile in 0..9usize {
         let index = unit + tile * 256;
         if index < 2113 {
@@ -1358,22 +1387,22 @@ fn fused_field_kernel(
         }
     }
     sync_cube();
+    let lane = unit % 64;
+    let slot = unit / 64;
     // Occupancy uses a bounded persistent grid: stage weights once, then consume
     // as many compacted tiles as the device count requires. No capacity-sized
     // field dispatch and no CPU count readback are necessary.
     let group_stride =
         usize::cast_from(CUBE_COUNT_X) * usize::cast_from(CUBE_COUNT_Y) * point_tiles;
     let mut wave_base = group_base;
+    let active_cols = 3usize + usize::cast_from(active) * 2usize;
+    let fast_tile_sync = corner_parallel && subgroup_width == 32usize;
     while wave_base * 4 < n_valid {
         // Reuse the staged weights for several bounded four-point tiles.
         for point_tile in 0..point_tiles {
-            let lane = unit % 64;
-            let slot = unit / 64;
             let group = wave_base + point_tile;
             let point_idx = group * 4 + slot;
             let valid = point_idx < n_valid;
-            let mut shared_features = Shared::new_slice(128usize);
-            let mut partials = Shared::new_slice(if corner_parallel { 512usize } else { 256usize });
             field_hash_tile(
                 points,
                 tables,
@@ -1386,12 +1415,13 @@ fn fused_field_kernel(
                 active,
                 local_hash,
                 corner_parallel,
+                subgroup_width,
             );
             let mut contribution = 0.0_f32;
             if valid {
                 let mut h = 0.0_f32;
                 // Packed input-major weights give adjacent lanes adjacent reads.
-                for k in 0..(3 + usize::cast_from(active) * 2) {
+                for k in 0..active_cols {
                     h += shared_features[field_feature_index(slot, k, local_hash)]
                         * shared_weights[k * 64 + lane];
                 }
@@ -1419,6 +1449,22 @@ fn fused_field_kernel(
                             selected_ids,
                             point_idx,
                             sum + shared_weights[2112],
+                            occupancy,
+                        );
+                    }
+                } else if fast_tile_sync {
+                    if lane == 0usize || lane == 32usize {
+                        partials[slot * 2 + (lane >> 5)] = sum;
+                    }
+                    // This single barrier publishes partials AND ensures all lanes
+                    // finished reading shared_features before the next tile writes it.
+                    sync_cube();
+                    if valid && lane == 0usize {
+                        field_store_result(
+                            output,
+                            selected_ids,
+                            point_idx,
+                            partials[slot * 2] + partials[slot * 2 + 1] + shared_weights[2112],
                             occupancy,
                         );
                     }
@@ -1456,14 +1502,16 @@ fn fused_field_kernel(
                     );
                 }
             }
-            // The next hash tile reuses partials after every lane has consumed them.
-            if point_tiles > 1 {
+            // The next hash tile reuses partials/shared_features unless fast_tile_sync
+            // already synchronized after MLP reads and does not touch partials in hash.
+            if point_tiles > 1 && !fast_tile_sync {
                 sync_cube();
             }
         }
         if occupancy {
-            // Every lane must finish its final tile before shared storage is reused.
-            sync_cube();
+            if !fast_tile_sync {
+                sync_cube();
+            }
             wave_base += group_stride;
         } else {
             break;
@@ -1911,16 +1959,45 @@ fn composite_kernel(
     let pixel_den = patches[pb + 4];
     let sample_den = patches[pb + 5];
 
-    let mut normals = Array::<f32>::new(3usize);
-    let mut dn = Array::<f32>::new(3usize);
+    let vb = pb + 6 + pixel * 13;
+    let mask = patches[vb + 12];
+    if begin >= end {
+        let mut nl = 0.0_f32;
+        if mask != 0.0_f32 {
+            let e0 = -patches[vb + 9] * mask;
+            let e1 = -patches[vb + 10] * mask;
+            let e2 = -patches[vb + 11] * mask;
+            nl = (e0 * e0 + e1 * e1 + e2 * e2) / normal_den;
+        }
+        let m = 1e-5_f32;
+        let ml = -(mask * f32::ln(m) + (1.0_f32 - mask) * f32::ln(1.0_f32 - m)) / pixel_den;
+        stats[ray * 5] = nl;
+        stats[ray * 5 + 1] = ml;
+        stats[ray * 5 + 2] = 0.0_f32;
+        stats[ray * 5 + 3] = 0.0_f32;
+        stats[ray * 5 + 4] = 0.0_f32;
+        terminate!();
+    }
+
+    // Hoist loop-invariant 3x3 inverse basis matrix into registers once per ray
+    // instead of reloading 9 floats from global memory on every sample in both loops.
+    let m00 = patches[vb];
+    let m01 = patches[vb + 1];
+    let m02 = patches[vb + 2];
+    let m10 = patches[vb + 3];
+    let m11 = patches[vb + 4];
+    let m12 = patches[vb + 5];
+    let m20 = patches[vb + 6];
+    let m21 = patches[vb + 7];
+    let m22 = patches[vb + 8];
+
+    let mut normals0 = 0.0_f32;
+    let mut normals1 = 0.0_f32;
+    let mut normals2 = 0.0_f32;
     let mut masks = 0.0_f32;
     let mut trans = 1.0_f32;
     let mut dm = 0.0_f32;
     let mut future = 0.0_f32;
-    for i in 0..3usize {
-        normals[i] = 0.0_f32;
-        dn[i] = 0.0_f32;
-    }
 
     let col = pixel % 3;
     let row = pixel / 3;
@@ -1997,27 +2074,29 @@ fn composite_kernel(
         }
         trans *= f32::max(1.0_f32 - a, 1e-10_f32);
         masks += w;
-        for j in 0..3usize {
-            let vb = pb + 6 + pixel * 13 + j * 3;
-            let g = patches[vb] * dt + patches[vb + 1] * dx + patches[vb + 2] * dy;
-            scratch[composite_scratch_index(s, pixel, j, coalesced_scratch, compact_cache)] = g;
-            normals[j] += w * g;
-        }
+        let g0 = m00 * dt + m01 * dx + m02 * dy;
+        let g1 = m10 * dt + m11 * dx + m12 * dy;
+        let g2 = m20 * dt + m21 * dx + m22 * dy;
+        scratch[composite_scratch_index(s, pixel, 0, coalesced_scratch, compact_cache)] = g0;
+        scratch[composite_scratch_index(s, pixel, 1, coalesced_scratch, compact_cache)] = g1;
+        scratch[composite_scratch_index(s, pixel, 2, coalesced_scratch, compact_cache)] = g2;
+        normals0 += w * g0;
+        normals1 += w * g1;
+        normals2 += w * g2;
     }
 
-    let mut nl = 0.0_f32;
-    let mut ml = 0.0_f32;
     let mut el = 0.0_f32;
     let mut dinv = 0.0_f32;
     let mut bias = 0.0_f32;
-    let mask = patches[pb + 6 + pixel * 13 + 12];
-    for j in 0..3usize {
-        let err = (normals[j] - patches[pb + 6 + pixel * 13 + 9 + j]) * mask;
-        nl += err * err / normal_den;
-        dn[j] = 2.0_f32 * err * mask / normal_den;
-    }
+    let err0 = (normals0 - patches[vb + 9]) * mask;
+    let err1 = (normals1 - patches[vb + 10]) * mask;
+    let err2 = (normals2 - patches[vb + 11]) * mask;
+    let nl = (err0 * err0 + err1 * err1 + err2 * err2) / normal_den;
+    let dn0 = 2.0_f32 * err0 * mask / normal_den;
+    let dn1 = 2.0_f32 * err1 * mask / normal_den;
+    let dn2 = 2.0_f32 * err2 * mask / normal_den;
     let m = f32::clamp(masks, 1e-5_f32, 1.0_f32 - 1e-5_f32);
-    ml += -(mask * f32::ln(m) + (1.0_f32 - mask) * f32::ln(1.0_f32 - m)) / pixel_den;
+    let ml = -(mask * f32::ln(m) + (1.0_f32 - mask) * f32::ln(1.0_f32 - m)) / pixel_den;
     if masks >= 1e-5_f32 && masks <= 1.0_f32 - 1e-5_f32 {
         dm = (m - mask) / (m * (1.0_f32 - m) * pixel_den);
     }
@@ -2031,43 +2110,40 @@ fn composite_kernel(
         let a = scratch[composite_scratch_index(s, pixel, 4, coalesced_scratch, compact_cache)];
         let c0 = scratch[composite_scratch_index(s, pixel, 5, coalesced_scratch, compact_cache)];
         let c1 = scratch[composite_scratch_index(s, pixel, 6, coalesced_scratch, compact_cache)];
-        let mut s0 = 0.0_f32;
-        let mut s1 = 0.0_f32;
-        if compact_cache {
+        let (s0, s1) = if compact_cache {
             // SDF values are immutable throughout forward/reverse/gather.
             // Reloading them avoids caching two extra floats per pixel/sample.
             if compact_ids {
                 let base = usize::cast_from(ids[s]);
-                s0 = sdf[base + pixel];
-                s1 = sdf[base + 9 + pixel];
+                (sdf[base + pixel], sdf[base + 9 + pixel])
             } else {
-                s0 = sdf[usize::cast_from(ids[s * 18 + pixel])];
-                s1 = sdf[usize::cast_from(ids[s * 18 + 9 + pixel])];
+                (
+                    sdf[usize::cast_from(ids[s * 18 + pixel])],
+                    sdf[usize::cast_from(ids[s * 18 + 9 + pixel])],
+                )
             }
         } else {
-            s0 = scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch, compact_cache)];
-            s1 = scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch, compact_cache)];
-        }
+            (
+                scratch[composite_scratch_index(s, pixel, 7, coalesced_scratch, compact_cache)],
+                scratch[composite_scratch_index(s, pixel, 8, coalesced_scratch, compact_cache)],
+            )
+        };
         let norm = f32::sqrt(g0 * g0 + g1 * g1 + g2 * g2);
         el += (norm - 1.0_f32) * (norm - 1.0_f32) / sample_den;
         let eg = 2.0_f32 * (norm - 1.0_f32) / sample_den / f32::max(norm, 1e-12_f32);
-        let dg0 = t * a * dn[0] + eg * g0;
-        let dg1 = t * a * dn[1] + eg * g1;
-        let dg2 = t * a * dn[2] + eg * g2;
-        let vb = pb + 6 + pixel * 13;
+        let dg0 = t * a * dn0 + eg * g0;
+        let dg1 = t * a * dn1 + eg * g1;
+        let dg2 = t * a * dn2 + eg * g2;
         let gb = s * 27 + pixel * 3;
-        let dp0 =
-            (patches[vb] * dg0 + patches[vb + 3] * dg1 + patches[vb + 6] * dg2) * geometry[gb];
-        let dp1 = (patches[vb + 1] * dg0 + patches[vb + 4] * dg1 + patches[vb + 7] * dg2)
-            * geometry[gb + 1];
-        let dp2 = (patches[vb + 2] * dg0 + patches[vb + 5] * dg1 + patches[vb + 8] * dg2)
-            * geometry[gb + 2];
+        let dp0 = (m00 * dg0 + m10 * dg1 + m20 * dg2) * geometry[gb];
+        let dp1 = (m01 * dg0 + m11 * dg1 + m21 * dg2) * geometry[gb + 1];
+        let dp2 = (m02 * dg0 + m12 * dg1 + m22 * dg2) * geometry[gb + 2];
         if !compact_cache {
             scratch[composite_adjoint_index(s, pixel, 0, coalesced_scratch, compact_cache)] = dp0;
         }
         scratch[composite_adjoint_index(s, pixel, 1, coalesced_scratch, compact_cache)] = dp1;
         scratch[composite_adjoint_index(s, pixel, 2, coalesced_scratch, compact_cache)] = dp2;
-        let gw = dn[0] * g0 + dn[1] * g1 + dn[2] * g2 + dm;
+        let gw = dn0 * g0 + dn1 * g1 + dn2 * g2 + dm;
         let one_minus_a = 1.0_f32 - a;
         let q = f32::max(one_minus_a, 1e-10_f32);
         let tail = if one_minus_a >= 1e-10_f32 {
@@ -2108,6 +2184,42 @@ fn composite_kernel(
     stats[ray * 5 + 4] = bias;
 }
 
+#[cube(launch)]
+fn reduce_composite_stats_kernel(
+    raw_stats: &Tensor<f32>,
+    out_stats: &mut Tensor<f32>,
+    rays: u32,
+    vscale: f32,
+) {
+    let col = usize::cast_from(CUBE_POS_X);
+    let unit = usize::cast_from(UNIT_POS);
+    let n = usize::cast_from(rays);
+    let mut sum = 0.0_f32;
+    let mut i = unit;
+    while i < n {
+        sum += raw_stats[i * 5 + col];
+        i += 256usize;
+    }
+    let mut sh = Shared::new_slice(256usize);
+    sh[unit] = sum;
+    sync_cube();
+    let mut stride = 128usize;
+    for _ in 0..8usize {
+        if unit < stride {
+            sh[unit] += sh[unit + stride];
+        }
+        sync_cube();
+        stride = stride >> 1usize;
+    }
+    if unit == 0usize {
+        let mut total = sh[0];
+        if col == 3usize {
+            total = total * vscale;
+        }
+        out_stats[col] = total;
+    }
+}
+
 #[derive(Debug)]
 struct CompositeOp {
     desc: CustomOpIr,
@@ -2117,19 +2229,20 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([s, g, i, p, vp, w, d, l, r], [od, ol]) = self.desc.as_fixed();
+        let ([s, g, i, p, vp, w, d, l, r, rl], [od, orl]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(valid_points),
             ScalarIr::UInt(compact_tables),
             ScalarIr::UInt(coalesced_scratch),
             ScalarIr::UInt(compact_cache),
             ScalarIr::UInt(reuse_endpoints),
+            ScalarIr::Float(vscale),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid composite scalars")
         };
-        let [s, g, i, p, vp, w, d, l, r] =
-            [s, g, i, p, vp, w, d, l, r].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [s, g, i, p, vp, w, d, l, r, rl] =
+            [s, g, i, p, vp, w, d, l, r, rl].map(|x| handles.get_float_tensor::<CubeBackend>(x));
         let client = s.client.clone();
         let rays = (p.meta.shape().dims::<2>()[0] * 9).max(1);
         let dim_rays = CubeDim::new(&client, rays);
@@ -2152,7 +2265,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             *reuse_endpoints != 0,
         );
         drop(timing);
-        let _timing = crate::diagnostics::start(&client, "composite_gather");
+        let timing_g = crate::diagnostics::start(&client, "composite_gather");
         let count = (*valid_points as usize).max(1);
         let dim = CubeDim::new(&client, count);
         composite_gather_kernel::launch(
@@ -2167,8 +2280,19 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             *coalesced_scratch != 0,
             *compact_cache != 0,
         );
+        drop(timing_g);
+        let _timing_r = crate::diagnostics::start(&client, "composite_stats_reduce");
+        reduce_composite_stats_kernel::launch(
+            &client,
+            CubeCount::Static(5, 1, 1),
+            CubeDim::new_1d(256),
+            l.into_tensor_arg(),
+            rl.clone().into_tensor_arg(),
+            rays as u32,
+            *vscale as f32,
+        );
         handles.register_float_tensor::<CubeBackend>(&od.id, d);
-        handles.register_float_tensor::<CubeBackend>(&ol.id, l);
+        handles.register_float_tensor::<CubeBackend>(&orl.id, rl);
         Ok(())
     }
 }
@@ -2179,17 +2303,24 @@ pub fn composite_gpu(
     coalesced_scratch: bool,
     compact_cache: bool,
     reuse_endpoints: bool,
+    vscale: f32,
 ) -> [burn::tensor::Tensor<2>; 2] {
     assert_eq!(inputs[5].dims()[1], if compact_cache { 63 } else { 90 });
-    let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let device = inputs[0].device();
+    let inputs: Vec<_> = inputs
+        .into_iter()
+        .chain([burn::tensor::Tensor::<2>::empty([1, 5], &device)])
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
+        .collect();
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = inputs[6..8]
-        .iter()
+    let outputs: Vec<_> = [6usize, 9]
+        .into_iter()
+        .map(|i| &inputs[i])
         .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
         .collect();
     let desc = CustomOpIr::with_scalars(
         "supernormal_composite",
-        &inputs.map(|t| t.into_ir()),
+        &inputs.into_iter().map(|t| t.into_ir()).collect::<Vec<_>>(),
         &outputs,
         vec![
             ScalarIr::UInt(valid_points as u64),
@@ -2197,6 +2328,7 @@ pub fn composite_gpu(
             ScalarIr::UInt(coalesced_scratch as u64),
             ScalarIr::UInt(compact_cache as u64),
             ScalarIr::UInt(reuse_endpoints as u64),
+            ScalarIr::Float(vscale as f64),
         ],
     );
     let result: [_; 2] = client
@@ -2298,6 +2430,7 @@ fn field_backward_kernel(
             active,
             local_hash,
             corner_parallel,
+            0usize,
         );
         // Parameter gradients consume these features after this dispatch.
         // All 31 columns are initialized, including inactive hash levels.
@@ -3260,10 +3393,10 @@ impl Operation<FusionCubeRuntime> for VisibilityOp {
         let client = s.client.clone();
         let _timing = crate::diagnostics::start(&client, "visibility");
         let n = r.meta.shape().dims::<2>()[0];
-        let dim = CubeDim::new(&client, n);
+        let dim = CubeDim::new_1d(32);
         visibility_kernel::launch(
             &client,
-            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            CubeCount::Static(n.div_ceil(32) as u32, 1, 1),
             dim,
             s.into_tensor_arg(),
             p.into_tensor_arg(),
@@ -3387,6 +3520,7 @@ fn field_backward_native_kernel(
             active,
             local_hash,
             corner_parallel,
+            0usize,
         );
         // Parameter gradients consume these features after this dispatch.
         // All 31 columns are initialized, including inactive hash levels.
@@ -3871,4 +4005,1310 @@ pub fn cached_mlp_preactivation(
         )
         .outputs();
     BT::<2>::from_primitive::<GpuBackend>(out)
+}
+
+// Persistent fused backward + parameter-gradient kernel (native float atomics):
+// Eliminates the global `dh` [N, 64] buffer, eliminates the separate
+// `parameter_gradients` dispatch and double `features` reads, stages MLP
+// weights once per workgroup instead of once per 4 points, replaces 4 of 6
+// workgroup barriers with warp-shuffle reductions & warp-shuffle same-address
+// hash aggregation, and accumulates `dw0`/`db0`/`dw1` partials across chunks.
+#[cube(launch)]
+fn field_backward_fused_native_kernel(
+    pre: &Tensor<f32>,
+    features: &Tensor<f32>,
+    ds: &Tensor<f32>,
+    weights: &Tensor<f32>,
+    metadata: &Tensor<f32>,
+    table_grad: &Tensor<Atomic<f32>>,
+    dw0_partials: &mut Tensor<f32>,
+    dw1_partials: &mut Tensor<f32>,
+    active: u32,
+    valid_n: u32,
+    aggregation_levels: u32,
+    adjoint_offset: u32,
+    #[comptime] local_hash: bool,
+    #[comptime] aggregate_hash: bool,
+    #[comptime] replay_features: bool,
+    #[comptime] selective_weights: bool,
+    #[comptime] accumulate: bool,
+    #[comptime] subgroup_width: usize,
+    #[comptime] active_columns_only: bool,
+) {
+    let mut unit = usize::cast_from(UNIT_POS);
+    if subgroup_width > 0 {
+        unit = usize::cast_from(PLANE_POS) * subgroup_width + usize::cast_from(UNIT_POS_PLANE);
+    }
+    let lane = unit % 64;
+    let slot = unit / 64;
+    let p_row = unit / 16;
+    let p_col = unit % 16;
+    let hash_slot = unit & 3usize;
+    let sub_part = (unit >> 2) & 3usize;
+    let level = unit >> 4;
+    let active_cols = 3usize + usize::cast_from(active) * 2usize;
+    let feat_cols = if active_columns_only {
+        active_cols
+    } else {
+        usize::cast_from(31u32)
+    };
+    let first_active = p_col < feat_cols;
+    let second_active = p_col + 16usize < feat_cols || p_col + 16usize == 31usize;
+
+    let n_valid = usize::cast_from(valid_n);
+    let total_groups = (n_valid + 3usize) / 4usize;
+    let part = usize::cast_from(CUBE_POS_X);
+    let stride = usize::cast_from(CUBE_COUNT_X);
+
+    // Stage MLP weights ONCE per workgroup (never overwritten by aggregation).
+    let mut shared_weights = Shared::new_slice(2113usize);
+    for tile in 0..9usize {
+        let index = unit + tile * 256;
+        if index < 2113 {
+            let mut needed = false;
+            if index < 1984 {
+                let column = index / 64;
+                needed = column < active_cols && (replay_features || column >= 3);
+            } else if index < 2048 {
+                needed = replay_features;
+            } else if index < 2112 {
+                needed = true;
+            }
+            if !selective_weights || needed {
+                let target = if local_hash && index < 1984 {
+                    (index % 64) * 31 + index / 64
+                } else {
+                    index
+                };
+                shared_weights[target] = weights[index];
+            }
+        }
+    }
+    let mut shared_dh = Shared::new_slice(272usize);
+    let mut shared_feat = Shared::new_slice(128usize);
+    let mut slot_ds = Shared::new_slice(4usize);
+    let mut fallback_partials = Shared::new_slice(if subgroup_width == 0 { 448usize } else { 1usize });
+    sync_cube();
+
+    let mut acc00 = 0.0_f32;
+    let mut acc01 = 0.0_f32;
+    let mut acc10 = 0.0_f32;
+    let mut acc11 = 0.0_f32;
+    let mut acc20 = 0.0_f32;
+    let mut acc21 = 0.0_f32;
+    let mut acc30 = 0.0_f32;
+    let mut acc31 = 0.0_f32;
+    let mut dw1_reg = 0.0_f32;
+
+    // Hoist loop-invariant hash-level metadata (2 registers) out of the group loop.
+    let mut level_res = 0u32;
+    let mut level_offset = 0usize;
+    if level < usize::cast_from(active) {
+        level_res = u32::cast_from(metadata[level * 2]);
+        level_offset = usize::cast_from(metadata[level * 2 + 1]);
+    }
+    let lane_base = (u32::cast_from(UNIT_POS_PLANE) >> 2u32) << 2u32;
+    let use_agg = aggregate_hash
+        && subgroup_width >= 32usize
+        && level < usize::cast_from(aggregation_levels);
+
+    let tiles_per_part = (total_groups + stride - 1usize) / stride;
+    let start_group = part * tiles_per_part;
+    let end_group = usize::min(start_group + tiles_per_part, total_groups);
+    let mut group = start_group;
+    while group < end_group {
+        if unit < 4usize {
+            let p = group * 4 + unit;
+            slot_ds[unit] = if p < n_valid {
+                ds[(p + usize::cast_from(adjoint_offset)) * ds.stride(0)]
+            } else {
+                0.0_f32
+            };
+        }
+        if unit < 128usize {
+            let s = unit / 32;
+            let col = unit % 32;
+            let p = group * 4 + s;
+            let mut f = 0.0_f32;
+            if p < n_valid {
+                if col == 31usize {
+                    f = 1.0_f32;
+                } else if col < feat_cols {
+                    f = features[p * features.stride(0) + col * features.stride(1)];
+                }
+            }
+            shared_feat[unit] = f;
+        }
+        sync_cube();
+
+        let ds0 = slot_ds[0];
+        let ds1 = slot_ds[1];
+        let ds2 = slot_ds[2];
+        let ds3 = slot_ds[3];
+        if ds0 != 0.0_f32 || ds1 != 0.0_f32 || ds2 != 0.0_f32 || ds3 != 0.0_f32 {
+            let point = group * 4 + slot;
+            let ds_val = slot_ds[slot];
+            let mut v = 0.0_f32;
+            if point < n_valid && ds_val != 0.0_f32 {
+                let mut h = 0.0_f32;
+                if replay_features {
+                    for col in 0..active_cols {
+                        let wi = if local_hash {
+                            lane * 31 + col
+                        } else {
+                            col * 64 + lane
+                        };
+                        h += shared_feat[slot * 32 + col] * shared_weights[wi];
+                    }
+                    h += shared_weights[1984 + lane];
+                } else {
+                    h = pre[point * 64 + lane];
+                }
+                let scaled = h * 100.0_f32;
+                let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
+                let derivative = if scaled > 20.0_f32 {
+                    1.0_f32
+                } else {
+                    exp_pos / (1.0_f32 + exp_pos)
+                };
+                v = ds_val * shared_weights[2048 + lane] * derivative;
+                let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
+                let hidden = if scaled > 20.0_f32 { h } else { soft };
+                dw1_reg += ds_val * hidden;
+            }
+            shared_dh[slot * 68 + lane] = v;
+            sync_cube();
+
+            // Fused in-register dw0 + db0 outer product (zero bank conflicts).
+            for s in 0..4usize {
+                if slot_ds[s] != 0.0_f32 {
+                    let h0 = shared_dh[s * 68 + p_row];
+                    let h1 = shared_dh[s * 68 + p_row + 16];
+                    let h2 = shared_dh[s * 68 + p_row + 32];
+                    let h3 = shared_dh[s * 68 + p_row + 48];
+                    if first_active {
+                        let x0 = shared_feat[s * 32 + p_col];
+                        acc00 += h0 * x0;
+                        acc10 += h1 * x0;
+                        acc20 += h2 * x0;
+                        acc30 += h3 * x0;
+                    }
+                    if second_active {
+                        let x1 = shared_feat[s * 32 + p_col + 16];
+                        acc01 += h0 * x1;
+                        acc11 += h1 * x1;
+                        acc21 += h2 * x1;
+                        acc31 += h3 * x1;
+                    }
+                }
+            }
+
+            // 224-thread hash backward with bank-conflict-free interleaved j,
+            // warp-shuffle reduction, and low-register 4-peer warp-shuffle aggregation.
+            let hash_point = group * 4 + hash_slot;
+            let active_lane = hash_point < n_valid
+                && level < usize::cast_from(active)
+                && slot_ds[hash_slot] != 0.0_f32;
+            let mut p_g0 = 0.0_f32;
+            let mut p_g1 = 0.0_f32;
+            if active_lane {
+                let col = 3 + level * 2;
+                for j_off in 0..16usize {
+                    let j = j_off * 4 + sub_part;
+                    let h = shared_dh[hash_slot * 68 + j];
+                    let w0 = if local_hash {
+                        j * 31 + col
+                    } else {
+                        col * 64 + j
+                    };
+                    let w1 = if local_hash {
+                        j * 31 + col + 1
+                    } else {
+                        (col + 1) * 64 + j
+                    };
+                    p_g0 += h * shared_weights[w0];
+                    p_g1 += h * shared_weights[w1];
+                }
+            }
+            let (g0, g1) = if subgroup_width >= 32usize {
+                let s0 = p_g0 + plane_shuffle_xor(p_g0, 4u32);
+                let fg0 = s0 + plane_shuffle_xor(s0, 8u32);
+                let s1 = p_g1 + plane_shuffle_xor(p_g1, 4u32);
+                let fg1 = s1 + plane_shuffle_xor(s1, 8u32);
+                (fg0, fg1)
+            } else {
+                if level < 14usize {
+                    fallback_partials[unit * 2] = p_g0;
+                    fallback_partials[unit * 2 + 1] = p_g1;
+                }
+                sync_cube();
+                if active_lane {
+                    let base_p = (level * 16 + hash_slot) * 2;
+                    let fg0 = (fallback_partials[base_p] + fallback_partials[base_p + 8])
+                        + (fallback_partials[base_p + 16] + fallback_partials[base_p + 24]);
+                    let fg1 = (fallback_partials[base_p + 1] + fallback_partials[base_p + 9])
+                        + (fallback_partials[base_p + 17] + fallback_partials[base_p + 25]);
+                    (fg0, fg1)
+                } else {
+                    (0.0_f32, 0.0_f32)
+                }
+            };
+
+            let do_hash = active_lane && (g0 != 0.0_f32 || g1 != 0.0_f32);
+            let mut base0 = 0u32;
+            let mut w0 = 0.0_f32;
+            let mut kw12 = 0.0_f32;
+            let mut dense = false;
+            let mut dense_yz = 0u32;
+            let mut hash_yz = 0u32;
+            if do_hash {
+                let norm0 = f32::clamp(
+                    (shared_feat[hash_slot * 32] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm1 = f32::clamp(
+                    (shared_feat[hash_slot * 32 + 1] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm2 = f32::clamp(
+                    (shared_feat[hash_slot * 32 + 2] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let res_f = f32::cast_from(level_res);
+                let c0 = norm0 * res_f;
+                let c1 = norm1 * res_f;
+                let c2 = norm2 * res_f;
+                let b0 = f32::floor(c0);
+                let b1 = f32::floor(c1);
+                let b2 = f32::floor(c2);
+                w0 = c0 - b0;
+                let w1 = c1 - b1;
+                let w2 = c2 - b2;
+                base0 = u32::cast_from(b0);
+                let r1 = level_res + 1u32;
+                dense = r1 * r1 * r1 <= 524288u32;
+                let bit1 = u32::cast_from(sub_part) & 1u32;
+                let bit2 = (u32::cast_from(sub_part) >> 1u32) & 1u32;
+                let v1 = u32::cast_from(b1) + bit1;
+                let v2 = u32::cast_from(b2) + bit2;
+                let kw1 = if bit1 == 0u32 { 1.0_f32 - w1 } else { w1 };
+                let kw2 = if bit2 == 0u32 { 1.0_f32 - w2 } else { w2 };
+                kw12 = kw1 * kw2;
+                dense_yz = v1 * r1 + v2 * r1 * r1;
+                hash_yz = (v1 * 2654435761u32) ^ (v2 * 805459861u32);
+            }
+
+            // Process corner 0 and corner 1 sequentially to minimize live registers.
+            for c_sub in 0..2u32 {
+                let mut key = 0xFFFF_FFFFu32;
+                let mut wg0 = 0.0_f32;
+                let mut wg1 = 0.0_f32;
+                if do_hash {
+                    let v0 = base0 + c_sub;
+                    let weight = (if c_sub == 0u32 { 1.0_f32 - w0 } else { w0 }) * kw12;
+                    let idx = if dense {
+                        v0 + dense_yz
+                    } else {
+                        (v0 ^ hash_yz) & 524287u32
+                    };
+                    let t0 = weight * g0;
+                    let t1 = weight * g1;
+                    if use_agg {
+                        key = idx;
+                        wg0 = t0;
+                        wg1 = t1;
+                    } else {
+                        let e = (level_offset + usize::cast_from(idx)) * 2;
+                        if t0 != 0.0_f32 {
+                            table_grad[e].fetch_add(t0);
+                        }
+                        if t1 != 0.0_f32 {
+                            table_grad[e + 1].fetch_add(t1);
+                        }
+                    }
+                }
+                if aggregate_hash && subgroup_width >= 32usize {
+                    let mut is_leader = key != 0xFFFF_FFFFu32;
+                    let mut sum0 = wg0;
+                    let mut sum1 = wg1;
+                    for peer in 0..4u32 {
+                        let pk = plane_shuffle(key, lane_base + peer);
+                        let pg0 = plane_shuffle(wg0, lane_base + peer);
+                        let pg1 = plane_shuffle(wg1, lane_base + peer);
+                        let p_idx = usize::cast_from(peer);
+                        if p_idx < hash_slot && pk == key {
+                            is_leader = false;
+                        }
+                        if p_idx > hash_slot && pk == key {
+                            sum0 += pg0;
+                            sum1 += pg1;
+                        }
+                    }
+                    if is_leader {
+                        let entry = (level_offset + usize::cast_from(key)) * 2;
+                        if sum0 != 0.0_f32 {
+                            table_grad[entry].fetch_add(sum0);
+                        }
+                        if sum1 != 0.0_f32 {
+                            table_grad[entry + 1].fetch_add(sum1);
+                        }
+                    }
+                }
+            }
+        }
+        group += 1usize;
+        if group < end_group {
+            sync_cube();
+        }
+    }
+
+    // Write workgroup dw0 + db0 partials once per workgroup.
+    let row0 = part * 2048 + p_row * 32;
+    let row1 = part * 2048 + (p_row + 16) * 32;
+    let row2 = part * 2048 + (p_row + 32) * 32;
+    let row3 = part * 2048 + (p_row + 48) * 32;
+    if accumulate {
+        dw0_partials[row0 + p_col] += acc00;
+        dw0_partials[row1 + p_col] += acc10;
+        dw0_partials[row2 + p_col] += acc20;
+        dw0_partials[row3 + p_col] += acc30;
+        dw0_partials[row0 + p_col + 16] += acc01;
+        dw0_partials[row1 + p_col + 16] += acc11;
+        dw0_partials[row2 + p_col + 16] += acc21;
+        dw0_partials[row3 + p_col + 16] += acc31;
+    } else {
+        dw0_partials[row0 + p_col] = acc00;
+        dw0_partials[row1 + p_col] = acc10;
+        dw0_partials[row2 + p_col] = acc20;
+        dw0_partials[row3 + p_col] = acc30;
+        dw0_partials[row0 + p_col + 16] = acc01;
+        dw0_partials[row1 + p_col + 16] = acc11;
+        dw0_partials[row2 + p_col + 16] = acc21;
+        dw0_partials[row3 + p_col + 16] = acc31;
+    }
+
+    // Reduce dw1 across the 4 slots in shared_dh (free after loop) and write once.
+    sync_cube();
+    shared_dh[unit] = dw1_reg;
+    sync_cube();
+    if slot == 0usize {
+        let sum = (shared_dh[lane] + shared_dh[64 + lane])
+            + (shared_dh[128 + lane] + shared_dh[192 + lane]);
+        if accumulate {
+            dw1_partials[part * 64 + lane] += sum;
+        } else {
+            dw1_partials[part * 64 + lane] = sum;
+        }
+    }
+}
+
+// CAS-atomic companion to `field_backward_fused_native_kernel` for runtimes
+// without native float atomic add.
+#[cube(launch)]
+fn field_backward_fused_cas_kernel(
+    pre: &Tensor<f32>,
+    features: &Tensor<f32>,
+    ds: &Tensor<f32>,
+    weights: &Tensor<f32>,
+    metadata: &Tensor<f32>,
+    table_grad: &Tensor<Atomic<u32>>,
+    dw0_partials: &mut Tensor<f32>,
+    dw1_partials: &mut Tensor<f32>,
+    active: u32,
+    valid_n: u32,
+    aggregation_levels: u32,
+    adjoint_offset: u32,
+    #[comptime] local_hash: bool,
+    #[comptime] aggregate_hash: bool,
+    #[comptime] replay_features: bool,
+    #[comptime] selective_weights: bool,
+    #[comptime] accumulate: bool,
+    #[comptime] subgroup_width: usize,
+    #[comptime] active_columns_only: bool,
+) {
+    let mut unit = usize::cast_from(UNIT_POS);
+    if subgroup_width > 0 {
+        unit = usize::cast_from(PLANE_POS) * subgroup_width + usize::cast_from(UNIT_POS_PLANE);
+    }
+    let lane = unit % 64;
+    let slot = unit / 64;
+    let p_row = unit / 16;
+    let p_col = unit % 16;
+    let hash_slot = unit & 3usize;
+    let sub_part = (unit >> 2) & 3usize;
+    let level = unit >> 4;
+    let active_cols = 3usize + usize::cast_from(active) * 2usize;
+    let feat_cols = if active_columns_only {
+        active_cols
+    } else {
+        usize::cast_from(31u32)
+    };
+    let first_active = p_col < feat_cols;
+    let second_active = p_col + 16usize < feat_cols || p_col + 16usize == 31usize;
+
+    let n_valid = usize::cast_from(valid_n);
+    let total_groups = (n_valid + 3usize) / 4usize;
+    let part = usize::cast_from(CUBE_POS_X);
+    let stride = usize::cast_from(CUBE_COUNT_X);
+
+    let mut shared_weights = Shared::new_slice(2113usize);
+    for tile in 0..9usize {
+        let index = unit + tile * 256;
+        if index < 2113 {
+            let mut needed = false;
+            if index < 1984 {
+                let column = index / 64;
+                needed = column < active_cols && (replay_features || column >= 3);
+            } else if index < 2048 {
+                needed = replay_features;
+            } else if index < 2112 {
+                needed = true;
+            }
+            if !selective_weights || needed {
+                let target = if local_hash && index < 1984 {
+                    (index % 64) * 31 + index / 64
+                } else {
+                    index
+                };
+                shared_weights[target] = weights[index];
+            }
+        }
+    }
+    let mut shared_dh = Shared::new_slice(272usize);
+    let mut shared_feat = Shared::new_slice(128usize);
+    let mut slot_ds = Shared::new_slice(4usize);
+    let mut fallback_partials = Shared::new_slice(if subgroup_width == 0 { 448usize } else { 1usize });
+    sync_cube();
+
+    let mut acc00 = 0.0_f32;
+    let mut acc01 = 0.0_f32;
+    let mut acc10 = 0.0_f32;
+    let mut acc11 = 0.0_f32;
+    let mut acc20 = 0.0_f32;
+    let mut acc21 = 0.0_f32;
+    let mut acc30 = 0.0_f32;
+    let mut acc31 = 0.0_f32;
+    let mut dw1_reg = 0.0_f32;
+
+    // Hoist loop-invariant hash-level metadata (2 registers) out of the group loop.
+    let mut level_res = 0u32;
+    let mut level_offset = 0usize;
+    if level < usize::cast_from(active) {
+        level_res = u32::cast_from(metadata[level * 2]);
+        level_offset = usize::cast_from(metadata[level * 2 + 1]);
+    }
+    let lane_base = (u32::cast_from(UNIT_POS_PLANE) >> 2u32) << 2u32;
+    let use_agg = aggregate_hash
+        && subgroup_width >= 32usize
+        && level < usize::cast_from(aggregation_levels);
+
+    let tiles_per_part = (total_groups + stride - 1usize) / stride;
+    let start_group = part * tiles_per_part;
+    let end_group = usize::min(start_group + tiles_per_part, total_groups);
+    let mut group = start_group;
+    while group < end_group {
+        if unit < 4usize {
+            let p = group * 4 + unit;
+            slot_ds[unit] = if p < n_valid {
+                ds[(p + usize::cast_from(adjoint_offset)) * ds.stride(0)]
+            } else {
+                0.0_f32
+            };
+        }
+        if unit < 128usize {
+            let s = unit / 32;
+            let col = unit % 32;
+            let p = group * 4 + s;
+            let mut f = 0.0_f32;
+            if p < n_valid {
+                if col == 31usize {
+                    f = 1.0_f32;
+                } else if col < feat_cols {
+                    f = features[p * features.stride(0) + col * features.stride(1)];
+                }
+            }
+            shared_feat[unit] = f;
+        }
+        sync_cube();
+
+        let ds0 = slot_ds[0];
+        let ds1 = slot_ds[1];
+        let ds2 = slot_ds[2];
+        let ds3 = slot_ds[3];
+        if ds0 != 0.0_f32 || ds1 != 0.0_f32 || ds2 != 0.0_f32 || ds3 != 0.0_f32 {
+            let point = group * 4 + slot;
+            let ds_val = slot_ds[slot];
+            let mut v = 0.0_f32;
+            if point < n_valid && ds_val != 0.0_f32 {
+                let mut h = 0.0_f32;
+                if replay_features {
+                    for col in 0..active_cols {
+                        let wi = if local_hash {
+                            lane * 31 + col
+                        } else {
+                            col * 64 + lane
+                        };
+                        h += shared_feat[slot * 32 + col] * shared_weights[wi];
+                    }
+                    h += shared_weights[1984 + lane];
+                } else {
+                    h = pre[point * 64 + lane];
+                }
+                let scaled = h * 100.0_f32;
+                let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
+                let derivative = if scaled > 20.0_f32 {
+                    1.0_f32
+                } else {
+                    exp_pos / (1.0_f32 + exp_pos)
+                };
+                v = ds_val * shared_weights[2048 + lane] * derivative;
+                let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
+                let hidden = if scaled > 20.0_f32 { h } else { soft };
+                dw1_reg += ds_val * hidden;
+            }
+            shared_dh[slot * 68 + lane] = v;
+            sync_cube();
+
+            for s in 0..4usize {
+                if slot_ds[s] != 0.0_f32 {
+                    let h0 = shared_dh[s * 68 + p_row];
+                    let h1 = shared_dh[s * 68 + p_row + 16];
+                    let h2 = shared_dh[s * 68 + p_row + 32];
+                    let h3 = shared_dh[s * 68 + p_row + 48];
+                    if first_active {
+                        let x0 = shared_feat[s * 32 + p_col];
+                        acc00 += h0 * x0;
+                        acc10 += h1 * x0;
+                        acc20 += h2 * x0;
+                        acc30 += h3 * x0;
+                    }
+                    if second_active {
+                        let x1 = shared_feat[s * 32 + p_col + 16];
+                        acc01 += h0 * x1;
+                        acc11 += h1 * x1;
+                        acc21 += h2 * x1;
+                        acc31 += h3 * x1;
+                    }
+                }
+            }
+
+            let hash_point = group * 4 + hash_slot;
+            let active_lane = hash_point < n_valid
+                && level < usize::cast_from(active)
+                && slot_ds[hash_slot] != 0.0_f32;
+            let mut p_g0 = 0.0_f32;
+            let mut p_g1 = 0.0_f32;
+            if active_lane {
+                let col = 3 + level * 2;
+                for j_off in 0..16usize {
+                    let j = j_off * 4 + sub_part;
+                    let h = shared_dh[hash_slot * 68 + j];
+                    let w0 = if local_hash {
+                        j * 31 + col
+                    } else {
+                        col * 64 + j
+                    };
+                    let w1 = if local_hash {
+                        j * 31 + col + 1
+                    } else {
+                        (col + 1) * 64 + j
+                    };
+                    p_g0 += h * shared_weights[w0];
+                    p_g1 += h * shared_weights[w1];
+                }
+            }
+            let (g0, g1) = if subgroup_width >= 32usize {
+                let s0 = p_g0 + plane_shuffle_xor(p_g0, 4u32);
+                let fg0 = s0 + plane_shuffle_xor(s0, 8u32);
+                let s1 = p_g1 + plane_shuffle_xor(p_g1, 4u32);
+                let fg1 = s1 + plane_shuffle_xor(s1, 8u32);
+                (fg0, fg1)
+            } else {
+                if level < 14usize {
+                    fallback_partials[unit * 2] = p_g0;
+                    fallback_partials[unit * 2 + 1] = p_g1;
+                }
+                sync_cube();
+                if active_lane {
+                    let base_p = (level * 16 + hash_slot) * 2;
+                    let fg0 = (fallback_partials[base_p] + fallback_partials[base_p + 8])
+                        + (fallback_partials[base_p + 16] + fallback_partials[base_p + 24]);
+                    let fg1 = (fallback_partials[base_p + 1] + fallback_partials[base_p + 9])
+                        + (fallback_partials[base_p + 17] + fallback_partials[base_p + 25]);
+                    (fg0, fg1)
+                } else {
+                    (0.0_f32, 0.0_f32)
+                }
+            };
+
+            let do_hash = active_lane && (g0 != 0.0_f32 || g1 != 0.0_f32);
+            let mut base0 = 0u32;
+            let mut w0 = 0.0_f32;
+            let mut kw12 = 0.0_f32;
+            let mut dense = false;
+            let mut dense_yz = 0u32;
+            let mut hash_yz = 0u32;
+            if do_hash {
+                let norm0 = f32::clamp(
+                    (shared_feat[hash_slot * 32] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm1 = f32::clamp(
+                    (shared_feat[hash_slot * 32 + 1] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let norm2 = f32::clamp(
+                    (shared_feat[hash_slot * 32 + 2] + 1.0_f32) * 0.5_f32,
+                    0.0_f32,
+                    1.0_f32 - 1e-7_f32,
+                );
+                let res_f = f32::cast_from(level_res);
+                let c0 = norm0 * res_f;
+                let c1 = norm1 * res_f;
+                let c2 = norm2 * res_f;
+                let b0 = f32::floor(c0);
+                let b1 = f32::floor(c1);
+                let b2 = f32::floor(c2);
+                w0 = c0 - b0;
+                let w1 = c1 - b1;
+                let w2 = c2 - b2;
+                base0 = u32::cast_from(b0);
+                let r1 = level_res + 1u32;
+                dense = r1 * r1 * r1 <= 524288u32;
+                let bit1 = u32::cast_from(sub_part) & 1u32;
+                let bit2 = (u32::cast_from(sub_part) >> 1u32) & 1u32;
+                let v1 = u32::cast_from(b1) + bit1;
+                let v2 = u32::cast_from(b2) + bit2;
+                let kw1 = if bit1 == 0u32 { 1.0_f32 - w1 } else { w1 };
+                let kw2 = if bit2 == 0u32 { 1.0_f32 - w2 } else { w2 };
+                kw12 = kw1 * kw2;
+                dense_yz = v1 * r1 + v2 * r1 * r1;
+                hash_yz = (v1 * 2654435761u32) ^ (v2 * 805459861u32);
+            }
+
+            for c_sub in 0..2u32 {
+                let mut key = 0xFFFF_FFFFu32;
+                let mut wg0 = 0.0_f32;
+                let mut wg1 = 0.0_f32;
+                if do_hash {
+                    let v0 = base0 + c_sub;
+                    let weight = (if c_sub == 0u32 { 1.0_f32 - w0 } else { w0 }) * kw12;
+                    let idx = if dense {
+                        v0 + dense_yz
+                    } else {
+                        (v0 ^ hash_yz) & 524287u32
+                    };
+                    let t0 = weight * g0;
+                    let t1 = weight * g1;
+                    if use_agg {
+                        key = idx;
+                        wg0 = t0;
+                        wg1 = t1;
+                    } else {
+                        let e = (level_offset + usize::cast_from(idx)) * 2;
+                        if t0 != 0.0_f32 {
+                            atomic_add_f32(table_grad, e, t0);
+                        }
+                        if t1 != 0.0_f32 {
+                            atomic_add_f32(table_grad, e + 1, t1);
+                        }
+                    }
+                }
+                if aggregate_hash && subgroup_width >= 32usize {
+                    let mut is_leader = key != 0xFFFF_FFFFu32;
+                    let mut sum0 = wg0;
+                    let mut sum1 = wg1;
+                    for peer in 0..4u32 {
+                        let pk = plane_shuffle(key, lane_base + peer);
+                        let pg0 = plane_shuffle(wg0, lane_base + peer);
+                        let pg1 = plane_shuffle(wg1, lane_base + peer);
+                        let p_idx = usize::cast_from(peer);
+                        if p_idx < hash_slot && pk == key {
+                            is_leader = false;
+                        }
+                        if p_idx > hash_slot && pk == key {
+                            sum0 += pg0;
+                            sum1 += pg1;
+                        }
+                    }
+                    if is_leader {
+                        let entry = (level_offset + usize::cast_from(key)) * 2;
+                        if sum0 != 0.0_f32 {
+                            atomic_add_f32(table_grad, entry, sum0);
+                        }
+                        if sum1 != 0.0_f32 {
+                            atomic_add_f32(table_grad, entry + 1, sum1);
+                        }
+                    }
+                }
+            }
+        }
+        group += 1usize;
+        if group < end_group {
+            sync_cube();
+        }
+    }
+
+    let row0 = part * 2048 + p_row * 32;
+    let row1 = part * 2048 + (p_row + 16) * 32;
+    let row2 = part * 2048 + (p_row + 32) * 32;
+    let row3 = part * 2048 + (p_row + 48) * 32;
+    if accumulate {
+        dw0_partials[row0 + p_col] += acc00;
+        dw0_partials[row1 + p_col] += acc10;
+        dw0_partials[row2 + p_col] += acc20;
+        dw0_partials[row3 + p_col] += acc30;
+        dw0_partials[row0 + p_col + 16] += acc01;
+        dw0_partials[row1 + p_col + 16] += acc11;
+        dw0_partials[row2 + p_col + 16] += acc21;
+        dw0_partials[row3 + p_col + 16] += acc31;
+    } else {
+        dw0_partials[row0 + p_col] = acc00;
+        dw0_partials[row1 + p_col] = acc10;
+        dw0_partials[row2 + p_col] = acc20;
+        dw0_partials[row3 + p_col] = acc30;
+        dw0_partials[row0 + p_col + 16] = acc01;
+        dw0_partials[row1 + p_col + 16] = acc11;
+        dw0_partials[row2 + p_col + 16] = acc21;
+        dw0_partials[row3 + p_col + 16] = acc31;
+    }
+
+    sync_cube();
+    shared_dh[unit] = dw1_reg;
+    sync_cube();
+    if slot == 0usize {
+        let sum = (shared_dh[lane] + shared_dh[64 + lane])
+            + (shared_dh[128 + lane] + shared_dh[192 + lane]);
+        if accumulate {
+            dw1_partials[part * 64 + lane] += sum;
+        } else {
+            dw1_partials[part * 64 + lane] = sum;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FieldBackwardFusedOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([p, f, d, w, m, t, dw0p, dw1p], [ot, odw0, odw1]) = self.desc.as_fixed();
+        let [
+            ScalarIr::UInt(active),
+            ScalarIr::UInt(valid_n),
+            ScalarIr::UInt(local_hash),
+            ScalarIr::UInt(aggregate_hash),
+            ScalarIr::UInt(aggregation_levels),
+            ScalarIr::UInt(replay_features),
+            ScalarIr::UInt(adjoint_offset),
+            ScalarIr::UInt(selective_weights),
+            ScalarIr::UInt(accumulate),
+            ScalarIr::UInt(active_columns_only),
+        ] = self.desc.scalars.as_slice()
+        else {
+            panic!("invalid fused backward scalars")
+        };
+        let [p, f, d, w, m, t, dw0p, dw1p] = [p, f, d, w, m, t, dw0p, dw1p]
+            .map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let t = if t.can_mut() {
+            t
+        } else {
+            crate::diagnostics::count(
+                "hash_backward.gradient_copy_bytes",
+                t.meta.shape().dims::<2>().iter().product::<usize>() * 4,
+            );
+            t.copy()
+        };
+        let dw0p = if *accumulate != 0 && !dw0p.can_mut() {
+            dw0p.copy()
+        } else {
+            dw0p
+        };
+        let dw1p = if *accumulate != 0 && !dw1p.can_mut() {
+            dw1p.copy()
+        } else {
+            dw1p
+        };
+        let client = p.client.clone();
+        let _timing = crate::diagnostics::start(&client, "field_backward_fused");
+        let props = client.properties();
+        let hw = &props.hardware;
+        let subgroup_width = if props
+            .features
+            .plane
+            .contains(cubecl::ir::features::Plane::Ops)
+            && hw.plane_size_min == hw.plane_size_max
+            && (hw.plane_size_min == 32 || hw.plane_size_min == 64)
+        {
+            hw.plane_size_min as usize
+        } else {
+            0usize
+        };
+        let native_add = props
+            .atomic_type_usage(Type::atomic(f32::elem_type_native()))
+            .contains(cubecl::ir::features::AtomicUsage::Add);
+        let parts = dw0p.meta.shape().dims::<2>()[0];
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            eprintln!(
+                "Fused backward+params: {} atomics; subgroup width {}; {} persistent groups",
+                if native_add { "native f32" } else { "CAS" },
+                subgroup_width,
+                parts,
+            );
+        });
+        if native_add {
+            field_backward_fused_native_kernel::launch(
+                &client,
+                CubeCount::Static(parts as u32, 1, 1),
+                CubeDim::new_1d(256),
+                p.into_tensor_arg(),
+                f.into_tensor_arg(),
+                d.into_tensor_arg(),
+                w.into_tensor_arg(),
+                m.into_tensor_arg(),
+                t.clone().into_tensor_arg(),
+                dw0p.clone().into_tensor_arg(),
+                dw1p.clone().into_tensor_arg(),
+                *active as u32,
+                *valid_n as u32,
+                *aggregation_levels as u32,
+                *adjoint_offset as u32,
+                *local_hash != 0,
+                *aggregate_hash != 0 && *aggregation_levels > 0,
+                *replay_features != 0,
+                *selective_weights != 0,
+                *accumulate != 0,
+                subgroup_width,
+                *active_columns_only != 0,
+            );
+        } else {
+            field_backward_fused_cas_kernel::launch(
+                &client,
+                CubeCount::Static(parts as u32, 1, 1),
+                CubeDim::new_1d(256),
+                p.into_tensor_arg(),
+                f.into_tensor_arg(),
+                d.into_tensor_arg(),
+                w.into_tensor_arg(),
+                m.into_tensor_arg(),
+                t.clone().into_tensor_arg(),
+                dw0p.clone().into_tensor_arg(),
+                dw1p.clone().into_tensor_arg(),
+                *active as u32,
+                *valid_n as u32,
+                *aggregation_levels as u32,
+                *adjoint_offset as u32,
+                *local_hash != 0,
+                *aggregate_hash != 0 && *aggregation_levels > 0,
+                *replay_features != 0,
+                *selective_weights != 0,
+                *accumulate != 0,
+                subgroup_width,
+                *active_columns_only != 0,
+            );
+        }
+        handles.register_float_tensor::<CubeBackend>(&ot.id, t);
+        handles.register_float_tensor::<CubeBackend>(&odw0.id, dw0p);
+        handles.register_float_tensor::<CubeBackend>(&odw1.id, dw1p);
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn field_backward_fused(
+    inputs: [burn::tensor::Tensor<2>; 8],
+    valid_n: usize,
+    active: usize,
+    local_hash: bool,
+    aggregate_hash: bool,
+    aggregation_levels: usize,
+    replay_features: bool,
+    adjoint_offset: usize,
+    selective_weights: bool,
+    accumulate: bool,
+    active_columns_only: bool,
+) -> [burn::tensor::Tensor<2>; 3] {
+    use burn::tensor::Tensor as BT;
+    assert!(
+        adjoint_offset <= inputs[2].dims()[0] && valid_n <= inputs[2].dims()[0] - adjoint_offset
+    );
+    assert!(valid_n <= inputs[1].dims()[0]);
+    let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let outputs: Vec<_> = [5usize, 6, 7]
+        .into_iter()
+        .map(|i| &inputs[i])
+        .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
+        .collect();
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_field_backward_fused",
+        &inputs.map(|t| t.into_ir()),
+        &outputs,
+        vec![
+            ScalarIr::UInt(active as u64),
+            ScalarIr::UInt(valid_n as u64),
+            ScalarIr::UInt(local_hash as u64),
+            ScalarIr::UInt(aggregate_hash as u64),
+            ScalarIr::UInt(aggregation_levels as u64),
+            ScalarIr::UInt(replay_features as u64),
+            ScalarIr::UInt(adjoint_offset as u64),
+            ScalarIr::UInt(selective_weights as u64),
+            ScalarIr::UInt(accumulate as u64),
+            ScalarIr::UInt(active_columns_only as u64),
+        ],
+    );
+    let result: [_; 3] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            FieldBackwardFusedOp { desc },
+        )
+        .outputs();
+    result.map(BT::<2>::from_primitive::<GpuBackend>)
+}
+
+#[cube(launch)]
+fn reduce_mlp_partials_kernel(
+    dw0_partials: &Tensor<f32>,
+    dw1_partials: &Tensor<f32>,
+    dw0_out: &mut Tensor<f32>,
+    db0_out: &mut Tensor<f32>,
+    dw1_out: &mut Tensor<f32>,
+) {
+    let idx = ABSOLUTE_POS;
+    if idx >= 2112usize {
+        terminate!();
+    }
+    let parts = dw0_partials.shape(0);
+    let mut sum = 0.0_f32;
+    if idx < 2048usize {
+        for p in 0..parts {
+            sum += dw0_partials[p * 2048 + idx];
+        }
+        let r = idx / 32;
+        let c = idx % 32;
+        if c < 31usize {
+            dw0_out[r * 31 + c] = sum;
+        } else {
+            db0_out[r] = sum;
+        }
+    } else {
+        let lane = idx - 2048usize;
+        for p in 0..parts {
+            sum += dw1_partials[p * 64 + lane];
+        }
+        dw1_out[lane] = sum;
+    }
+}
+
+#[derive(Debug)]
+struct ReduceMlpPartialsOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for ReduceMlpPartialsOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([p0, p1, dw0, db0, dw1], [odw0, odb0, odw1]) = self.desc.as_fixed();
+        let [p0, p1, dw0, db0, dw1] =
+            [p0, p1, dw0, db0, dw1].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let client = p0.client.clone();
+        let _timing = crate::diagnostics::start(&client, "reduce_mlp_partials");
+        reduce_mlp_partials_kernel::launch(
+            &client,
+            CubeCount::Static(17, 1, 1),
+            CubeDim::new_1d(128),
+            p0.into_tensor_arg(),
+            p1.into_tensor_arg(),
+            dw0.clone().into_tensor_arg(),
+            db0.clone().into_tensor_arg(),
+            dw1.clone().into_tensor_arg(),
+        );
+        handles.register_float_tensor::<CubeBackend>(&odw0.id, dw0);
+        handles.register_float_tensor::<CubeBackend>(&odb0.id, db0);
+        handles.register_float_tensor::<CubeBackend>(&odw1.id, dw1);
+        Ok(())
+    }
+}
+
+pub fn reduce_mlp_partials(
+    dw0_partials: burn::tensor::Tensor<2>,
+    dw1_partials: burn::tensor::Tensor<2>,
+) -> [burn::tensor::Tensor<2>; 3] {
+    use burn::tensor::Tensor as BT;
+    let device = dw0_partials.device();
+    let inputs = [
+        dw0_partials,
+        dw1_partials,
+        BT::empty([64, 31], &device),
+        BT::empty([1, 64], &device),
+        BT::empty([1, 64], &device),
+    ]
+    .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let outputs: Vec<_> = [2usize, 3, 4]
+        .into_iter()
+        .map(|i| &inputs[i])
+        .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
+        .collect();
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_reduce_mlp_partials",
+        &inputs.map(|t| t.into_ir()),
+        &outputs,
+        vec![],
+    );
+    let result: [_; 3] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            ReduceMlpPartialsOp { desc },
+        )
+        .outputs();
+    result.map(BT::<2>::from_primitive::<GpuBackend>)
+}
+
+#[cube]
+fn adam_scalar_step(
+    state: &mut Tensor<f32>,
+    idx: usize,
+    grad: f32,
+    inv_bc1: f32,
+    inv_bc2: f32,
+    lr: f32,
+) -> f32 {
+    let old_val = state[idx];
+    let old_m = state[2179usize + idx];
+    let old_v = state[4358usize + idx];
+    let m = old_m * 0.9_f32 + grad * 0.1_f32;
+    let v = old_v * 0.999_f32 + grad * grad * 0.001_f32;
+    let m_hat = m * inv_bc1;
+    let v_hat = v * inv_bc2;
+    let new_val = old_val - m_hat / (f32::sqrt(v_hat) + 1e-8_f32) * lr;
+    state[idx] = new_val;
+    state[2179usize + idx] = m;
+    state[4358usize + idx] = v;
+    new_val
+}
+
+// Single-workgroup fused MLP WeightNorm backward + 7-parameter Adam update +
+// WeightNorm forward + transposed `packed_mlp` packing.
+// Replaces ~118 Burn ops and ~20 tiny GPU launches per step with one < 5 us launch.
+// `mlp_state` `[3, 2179]` rows: 0 = value, 1 = m, 2 = v.
+// Offsets within each 2179-float row:
+//   0..1984:    lin0.weight_v [64, 31]
+//   1984..2048: lin0.weight_g [64, 1]
+//   2048..2112: lin0.bias     [1, 64]
+//   2112..2176: lin1.weight_v [1, 64]
+//   2176:       lin1.weight_g [1, 1]
+//   2177:       lin1.bias     [1, 1]
+//   2178:       variance      [1, 1]
+#[cube(launch)]
+fn fused_mlp_adam_pack_kernel(
+    mlp_state: &mut Tensor<f32>,
+    dw0: &Tensor<f32>,
+    db0: &Tensor<f32>,
+    dw1: &Tensor<f32>,
+    stats: &Tensor<f32>,
+    packed_mlp: &mut Tensor<f32>,
+    variance_out: &mut Tensor<f32>,
+    inv_bc1: f32,
+    inv_bc2: f32,
+    lr: f32,
+) {
+    let unit = usize::cast_from(UNIT_POS);
+    let mut sh_norm = Shared::new_slice(64usize);
+    let mut sh_dot = Shared::new_slice(64usize);
+    let mut sh_meta = Shared::new_slice(4usize);
+
+    // Threads 0..64: Layer 0 (64 rows of 31 cols) — independent per row!
+    if unit < 64usize {
+        let r = unit;
+        let row_off = r * 31;
+        let mut norm_sq = 0.0_f32;
+        let mut dot = 0.0_f32;
+        for c in 0..31usize {
+            let v = mlp_state[row_off + c];
+            let g = dw0[row_off + c];
+            norm_sq += v * v;
+            dot += g * v;
+        }
+        let norm = f32::sqrt(norm_sq);
+        let old_g = mlp_state[1984usize + r];
+        let dg = dot / norm;
+        let dot_over_nsq = dot / norm_sq;
+        let scale_v = old_g / norm;
+
+        let new_g = adam_scalar_step(mlp_state, 1984usize + r, dg, inv_bc1, inv_bc2, lr);
+        let new_b0 = adam_scalar_step(mlp_state, 2048usize + r, db0[r], inv_bc1, inv_bc2, lr);
+        packed_mlp[1984usize + r] = new_b0;
+
+        let mut new_norm_sq = 0.0_f32;
+        for c in 0..31usize {
+            let v = mlp_state[row_off + c];
+            let dv = (dw0[row_off + c] - v * dot_over_nsq) * scale_v;
+            let nv = adam_scalar_step(mlp_state, row_off + c, dv, inv_bc1, inv_bc2, lr);
+            new_norm_sq += nv * nv;
+        }
+        let new_scale = new_g / f32::sqrt(new_norm_sq);
+        for c in 0..31usize {
+            packed_mlp[c * 64 + r] = mlp_state[row_off + c] * new_scale;
+        }
+    }
+
+    // Threads 64..128: Layer 1 (1 row of 64 cols) + lin1.bias + variance.
+    if unit >= 64usize {
+        let k = unit - 64usize;
+        let v1 = mlp_state[2112usize + k];
+        sh_norm[k] = v1 * v1;
+        sh_dot[k] = dw1[k] * v1;
+    }
+    sync_cube();
+
+    if unit == 64usize {
+        let mut norm_sq = 0.0_f32;
+        let mut dot = 0.0_f32;
+        for k in 0..64usize {
+            norm_sq += sh_norm[k];
+            dot += sh_dot[k];
+        }
+        let norm = f32::sqrt(norm_sq);
+        let old_g1 = mlp_state[2176usize];
+        let dg1 = dot / norm;
+        let new_g1 = adam_scalar_step(mlp_state, 2176usize, dg1, inv_bc1, inv_bc2, lr);
+        let new_b1 = adam_scalar_step(mlp_state, 2177usize, stats[4], inv_bc1, inv_bc2, lr);
+        let new_var = adam_scalar_step(mlp_state, 2178usize, stats[3], inv_bc1, inv_bc2, lr);
+        packed_mlp[2112usize] = new_b1;
+        variance_out[0] = new_var;
+        sh_meta[0] = dot / norm_sq;
+        sh_meta[1] = old_g1 / norm;
+        sh_meta[2] = new_g1;
+    }
+    sync_cube();
+
+    if unit >= 64usize {
+        let k = unit - 64usize;
+        let v1 = mlp_state[2112usize + k];
+        let dv1 = (dw1[k] - v1 * sh_meta[0]) * sh_meta[1];
+        let nv1 = adam_scalar_step(mlp_state, 2112usize + k, dv1, inv_bc1, inv_bc2, lr);
+        sh_norm[k] = nv1 * nv1;
+    }
+    sync_cube();
+
+    if unit == 64usize {
+        let mut new_norm_sq = 0.0_f32;
+        for k in 0..64usize {
+            new_norm_sq += sh_norm[k];
+        }
+        sh_meta[3] = sh_meta[2] / f32::sqrt(new_norm_sq);
+    }
+    sync_cube();
+
+    if unit >= 64usize {
+        let k = unit - 64usize;
+        packed_mlp[2048usize + k] = mlp_state[2112usize + k] * sh_meta[3];
+    }
+}
+
+#[derive(Debug)]
+struct FusedMlpStepOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for FusedMlpStepOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([st, dw0, db0, dw1, stats, pmlp, vout], [ost, opmlp, ovout]) = self.desc.as_fixed();
+        let [
+            ScalarIr::Float(inv_bc1),
+            ScalarIr::Float(inv_bc2),
+            ScalarIr::Float(lr),
+        ] = self.desc.scalars.as_slice()
+        else {
+            panic!("invalid fused mlp step scalars")
+        };
+        let [st, dw0, db0, dw1, stats, pmlp, vout] = [st, dw0, db0, dw1, stats, pmlp, vout]
+            .map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let st = if st.can_mut() { st } else { st.copy() };
+        let client = st.client.clone();
+        let _timing = crate::diagnostics::start(&client, "fused_mlp_adam_pack");
+        fused_mlp_adam_pack_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(128),
+            st.clone().into_tensor_arg(),
+            dw0.into_tensor_arg(),
+            db0.into_tensor_arg(),
+            dw1.into_tensor_arg(),
+            stats.into_tensor_arg(),
+            pmlp.clone().into_tensor_arg(),
+            vout.clone().into_tensor_arg(),
+            *inv_bc1 as f32,
+            *inv_bc2 as f32,
+            *lr as f32,
+        );
+        handles.register_float_tensor::<CubeBackend>(&ost.id, st);
+        handles.register_float_tensor::<CubeBackend>(&opmlp.id, pmlp);
+        handles.register_float_tensor::<CubeBackend>(&ovout.id, vout);
+        Ok(())
+    }
+}
+
+pub fn fused_mlp_step(
+    mlp_state: burn::tensor::Tensor<2>,
+    dw0: burn::tensor::Tensor<2>,
+    db0: burn::tensor::Tensor<2>,
+    dw1: burn::tensor::Tensor<2>,
+    stats: burn::tensor::Tensor<2>,
+    inv_bc1: f64,
+    inv_bc2: f64,
+    lr: f64,
+) -> [burn::tensor::Tensor<2>; 3] {
+    use burn::tensor::Tensor as BT;
+    let device = mlp_state.device();
+    let inputs = [
+        mlp_state,
+        dw0,
+        db0,
+        dw1,
+        stats,
+        BT::empty([1, 2113], &device),
+        BT::empty([1, 1], &device),
+    ]
+    .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let outputs: Vec<_> = [0usize, 5, 6]
+        .into_iter()
+        .map(|i| &inputs[i])
+        .map(|t| TensorIr::uninit(client.create_empty_handle(), t.shape.clone(), t.dtype))
+        .collect();
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_fused_mlp_step",
+        &inputs.map(|t| t.into_ir()),
+        &outputs,
+        vec![
+            ScalarIr::Float(inv_bc1),
+            ScalarIr::Float(inv_bc2),
+            ScalarIr::Float(lr),
+        ],
+    );
+    let result: [_; 3] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            FusedMlpStepOp { desc },
+        )
+        .outputs();
+    result.map(BT::<2>::from_primitive::<GpuBackend>)
 }

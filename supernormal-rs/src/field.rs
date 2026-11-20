@@ -65,7 +65,9 @@ pub struct Field {
     pub wide_parameter_rows: bool,
     pub hybrid_activation_cache: bool,
     pub fused_mlp_packing: bool,
+    pub fused_backward_params: bool,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
+    packed_mlp_state: Option<(Tensor<2>, usize)>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
     persistent_table_grad: std::cell::RefCell<Option<Tensor<2>>>,
 }
@@ -98,6 +100,8 @@ pub fn write_f32(path: &Path, data: &[f32]) -> Result<()> {
 pub struct Gradients {
     pub params: BTreeMap<String, Tensor<2>>,
     pub host_tables: Vec<Vec<f32>>,
+    /// Raw `(dw0, db0, dw1)` for single-workgroup fused WeightNorm + Adam + pack.
+    pub raw_mlp: Option<(Tensor<2>, Tensor<2>, Tensor<2>)>,
 }
 
 impl Gradients {
@@ -105,7 +109,27 @@ impl Gradients {
         self.params.insert(name, tensor);
     }
 
+    pub fn expand_raw_mlp(&mut self, field: &Field) {
+        if let Some((dw0, db0, dw1)) = self.raw_mlp.take() {
+            let (dv0, dg0) = field.weight_gradients(0, dw0);
+            let (dv1, dg1) = field.weight_gradients(1, dw1);
+            for (name, grad) in [
+                ("lin0.weight_v", dv0),
+                ("lin0.weight_g", dg0),
+                ("lin0.bias", db0),
+                ("lin1.weight_v", dv1),
+                ("lin1.weight_g", dg1),
+            ] {
+                self.params
+                    .entry(name.to_string())
+                    .and_modify(|v| *v = (v.clone() + grad.clone()).without_autodiff())
+                    .or_insert(grad);
+            }
+        }
+    }
+
     pub fn into_tensors(mut self, field: &Field) -> BTreeMap<String, Tensor<2>> {
+        self.expand_raw_mlp(field);
         if let Some(packed) = self.params.remove("encoding.packed") {
             let mut offset = 0;
             for level in 0..field.active.min(14) {
@@ -215,6 +239,66 @@ impl Field {
         (packed_param, meta_tensor, offsets, updates)
     }
 
+    const MLP_PARAM_SPEC: [(&'static str, usize, [usize; 2]); 7] = [
+        ("lin0.weight_v", 1984, [64, 31]),
+        ("lin0.weight_g", 64, [64, 1]),
+        ("lin0.bias", 64, [1, 64]),
+        ("lin1.weight_v", 64, [1, 64]),
+        ("lin1.weight_g", 1, [1, 1]),
+        ("lin1.bias", 1, [1, 1]),
+        ("variance", 1, [1, 1]),
+    ];
+
+    fn build_packed_mlp_state(
+        params: &BTreeMap<String, Parameter>,
+    ) -> Option<(Tensor<2>, usize)> {
+        let updates = params.get("lin0.weight_v")?.updates;
+        if Self::MLP_PARAM_SPEC
+            .iter()
+            .any(|(name, _, _)| params.get(*name).is_none_or(|p| p.updates != updates))
+        {
+            return None;
+        }
+        let mut vals = Vec::with_capacity(7);
+        let mut ms = Vec::with_capacity(7);
+        let mut vs = Vec::with_capacity(7);
+        for &(name, len, _) in &Self::MLP_PARAM_SPEC {
+            let p = &params[name];
+            vals.push(p.value.clone().without_autodiff().reshape([1, len]));
+            ms.push(p.m.clone().without_autodiff().reshape([1, len]));
+            vs.push(p.v.clone().without_autodiff().reshape([1, len]));
+        }
+        let state = Tensor::cat(
+            vec![
+                Tensor::cat(vals, 1),
+                Tensor::cat(ms, 1),
+                Tensor::cat(vs, 1),
+            ],
+            0,
+        );
+        Some((state, updates))
+    }
+
+    fn sync_packed_mlp_to_params(&mut self) {
+        if let Some((state, updates)) = &self.packed_mlp_state {
+            let mut col = 0usize;
+            for &(name, len, shape) in &Self::MLP_PARAM_SPEC {
+                if let Some(p) = self.params.get_mut(name) {
+                    p.value = state
+                        .clone()
+                        .slice([0..1, col..col + len])
+                        .reshape(shape)
+                        .autodiff()
+                        .require_grad();
+                    p.m = state.clone().slice([1..2, col..col + len]).reshape(shape);
+                    p.v = state.clone().slice([2..3, col..col + len]).reshape(shape);
+                    p.updates = *updates;
+                }
+                col += len;
+            }
+        }
+    }
+
     pub fn sync_packed_to_params(&mut self) {
         if let Some(packed) = &self.packed_embedding {
             for level in 0..14 {
@@ -243,6 +327,7 @@ impl Field {
                 }
             }
         }
+        self.sync_packed_mlp_to_params();
     }
 
     pub fn new(device: Device, seed: u64) -> Self {
@@ -306,6 +391,7 @@ impl Field {
 
         let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
             Self::build_packed_embedding(&params, &device);
+        let packed_mlp_state = Self::build_packed_mlp_state(&params);
 
         let _ = device.sync();
         device.memory_cleanup();
@@ -337,7 +423,7 @@ impl Field {
             direct_adjoint_views: true,
             active_parameter_columns: true,
             selective_backward_weights: true,
-            point_tiles: 1,
+            point_tiles: 4,
             subgroup_reduce: true,
             aggregation_levels: 14,
             cross_corners: false,
@@ -353,7 +439,9 @@ impl Field {
             wide_parameter_rows: true,
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
+            fused_backward_params: true,
             packed_mlp: std::cell::RefCell::new(None),
+            packed_mlp_state,
             inference_weights: std::cell::RefCell::new(None),
             persistent_table_grad: std::cell::RefCell::new(None),
         }
@@ -410,6 +498,7 @@ impl Field {
             .into_scalar();
         let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
             Self::build_packed_embedding(&params, &device);
+        let packed_mlp_state = Self::build_packed_mlp_state(&params);
 
         let _ = device.sync();
         device.memory_cleanup();
@@ -441,7 +530,7 @@ impl Field {
             direct_adjoint_views: true,
             active_parameter_columns: true,
             selective_backward_weights: true,
-            point_tiles: 1,
+            point_tiles: 4,
             subgroup_reduce: true,
             aggregation_levels: 14,
             cross_corners: false,
@@ -457,7 +546,9 @@ impl Field {
             wide_parameter_rows: true,
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
+            fused_backward_params: true,
             packed_mlp: std::cell::RefCell::new(None),
+            packed_mlp_state,
             inference_weights: std::cell::RefCell::new(None),
             persistent_table_grad: std::cell::RefCell::new(None),
         })
@@ -1252,6 +1343,7 @@ impl Field {
         let mut dw1_total: Option<Tensor<2>> = None;
         let mut db0_total: Option<Tensor<2>> = None;
         let mut db1_total: Option<Tensor<2>> = None;
+        let mut fused_partials: Option<(Tensor<2>, Tensor<2>)> = None;
         let single_chunk = cached.len() == 1;
 
         for chunk in cached {
@@ -1343,6 +1435,65 @@ impl Field {
                     (f, p)
                 }
             };
+
+            let use_fused_bwd = self.fused_backward_params
+                && self.fused_field
+                && self.tiled_gradients
+                && self.corner_parallel
+                && !self.recompute_parameter_gradients
+                && self.wide_gradient_tiles
+                && self.register_gradient_tiles
+                && !self.cross_corners
+                && !replay_hash;
+            if use_fused_bwd {
+                let weights = self
+                    .packed_mlp
+                    .borrow()
+                    .as_ref()
+                    .expect("cached forward packs weights")
+                    .clone();
+                let table_grad = accumulated.params.remove("encoding.packed").unwrap();
+                let (dw0p, dw1p, accumulate) = match fused_partials.take() {
+                    Some((p0, p1)) => (p0, p1, true),
+                    None => (
+                        Tensor::empty([448, 2048], &self.device),
+                        Tensor::empty([448, 64], &self.device),
+                        false,
+                    ),
+                };
+                let [updated, next_dw0p, next_dw1p] = crate::kernels::field_backward_fused(
+                    [
+                        preactivation,
+                        feat,
+                        ds_tensor.clone(),
+                        weights,
+                        metadata.clone(),
+                        table_grad,
+                        dw0p,
+                        dw1p,
+                    ],
+                    n,
+                    active_levels,
+                    self.local_hash,
+                    self.aggregate_hash,
+                    self.aggregation_levels,
+                    replay_features,
+                    adjoint_offset,
+                    self.selective_backward_weights,
+                    accumulate,
+                    self.active_parameter_columns,
+                );
+                accumulated.params.insert("encoding.packed".into(), updated);
+                fused_partials = Some((next_dw0p, next_dw1p));
+                if need_bias {
+                    let db1_chunk = ds_tensor.sum_dim(0);
+                    db1_total = Some(match db1_total {
+                        Some(acc) => (acc + db1_chunk).without_autodiff(),
+                        None => db1_chunk,
+                    });
+                }
+                continue;
+            }
 
             let recompute =
                 self.fused_field && self.tiled_gradients && self.recompute_parameter_gradients;
@@ -1499,22 +1650,54 @@ impl Field {
             }
         }
 
-        if let (Some(dw0), Some(dw1), Some(db0)) = (dw0_total, dw1_total, db0_total) {
-            let (dv0, dg0) = self.weight_gradients(0, dw0);
-            let (dv1, dg1) = self.weight_gradients(1, dw1);
+        if let Some((dw0p, dw1p)) = fused_partials {
+            let [dw0_f, db0_f, dw1_f] = crate::kernels::reduce_mlp_partials(dw0p, dw1p);
+            dw0_total = Some(match dw0_total {
+                Some(acc) => (acc + dw0_f).without_autodiff(),
+                None => dw0_f,
+            });
+            db0_total = Some(match db0_total {
+                Some(acc) => (acc + db0_f).without_autodiff(),
+                None => db0_f,
+            });
+            dw1_total = Some(match dw1_total {
+                Some(acc) => (acc + dw1_f).without_autodiff(),
+                None => dw1_f,
+            });
+        }
 
-            for (name, grad) in [
-                ("lin0.weight_v", dv0),
-                ("lin0.weight_g", dg0),
-                ("lin0.bias", db0),
-                ("lin1.weight_v", dv1),
-                ("lin1.weight_g", dg1),
-            ] {
-                accumulated
-                    .params
-                    .entry(name.to_string())
-                    .and_modify(|v| *v = (v.clone() + grad.clone()).without_autodiff())
-                    .or_insert(grad);
+        if let (Some(dw0), Some(dw1), Some(db0)) = (dw0_total, dw1_total, db0_total) {
+            if !need_bias
+                && self.fused_field
+                && self.fused_mlp_packing
+                && self.packed_mlp_state.is_some()
+                && db1_total.is_none()
+            {
+                accumulated.raw_mlp = Some(match accumulated.raw_mlp.take() {
+                    Some((a0, ab0, a1)) => (
+                        (a0 + dw0).without_autodiff(),
+                        (ab0 + db0).without_autodiff(),
+                        (a1 + dw1).without_autodiff(),
+                    ),
+                    None => (dw0, db0, dw1),
+                });
+            } else {
+                let (dv0, dg0) = self.weight_gradients(0, dw0);
+                let (dv1, dg1) = self.weight_gradients(1, dw1);
+
+                for (name, grad) in [
+                    ("lin0.weight_v", dv0),
+                    ("lin0.weight_g", dg0),
+                    ("lin0.bias", db0),
+                    ("lin1.weight_v", dv1),
+                    ("lin1.weight_g", dg1),
+                ] {
+                    accumulated
+                        .params
+                        .entry(name.to_string())
+                        .and_modify(|v| *v = (v.clone() + grad.clone()).without_autodiff())
+                        .or_insert(grad);
+                }
             }
         }
         if let Some(db1) = db1_total {
@@ -1538,7 +1721,16 @@ impl Field {
         self.accumulate_gradients_cached(cached, adjoints, accumulated);
     }
 
-    pub fn apply_gradients_packed(&mut self, mut gradients: Gradients, lr: f64) {
+    pub fn apply_gradients_packed(&mut self, gradients: Gradients, lr: f64) {
+        self.apply_gradients_packed_with_stats(gradients, None, lr);
+    }
+
+    pub fn apply_gradients_packed_with_stats(
+        &mut self,
+        mut gradients: Gradients,
+        device_stats: Option<&Tensor<2>>,
+        lr: f64,
+    ) {
         self.inference_weights.get_mut().take();
         self.packed_mlp.get_mut().take();
 
@@ -1584,6 +1776,48 @@ impl Field {
                 *self.persistent_table_grad.borrow_mut() = Some(packed_grad.without_autodiff());
             }
         }
+
+        if self.fused_field
+            && self.fused_mlp_packing
+            && gradients.params.is_empty()
+            && device_stats.is_some()
+            && gradients.raw_mlp.is_some()
+            && self.packed_mlp_state.is_some()
+        {
+            let stats = device_stats.unwrap();
+            let (dw0, db0, dw1) = gradients.raw_mlp.take().unwrap();
+            let (state, mut updates) = self.packed_mlp_state.take().unwrap();
+            updates += 1;
+            let inv_bc1 = 1.0 / (1.0 - 0.9f64.powi(updates as i32));
+            let inv_bc2 = 1.0 / (1.0 - 0.999f64.powi(updates as i32));
+            let [new_state, packed_mlp, new_var] = crate::kernels::fused_mlp_step(
+                state,
+                dw0,
+                db0,
+                dw1,
+                stats.clone(),
+                inv_bc1,
+                inv_bc2,
+                lr,
+            );
+            self.packed_mlp_state = Some((new_state, updates));
+            *self.packed_mlp.borrow_mut() = Some(packed_mlp);
+            self.params.get_mut("variance").unwrap().value = new_var.autodiff().require_grad();
+            return;
+        }
+
+        self.sync_packed_mlp_to_params();
+        gradients.expand_raw_mlp(self);
+        if let Some(stats) = device_stats {
+            gradients
+                .params
+                .entry("variance".into())
+                .or_insert_with(|| stats.clone().slice([0..1, 3..4]));
+            gradients
+                .params
+                .entry("lin1.bias".into())
+                .or_insert_with(|| stats.clone().slice([0..1, 4..5]));
+        }
         for (name, grad) in gradients.params {
             let p = self.params.get_mut(&name).unwrap();
             p.updates += 1;
@@ -1598,9 +1832,11 @@ impl Field {
             // Do not insert a scalar readback/wait into the optimizer here.
             p.value = updated.autodiff().require_grad();
         }
+        self.packed_mlp_state = Self::build_packed_mlp_state(&self.params);
     }
 
     pub fn apply_gradients(&mut self, gradients: BTreeMap<String, Tensor<2>>, lr: f64) {
+        self.sync_packed_mlp_to_params();
         self.inference_weights.get_mut().take();
         self.packed_mlp.get_mut().take();
         for (name, grad) in gradients {
@@ -1624,6 +1860,7 @@ impl Field {
         self.packed_metadata = Some(packed_metadata);
         self.level_offsets = level_offsets;
         self.level_u32_updates = level_u32_updates;
+        self.packed_mlp_state = Self::build_packed_mlp_state(&self.params);
     }
 }
 
