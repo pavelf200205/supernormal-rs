@@ -1943,7 +1943,7 @@ fn gather_patch_tables_kernel(
     let d4z = (uz * c_cx + vz * c_cy + plz * c_cz) * c_inv_len;
     let center_dot = d4x * plx + d4y * ply + d4z * plz;
     if i == 4 {
-        let ang_pix = 0.5_f32 * (f32::abs(k00) + f32::abs(k11)) * center_dot;
+        let ang_pix = 0.5_f32 * (f32::abs(k00) + f32::abs(k11)) * f32::abs(center_dot);
         let t_base_c = c_idx + 3 + 16;
         let gnx = coords[t_base_c];
         let gny = coords[t_base_c + 1];

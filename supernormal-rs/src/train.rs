@@ -457,6 +457,19 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         args.start_step_size > 0.0 && args.end_step_size > 0.0,
         "start-step-size and end-step-size must be > 0"
     );
+    if args.scale_encoding || args.log2_hashmap_size != 19 {
+        ensure!(
+            !args.unfused_field
+                && !args.legacy_fused_backward
+                && !args.untiled_gradients
+                && !args.legacy_corner_loop
+                && !args.legacy_gradient_tiles
+                && !args.legacy_parameter_kernel
+                && !args.hash_aggregation_cross_corners
+                && !args.recompute_parameter_gradients,
+            "--scale-encoding and non-default --log2-hashmap-size require the default fused GPU field/backward path"
+        );
+    }
     let mut field = if let Some(path) = &args.model {
         Field::load(path, device)?
     } else {

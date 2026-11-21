@@ -5422,3 +5422,278 @@ pub fn fused_mlp_step(
         .outputs();
     result.map(BT::<2>::from_primitive::<GpuBackend>)
 }
+
+/// Numerical GPU-vs-CPU parity test for SNSR scale-encoded forward (`fused_field`)
+/// and fused backward (`field_backward_fused`) with `max_res = 4096` and
+/// `log2_hashmap_size = 20` (verifying overflow-safe dense/hash indexing,
+/// Butterworth scale weights, `[N, 4]` points, and `[N, 32]` cached features).
+pub fn test_snsr_forward_backward_parity(device: &burn::tensor::Device) -> anyhow::Result<()> {
+    use burn::tensor::{Tensor as BT, TensorData};
+
+    let base_res = 32usize;
+    let max_res = 4096usize;
+    let log2_hm = 20u32;
+    let hashmap_size = 1usize << log2_hm;
+    let hash_mask = (hashmap_size - 1) as u32;
+    let cutoff = 0.45_f32;
+    let active = 14usize;
+
+    let mut meta_vec = Vec::with_capacity(28);
+    let mut offsets = Vec::with_capacity(15);
+    let mut level_res = Vec::with_capacity(14);
+    let mut offset = 0usize;
+    offsets.push(0);
+    for l in 0..14usize {
+        let res = crate::field::hash_level_resolution(base_res, max_res, l);
+        let entries = (res + 1).saturating_pow(3).min(hashmap_size);
+        meta_vec.extend([res as f32, offset as f32]);
+        level_res.push(res as u32);
+        offset += entries;
+        offsets.push(offset);
+    }
+    let total_entries = offset;
+    let mut table_vec = vec![0.0_f32; total_entries * 2];
+    for i in 0..total_entries {
+        table_vec[i * 2] = (((i.wrapping_mul(2654435761) >> 16) & 0xFF) as f32 - 128.0) * 1e-3;
+        table_vec[i * 2 + 1] = (((i.wrapping_mul(805459861) >> 16) & 0xFF) as f32 - 128.0) * 1e-3;
+    }
+
+    // Packed MLP weights `[1, 2113]`: input-major w0 `[31, 64]`, b0 `[64]`, w1 `[64]`, b1 `[1]`.
+    let mut weights_vec = vec![0.0_f32; 2113];
+    for i in 0..2113 {
+        weights_vec[i] = ((((i * 73 + 17) % 101) as f32) - 50.0) * 0.01;
+    }
+
+    // 4 test points spanning close-up (`0.0004`), normal (`0.002`), grazing (`0.01`), and wide (`0.05`) scales.
+    let pts = [
+        [0.123_f32, -0.456, 0.789, 0.0004],
+        [-0.500, 0.250, -0.125, 0.0020],
+        [0.010, -0.020, 0.030, 0.0100],
+        [0.750, -0.650, 0.350, 0.0500],
+    ];
+    let ds_vec = [0.7_f32, -1.2, 0.4, -0.9];
+    let n = pts.len();
+
+    let cpu_sw = |scale: f32, res: u32| -> f32 {
+        let u = 0.5_f32 * cutoff * scale * (res as f32);
+        let u2 = u * u;
+        1.0_f32 / (1.0_f32 + u2 * u2)
+    };
+
+    // CPU reference forward + backward.
+    let mut cpu_feat = vec![0.0_f32; n * 32];
+    let mut cpu_sdf = vec![0.0_f32; n];
+    let mut cpu_dw0 = vec![0.0_f32; 64 * 31];
+    let mut cpu_db0 = vec![0.0_f32; 64];
+    let mut cpu_dw1 = vec![0.0_f32; 64];
+    let mut cpu_tgrad = vec![0.0_f32; total_entries * 2];
+
+    for p in 0..n {
+        let [px, py, pz, sc] = pts[p];
+        cpu_feat[p * 32] = px;
+        cpu_feat[p * 32 + 1] = py;
+        cpu_feat[p * 32 + 2] = pz;
+        cpu_feat[p * 32 + 31] = sc;
+        let norm = [
+            ((px + 1.0) * 0.5).clamp(0.0, 1.0 - 1e-7),
+            ((py + 1.0) * 0.5).clamp(0.0, 1.0 - 1e-7),
+            ((pz + 1.0) * 0.5).clamp(0.0, 1.0 - 1e-7),
+        ];
+        for l in 0..active {
+            let res = level_res[l];
+            let off = offsets[l];
+            let r1 = res + 1;
+            let dense = r1 <= 256 && (r1 as usize).saturating_pow(3) <= hashmap_size;
+            let c = norm.map(|v| v * res as f32);
+            let b = c.map(|v| v.floor() as u32);
+            let w = [c[0] - b[0] as f32, c[1] - b[1] as f32, c[2] - b[2] as f32];
+            let sw = cpu_sw(sc, res);
+            let mut f0 = 0.0_f32;
+            let mut f1 = 0.0_f32;
+            for corner in 0..8u32 {
+                let b0 = corner & 1;
+                let b1 = (corner >> 1) & 1;
+                let b2 = (corner >> 2) & 1;
+                let v0 = b[0] + b0;
+                let v1 = b[1] + b1;
+                let v2 = b[2] + b2;
+                let wt = (if b0 == 0 { 1.0 - w[0] } else { w[0] })
+                    * (if b1 == 0 { 1.0 - w[1] } else { w[1] })
+                    * (if b2 == 0 { 1.0 - w[2] } else { w[2] })
+                    * sw;
+                let idx = if dense {
+                    v0 + v1 * r1 + v2 * r1 * r1
+                } else {
+                    (v0 ^ v1.wrapping_mul(2654435761) ^ v2.wrapping_mul(805459861)) & hash_mask
+                };
+                let e = (off + idx as usize) * 2;
+                f0 += wt * table_vec[e];
+                f1 += wt * table_vec[e + 1];
+            }
+            cpu_feat[p * 32 + 3 + l * 2] = f0;
+            cpu_feat[p * 32 + 4 + l * 2] = f1;
+        }
+        let mut out = weights_vec[2112];
+        let mut dh = [0.0_f32; 64];
+        for j in 0..64usize {
+            let mut h = weights_vec[1984 + j];
+            for k in 0..31usize {
+                h += cpu_feat[p * 32 + k] * weights_vec[k * 64 + j];
+            }
+            let scaled = h * 100.0;
+            let act = if scaled > 20.0 {
+                h
+            } else {
+                (1.0 + scaled.exp()).ln() * 0.01
+            };
+            let deriv = if scaled > 20.0 {
+                1.0
+            } else {
+                let e = scaled.exp();
+                e / (1.0 + e)
+            };
+            out += act * weights_vec[2048 + j];
+            cpu_dw1[j] += ds_vec[p] * act;
+            let v = ds_vec[p] * weights_vec[2048 + j] * deriv;
+            dh[j] = v;
+            cpu_db0[j] += v;
+            for k in 0..31usize {
+                cpu_dw0[j * 31 + k] += v * cpu_feat[p * 32 + k];
+            }
+        }
+        cpu_sdf[p] = out;
+        for l in 0..active {
+            let mut g0 = 0.0_f32;
+            let mut g1 = 0.0_f32;
+            for j in 0..64usize {
+                g0 += dh[j] * weights_vec[(3 + l * 2) * 64 + j];
+                g1 += dh[j] * weights_vec[(4 + l * 2) * 64 + j];
+            }
+            let res = level_res[l];
+            let off = offsets[l];
+            let r1 = res + 1;
+            let dense = r1 <= 256 && (r1 as usize).saturating_pow(3) <= hashmap_size;
+            let c = norm.map(|v| v * res as f32);
+            let b = c.map(|v| v.floor() as u32);
+            let w = [c[0] - b[0] as f32, c[1] - b[1] as f32, c[2] - b[2] as f32];
+            let sw = cpu_sw(sc, res);
+            for corner in 0..8u32 {
+                let b0 = corner & 1;
+                let b1 = (corner >> 1) & 1;
+                let b2 = (corner >> 2) & 1;
+                let v0 = b[0] + b0;
+                let v1 = b[1] + b1;
+                let v2 = b[2] + b2;
+                let wt = (if b0 == 0 { 1.0 - w[0] } else { w[0] })
+                    * (if b1 == 0 { 1.0 - w[1] } else { w[1] })
+                    * (if b2 == 0 { 1.0 - w[2] } else { w[2] })
+                    * sw;
+                let idx = if dense {
+                    v0 + v1 * r1 + v2 * r1 * r1
+                } else {
+                    (v0 ^ v1.wrapping_mul(2654435761) ^ v2.wrapping_mul(805459861)) & hash_mask
+                };
+                let e = (off + idx as usize) * 2;
+                cpu_tgrad[e] += wt * g0;
+                cpu_tgrad[e + 1] += wt * g1;
+            }
+        }
+    }
+
+    // GPU forward + fused backward.
+    let pts_t = BT::<2>::from_data(
+        TensorData::new(pts.iter().flatten().copied().collect::<Vec<f32>>(), [n, 4]),
+        device,
+    );
+    let tables_t = BT::<2>::from_data(TensorData::new(table_vec, [total_entries, 2]), device);
+    let meta_t = BT::<2>::from_data(TensorData::new(meta_vec, [14, 2]), device);
+    let weights_t = BT::<2>::from_data(TensorData::new(weights_vec, [1, 2113]), device);
+    let [gpu_sdf_t, gpu_feat_t, _] = fused_field(
+        [pts_t, tables_t, meta_t.clone(), weights_t.clone()],
+        n,
+        active,
+        true,
+        false,
+        true,
+        true,
+        4,
+        true,
+        true,
+        hashmap_size,
+        cutoff,
+    );
+    let ds_t = BT::<2>::from_data(TensorData::new(ds_vec.to_vec(), [n, 1]), device);
+    let [gpu_tgrad_t, dw0p_t, dw1p_t] = field_backward_fused(
+        [
+            BT::<2>::empty([1, 64], device),
+            gpu_feat_t.clone(),
+            ds_t,
+            weights_t,
+            meta_t,
+            BT::<2>::zeros([total_entries, 2], device),
+            BT::<2>::empty([4, 2048], device),
+            BT::<2>::empty([4, 64], device),
+        ],
+        n,
+        active,
+        true,
+        true,
+        14,
+        true,
+        0,
+        true,
+        false,
+        true,
+        hashmap_size,
+        cutoff,
+    );
+
+    let gpu_sdf: Vec<f32> = gpu_sdf_t.try_into_vec_as::<f32>()?;
+    let gpu_feat: Vec<f32> = gpu_feat_t.try_into_vec_as::<f32>()?;
+    let gpu_tgrad: Vec<f32> = gpu_tgrad_t.try_into_vec_as::<f32>()?;
+    let gpu_dw0_sum: Vec<f32> = dw0p_t.sum_dim(0).reshape([64, 32]).try_into_vec_as::<f32>()?;
+    let gpu_dw1: Vec<f32> = dw1p_t.sum_dim(0).reshape([64, 1]).try_into_vec_as::<f32>()?;
+
+    let max_sdf_diff = gpu_sdf
+        .iter()
+        .zip(&cpu_sdf)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    let max_feat_diff = gpu_feat
+        .iter()
+        .zip(&cpu_feat)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    let max_tgrad_diff = gpu_tgrad
+        .iter()
+        .zip(&cpu_tgrad)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    let mut max_dw0_diff = 0.0_f32;
+    let mut max_db0_diff = 0.0_f32;
+    for j in 0..64usize {
+        for k in 0..31usize {
+            max_dw0_diff = max_dw0_diff.max((gpu_dw0_sum[j * 32 + k] - cpu_dw0[j * 31 + k]).abs());
+        }
+        max_db0_diff = max_db0_diff.max((gpu_dw0_sum[j * 32 + 31] - cpu_db0[j]).abs());
+    }
+    let max_dw1_diff = gpu_dw1
+        .iter()
+        .zip(&cpu_dw1)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+
+    println!(
+        "SNSR (4096/2^20) GPU vs CPU max diffs: sdf={max_sdf_diff:.2e} feat={max_feat_diff:.2e} table_grad={max_tgrad_diff:.2e} dw0={max_dw0_diff:.2e} db0={max_db0_diff:.2e} dw1={max_dw1_diff:.2e}"
+    );
+    anyhow::ensure!(max_sdf_diff < 1e-5, "SNSR sdf mismatch: {max_sdf_diff}");
+    anyhow::ensure!(max_feat_diff < 1e-5, "SNSR feat mismatch: {max_feat_diff}");
+    anyhow::ensure!(
+        max_tgrad_diff < 1e-5,
+        "SNSR table_grad mismatch: {max_tgrad_diff}"
+    );
+    anyhow::ensure!(max_dw0_diff < 1e-5, "SNSR dw0 mismatch: {max_dw0_diff}");
+    anyhow::ensure!(max_db0_diff < 1e-5, "SNSR db0 mismatch: {max_db0_diff}");
+    anyhow::ensure!(max_dw1_diff < 1e-5, "SNSR dw1 mismatch: {max_dw1_diff}");
+    Ok(())
+}

@@ -122,6 +122,9 @@ fn main() -> Result<()> {
             println!("Running hash grid backward GPU kernel parity test...");
             kernels::test_hash_grid_backward_parity(&device)?;
 
+            println!("Running SNSR (max_res=4096, 2^20) forward+backward GPU vs CPU parity test...");
+            kernels::test_snsr_forward_backward_parity(&device)?;
+
             if std::path::Path::new("experiments/field_30k").exists() {
                 println!("Testing full 14-level field features GPU vs CPU on real field_30k...");
                 let field = field::Field::load(

@@ -1510,7 +1510,9 @@ impl Field {
                     if self.fused_field
                         && self.fused_hash_replay
                         && self.fused_feature_replay
-                        && !self.recompute_parameter_gradients =>
+                        && !self.recompute_parameter_gradients
+                        && !self.scale_encoding
+                        && self.log2_hashmap_size == 19 =>
                 {
                     replay_features = true;
                     replay_hash = true;
