@@ -181,15 +181,15 @@ pub struct TrainArgs {
     #[arg(long)]
     #[serde(default)]
     pub sync_loss: bool,
-    #[arg(long, default_value_t = 65536)]
+    #[arg(long, default_value_t = 131072)]
     pub query: usize,
     #[arg(long, default_value_t = 128)]
     pub occupancy_resolution: usize,
-    #[arg(long, default_value_t = 5000)]
+    #[arg(long, default_value_t = 30000)]
     pub save_freq: usize,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 30000)]
     pub mesh_freq: usize,
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 1024)]
     pub mesh_resolution: usize,
     #[arg(long, default_value_t = 42)]
     pub seed: u64,
