@@ -5799,6 +5799,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "cubecl",
+ "cubecl-cuda",
  "half",
  "image",
  "nalgebra",

@@ -348,6 +348,23 @@ use burn_fusion::{
 
 type GpuBackend = Fusion<CubeBackend>;
 
+/// Retrieve a float tensor handle guaranteed to have strictly contiguous row-major
+/// strides (`stride(0) == shape(1)`). On WGPU this is a zero-cost no-op; on CUDA
+/// (`PitchedMemoryLayoutPolicy`) it converts pitched 2D allocations to contiguous
+/// layout so custom CubeCL kernels using flat row-major indexing work identically.
+#[inline]
+fn get_contig(
+    handles: &mut HandleContainer<CubeFusionHandle>,
+    ir: &TensorIr,
+) -> burn_cubecl::tensor::CubeTensor {
+    let t = handles.get_float_tensor::<CubeBackend>(ir);
+    if t.is_contiguous() {
+        t
+    } else {
+        burn_cubecl::kernel::into_contiguous(t)
+    }
+}
+
 /// One pass over active embedding entries. Inactive levels and their Adam
 /// moments are left untouched; bias corrections are independent per level.
 #[cube(launch)]
@@ -425,11 +442,11 @@ impl Operation<FusionCubeRuntime> for PackedAdamOp {
         else {
             panic!("Invalid scalar arguments for packed_adam")
         };
-        let value = handles.get_float_tensor::<CubeBackend>(v_ir);
-        let first = handles.get_float_tensor::<CubeBackend>(m_ir);
-        let second = handles.get_float_tensor::<CubeBackend>(s_ir);
-        let gradient = handles.get_float_tensor::<CubeBackend>(g_ir);
-        let corrections = handles.get_float_tensor::<CubeBackend>(c_ir);
+        let value = get_contig(handles, v_ir);
+        let first = get_contig(handles, m_ir);
+        let second = get_contig(handles, s_ir);
+        let gradient = get_contig(handles, g_ir);
+        let corrections = get_contig(handles, c_ir);
         // Preserve outstanding views (for example checkpoint parameter views).
         // Normal training transfers sole ownership and updates in place.
         let value = if value.can_mut() {
@@ -563,10 +580,10 @@ impl Operation<FusionCubeRuntime> for HashGridPackedForwardOp {
         let [ScalarIr::UInt(active)] = self.desc.scalars.as_slice() else {
             panic!("Invalid scalar arguments for hash_grid_packed_forward")
         };
-        let points = handles.get_float_tensor::<CubeBackend>(p_ir);
-        let tables = handles.get_float_tensor::<CubeBackend>(t_ir);
-        let metadata = handles.get_float_tensor::<CubeBackend>(m_ir);
-        let features = handles.get_float_tensor::<CubeBackend>(f_ir);
+        let points = get_contig(handles, p_ir);
+        let tables = get_contig(handles, t_ir);
+        let metadata = get_contig(handles, m_ir);
+        let features = get_contig(handles, f_ir);
         let client = points.client.clone();
         let n = points.meta.shape().dims::<2>()[0];
         let cube_dim = CubeDim::new(&client, n);
@@ -643,9 +660,9 @@ impl Operation<FusionCubeRuntime> for HashGridLevelForwardOp {
             panic!("Invalid scalar arguments for hash_grid_level_forward")
         };
 
-        let points = handles.get_float_tensor::<CubeBackend>(p_ir);
-        let table = handles.get_float_tensor::<CubeBackend>(t_ir);
-        let features = handles.get_float_tensor::<CubeBackend>(f_ir);
+        let points = get_contig(handles, p_ir);
+        let table = get_contig(handles, t_ir);
+        let features = get_contig(handles, f_ir);
 
         let client = points.client.clone();
         let n = points.meta.shape().dims::<2>()[0];
@@ -730,9 +747,9 @@ impl Operation<FusionCubeRuntime> for HashGridLevelBackwardOp {
             panic!("Invalid scalar arguments for hash_grid_level_backward")
         };
 
-        let points = handles.get_float_tensor::<CubeBackend>(p_ir);
-        let d_features = handles.get_float_tensor::<CubeBackend>(df_ir);
-        let table_grad = handles.get_float_tensor::<CubeBackend>(tg_ir);
+        let points = get_contig(handles, p_ir);
+        let d_features = get_contig(handles, df_ir);
+        let table_grad = get_contig(handles, tg_ir);
 
         let client = points.client.clone();
         let n = points.meta.shape().dims::<2>()[0];
@@ -814,10 +831,10 @@ impl Operation<FusionCubeRuntime> for HashGridPackedBackwardOp {
         let [ScalarIr::UInt(active), ScalarIr::UInt(valid_n)] = self.desc.scalars.as_slice() else {
             panic!("Invalid scalar arguments for hash_grid_packed_backward")
         };
-        let points = handles.get_float_tensor::<CubeBackend>(p_ir);
-        let d_features = handles.get_float_tensor::<CubeBackend>(df_ir);
-        let metadata = handles.get_float_tensor::<CubeBackend>(m_ir);
-        let table_grad = handles.get_float_tensor::<CubeBackend>(tg_ir);
+        let points = get_contig(handles, p_ir);
+        let d_features = get_contig(handles, df_ir);
+        let metadata = get_contig(handles, m_ir);
+        let table_grad = get_contig(handles, tg_ir);
         let client = points.client.clone();
         let n = (*valid_n as usize).max(1);
         let cube_dim = CubeDim::new(&client, n);
@@ -1574,7 +1591,7 @@ impl Operation<FusionCubeRuntime> for PackMlpWeightsOp {
     ) -> Result<(), ExecutionError> {
         let ([w0, b0, w1, b1, packed], [out]) = self.desc.as_fixed();
         let [w0, b0, w1, b1, packed] =
-            [w0, b0, w1, b1, packed].map(|t| handles.get_float_tensor::<CubeBackend>(t));
+            [w0, b0, w1, b1, packed].map(|t| get_contig(handles, t));
         let client = packed.client.clone();
         let _timing = crate::diagnostics::start(&client, "pack_mlp_weights");
         pack_mlp_weights_kernel::launch(
@@ -1662,7 +1679,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             output,
             features,
             hidden,
-        ] = [p, t, m, w, c, i, y, f, h].map(|ir| handles.get_float_tensor::<CubeBackend>(ir));
+        ] = [p, t, m, w, c, i, y, f, h].map(|ir| get_contig(handles, ir));
         let output = if *occupancy != 0 && !output.can_mut() {
             output.copy()
         } else {
@@ -1748,9 +1765,9 @@ pub fn fused_field(
     // 31 columns of `features` for every valid point, so `Tensor::empty` is safe
     // regardless of `active`.
     let buffers = [
-        burn::tensor::Tensor::<2>::empty([valid_n.max(1), 1], &device),
-        burn::tensor::Tensor::<2>::empty([if cache { n } else { 1 }, 31], &device),
-        burn::tensor::Tensor::<2>::empty([if cache_preactivation { n } else { 1 }, 64], &device),
+        crate::field::empty_2d(valid_n.max(1), 1, &device),
+        crate::field::empty_2d(if cache { n } else { 1 }, 31, &device),
+        crate::field::empty_2d(if cache_preactivation { n } else { 1 }, 64, &device),
     ];
     let [points, tables, metadata, weights] = inputs;
     let dummy = points.clone();
@@ -2242,7 +2259,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             panic!("invalid composite scalars")
         };
         let [s, g, i, p, vp, w, d, l, r, rl] =
-            [s, g, i, p, vp, w, d, l, r, rl].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+            [s, g, i, p, vp, w, d, l, r, rl].map(|x| get_contig(handles, x));
         let client = s.client.clone();
         let rays = (p.meta.shape().dims::<2>()[0] * 9).max(1);
         let dim_rays = CubeDim::new(&client, rays);
@@ -2840,7 +2857,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardOp {
             panic!("invalid backward scalars")
         };
         let [p, d, w, x, m, f, t, e, h, g] =
-            [p, d, w, x, m, f, t, e, h, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+            [p, d, w, x, m, f, t, e, h, g].map(|x| get_contig(handles, x));
         let t = if t.can_mut() {
             t
         } else {
@@ -3386,7 +3403,7 @@ impl Operation<FusionCubeRuntime> for VisibilityOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([s, p, r, v, o], [out]) = self.desc.as_fixed();
-        let [s, p, r, v, o] = [s, p, r, v, o].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [s, p, r, v, o] = [s, p, r, v, o].map(|x| get_contig(handles, x));
         let [ScalarIr::UInt(reuse_endpoints)] = self.desc.scalars.as_slice() else {
             panic!("invalid visibility scalars")
         };
@@ -3952,7 +3969,7 @@ impl Operation<FusionCubeRuntime> for CachedMlpOp {
         let [ScalarIr::UInt(valid_n), ScalarIr::UInt(active)] = self.desc.scalars.as_slice() else {
             panic!("invalid cached MLP scalars")
         };
-        let [f, w, p] = [f, w, p].map(|ir| handles.get_float_tensor::<CubeBackend>(ir));
+        let [f, w, p] = [f, w, p].map(|ir| get_contig(handles, ir));
         let client = f.client.clone();
         let _timing = crate::diagnostics::start(&client, "cached_mlp_preactivation");
         let groups = (*valid_n as usize).div_ceil(4).max(1);
@@ -4818,7 +4835,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
             panic!("invalid fused backward scalars")
         };
         let [p, f, d, w, m, t, dw0p, dw1p] = [p, f, d, w, m, t, dw0p, dw1p]
-            .map(|x| handles.get_float_tensor::<CubeBackend>(x));
+            .map(|x| get_contig(handles, x));
         let t = if t.can_mut() {
             t
         } else {
@@ -5022,7 +5039,7 @@ impl Operation<FusionCubeRuntime> for ReduceMlpPartialsOp {
     ) -> Result<(), ExecutionError> {
         let ([p0, p1, dw0, db0, dw1], [odw0, odb0, odw1]) = self.desc.as_fixed();
         let [p0, p1, dw0, db0, dw1] =
-            [p0, p1, dw0, db0, dw1].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+            [p0, p1, dw0, db0, dw1].map(|x| get_contig(handles, x));
         let client = p0.client.clone();
         let _timing = crate::diagnostics::start(&client, "reduce_mlp_partials");
         reduce_mlp_partials_kernel::launch(
@@ -5239,7 +5256,7 @@ impl Operation<FusionCubeRuntime> for FusedMlpStepOp {
             panic!("invalid fused mlp step scalars")
         };
         let [st, dw0, db0, dw1, stats, pmlp, vout] = [st, dw0, db0, dw1, stats, pmlp, vout]
-            .map(|x| handles.get_float_tensor::<CubeBackend>(x));
+            .map(|x| get_contig(handles, x));
         let st = if st.can_mut() { st } else { st.copy() };
         let client = st.client.clone();
         let _timing = crate::diagnostics::start(&client, "fused_mlp_adam_pack");

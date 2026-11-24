@@ -1892,7 +1892,6 @@ pub fn prepare_geometry_from_device_batch(
     device: &burn::tensor::Device,
 ) -> Option<DevicePreparedGeometry> {
     use crate::field::tensor;
-    use burn::tensor::Tensor;
     let patch_count = end - start;
     let (s_begin, s_end, ep_begin, ep_end) = if start == 0 && end == total_patches {
         (
@@ -1972,8 +1971,8 @@ pub fn prepare_geometry_from_device_batch(
             geom_rays,
             endpoints,
             descriptors,
-            Tensor::empty([padded_pts, 3], device),
-            Tensor::empty([vis_cap, 27], device),
+            crate::field::empty_2d(padded_pts, 3, device),
+            crate::field::empty_2d(vis_cap, 27, device),
         ],
         valid_points,
         vis_count,

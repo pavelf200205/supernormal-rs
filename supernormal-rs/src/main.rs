@@ -20,8 +20,11 @@ struct Cli {
     /// Prefer an integrated GPU (for example Intel UHD), instead of the default adapter.
     #[arg(long, conflicts_with = "cpu")]
     integrated: bool,
-    #[arg(long, default_value = "auto", value_parser = ["auto", "vulkan", "dx12", "metal"])]
+    #[arg(long, default_value = "auto", value_parser = ["auto", "cuda", "vulkan", "dx12", "metal"])]
     api: String,
+    /// CUDA device index when using `--api cuda` or `--api auto` on NVIDIA GPUs.
+    #[arg(long, default_value_t = 0)]
+    cuda_device: usize,
     #[command(subcommand)]
     command: Command,
 }
@@ -55,27 +58,63 @@ enum Command {
     },
 }
 
+fn init_wgpu_device(api_str: &str, integrated: bool) -> Result<Device> {
+    use burn::tensor::wgpu::WgpuBackend;
+    let api = match api_str {
+        "vulkan" => WgpuBackend::Vulkan,
+        "dx12" => WgpuBackend::Dx12,
+        "metal" => WgpuBackend::Metal,
+        _ => WgpuBackend::Auto,
+    };
+    Device::wgpu_options()
+        .device_kind(if integrated {
+            DeviceKind::IntegratedGpu(0)
+        } else {
+            DeviceKind::DefaultDevice
+        })
+        .graphics_api(api)
+        .init()
+        .map_err(|e| anyhow::anyhow!("GPU initialization failed: {e:?}"))
+}
+
+#[cfg(feature = "cuda")]
+fn try_init_cuda_device(index: usize) -> Option<Device> {
+    std::panic::catch_unwind(|| {
+        let dev = Device::cuda(index);
+        // Probe device initialization so missing drivers/GPUs fall back cleanly to WGPU.
+        let _ = dev.identity();
+        dev
+    })
+    .ok()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let device = if cli.cpu {
         Device::flex()
+    } else if cli.api == "cuda" {
+        #[cfg(feature = "cuda")]
+        {
+            Device::cuda(cli.cuda_device)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            anyhow::bail!("This binary was built without CUDA support; rebuild with `--features cuda` or pass `--api vulkan`.");
+        }
+    } else if cli.api == "auto" && !cli.integrated {
+        #[cfg(feature = "cuda")]
+        {
+            match try_init_cuda_device(cli.cuda_device) {
+                Some(dev) => dev,
+                None => init_wgpu_device("auto", false)?,
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            init_wgpu_device("auto", false)?
+        }
     } else {
-        use burn::tensor::wgpu::WgpuBackend;
-        let api = match cli.api.as_str() {
-            "vulkan" => WgpuBackend::Vulkan,
-            "dx12" => WgpuBackend::Dx12,
-            "metal" => WgpuBackend::Metal,
-            _ => WgpuBackend::Auto,
-        };
-        Device::wgpu_options()
-            .device_kind(if cli.integrated {
-                DeviceKind::IntegratedGpu(0)
-            } else {
-                DeviceKind::DefaultDevice
-            })
-            .graphics_api(api)
-            .init()
-            .map_err(|e| anyhow::anyhow!("GPU initialization failed: {e:?}"))?
+        init_wgpu_device(&cli.api, cli.integrated)?
     }
     .autodiff();
     println!("Device: {:?}", device.identity());

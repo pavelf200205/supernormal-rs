@@ -73,7 +73,21 @@ pub struct Field {
 }
 
 pub fn tensor<const D: usize>(data: Vec<f32>, shape: [usize; D], device: &Device) -> Tensor<D> {
-    Tensor::from_data(TensorData::new(data, shape), device)
+    let total: usize = shape.iter().product();
+    Tensor::<1>::from_data(TensorData::new(data, [total]), device).reshape(shape)
+}
+
+/// Allocate an uninitialized 2D tensor with guaranteed contiguous row-major
+/// strides on both WGPU and CUDA (avoiding CUDA's 512-byte pitched 2D layout).
+#[inline]
+pub fn empty_2d(rows: usize, cols: usize, device: &Device) -> Tensor<2> {
+    Tensor::<1>::empty([rows * cols], device).reshape([rows, cols])
+}
+
+/// Allocate a zeroed 2D tensor with guaranteed contiguous row-major strides.
+#[inline]
+pub fn zeros_2d(rows: usize, cols: usize, device: &Device) -> Tensor<2> {
+    Tensor::<1>::zeros([rows * cols], device).reshape([rows, cols])
 }
 
 pub fn ints(data: Vec<i32>, device: &Device) -> Tensor<1, Int> {
@@ -1321,7 +1335,7 @@ impl Field {
                 .persistent_table_grad
                 .borrow_mut()
                 .take()
-                .unwrap_or_else(|| Tensor::zeros([total_entries, 2], &self.device));
+                .unwrap_or_else(|| zeros_2d(total_entries, 2, &self.device));
             accumulated
                 .params
                 .insert("encoding.packed".into(), grad_buf);
@@ -1456,8 +1470,8 @@ impl Field {
                 let (dw0p, dw1p, accumulate) = match fused_partials.take() {
                     Some((p0, p1)) => (p0, p1, true),
                     None => (
-                        Tensor::empty([448, 2048], &self.device),
-                        Tensor::empty([448, 64], &self.device),
+                        empty_2d(448, 2048, &self.device),
+                        empty_2d(448, 64, &self.device),
                         false,
                     ),
                 };

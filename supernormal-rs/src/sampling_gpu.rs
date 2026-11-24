@@ -15,6 +15,22 @@ use burn_fusion::{
 use cubecl::prelude::*;
 type GpuBackend = Fusion<CubeBackend>;
 
+/// Retrieve a float tensor handle guaranteed to have strictly contiguous row-major
+/// strides. Zero-cost no-op on WGPU; ensures CUDA pitched 2D tensors match flat
+/// row-major indexing in custom CubeCL kernels.
+#[inline]
+fn get_contig(
+    handles: &mut HandleContainer<CubeFusionHandle>,
+    ir: &TensorIr,
+) -> burn_cubecl::tensor::CubeTensor {
+    let t = handles.get_float_tensor::<CubeBackend>(ir);
+    if t.is_contiguous() {
+        t
+    } else {
+        burn_cubecl::kernel::into_contiguous(t)
+    }
+}
+
 /// Round dynamic allocation row counts to a coarse bucket (4 steps per power-of-two
 /// octave) so Burn's wgpu memory pool reuses buffers in O(1) across steps instead
 /// of allocating a fresh GPU buffer every time sample/point counts fluctuate.
@@ -518,7 +534,7 @@ impl Operation<FusionCubeRuntime> for MarchOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([r, f, s, c], [o0, o1]) = self.desc.as_fixed();
-        let [r, f, s, c] = [r, f, s, c].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [r, f, s, c] = [r, f, s, c].map(|x| get_contig(handles, x));
         let client = r.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.MarchOp");
         let n = r.meta.shape().dims::<2>()[0];
@@ -576,7 +592,7 @@ impl Operation<FusionCubeRuntime> for CompactOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([r, s, p, o], [o0]) = self.desc.as_fixed();
-        let [r, s, p, o] = [r, s, p, o].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [r, s, p, o] = [r, s, p, o].map(|x| get_contig(handles, x));
         let client = r.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.CompactOp");
         let n = r.meta.shape().dims::<2>()[0];
@@ -634,7 +650,7 @@ impl Operation<FusionCubeRuntime> for CompactAndCenterEndpointsOp {
     ) -> Result<(), ExecutionError> {
         let ([r, s, p, m, u, pr, rg], [om, ou, opr, org]) = self.desc.as_fixed();
         let [r, s, p, m, u, pr, rg] =
-            [r, s, p, m, u, pr, rg].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+            [r, s, p, m, u, pr, rg].map(|x| get_contig(handles, x));
         let client = r.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.CompactAndCenterEndpointsOp");
         let n = r.meta.shape().dims::<2>()[0];
@@ -668,10 +684,10 @@ pub fn compact_and_center_endpoints(
     let n_rays = rays.dims()[0];
     let device = rays.device();
     let m_cap = bucket_capacity(total_marched);
-    let m_buf = burn::tensor::Tensor::<2>::empty([m_cap, 3], &device);
-    let u_buf = burn::tensor::Tensor::<2>::empty([padded_ep_cap, 3], &device);
-    let pr_buf = burn::tensor::Tensor::<2>::empty([m_cap, 2], &device);
-    let rg_buf = burn::tensor::Tensor::<2>::empty([n_rays, 2], &device);
+    let m_buf = crate::field::empty_2d(m_cap, 3, &device);
+    let u_buf = crate::field::empty_2d(padded_ep_cap, 3, &device);
+    let pr_buf = crate::field::empty_2d(m_cap, 2, &device);
+    let rg_buf = crate::field::empty_2d(n_rays, 2, &device);
     let inputs = [rays, samples, prefix, m_buf, u_buf, pr_buf, rg_buf]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -722,7 +738,7 @@ impl Operation<FusionCubeRuntime> for BuildVisibleGeometryTablesOp {
             panic!("invalid visible geometry table scalars")
         };
         let [m, mp, vp, e, d, map, r] =
-            [m, mp, vp, e, d, map, r].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+            [m, mp, vp, e, d, map, r].map(|x| get_contig(handles, x));
         let client = m.client.clone();
         let _timing = crate::diagnostics::start(&client, "geometry_tables");
         let n_rays = (*patch_count as usize).max(1);
@@ -764,10 +780,10 @@ pub fn build_visible_geometry_tables(
     let device = marched.device();
     let vis_cap = bucket_capacity(vis_count);
     let ep_cap = bucket_capacity(ep_count);
-    let e_buf = burn::tensor::Tensor::<2>::empty([ep_cap, 2], &device);
-    let d_buf = burn::tensor::Tensor::<2>::empty([vis_cap, 5], &device);
-    let map_buf = burn::tensor::Tensor::<2>::empty([vis_cap, 1], &device);
-    let r_buf = burn::tensor::Tensor::<2>::empty([ep_cap, 2], &device);
+    let e_buf = crate::field::empty_2d(ep_cap, 2, &device);
+    let d_buf = crate::field::empty_2d(vis_cap, 5, &device);
+    let map_buf = crate::field::empty_2d(vis_cap, 1, &device);
+    let r_buf = crate::field::empty_2d(ep_cap, 2, &device);
     let inputs = [
         marched,
         march_prefix,
@@ -830,7 +846,7 @@ impl Operation<FusionCubeRuntime> for OccupancyGridPointsOp {
         else {
             panic!("invalid occupancy_grid_points scalars")
         };
-        let p = handles.get_float_tensor::<CubeBackend>(p);
+        let p = get_contig(handles, p);
         let client = p.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.OccupancyGridPointsOp");
         let n = (*valid_n as usize).max(1);
@@ -896,7 +912,7 @@ impl Operation<FusionCubeRuntime> for OccupancyApplySliceOp {
         else {
             panic!("invalid occupancy_apply_slice scalars")
         };
-        let [s, v] = [s, v].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [s, v] = [s, v].map(|x| get_contig(handles, x));
         let v = if v.can_mut() { v } else { v.copy() };
         let client = v.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.OccupancyApplySliceOp");
@@ -965,7 +981,7 @@ impl Operation<FusionCubeRuntime> for OccupancyCountOp {
         else {
             panic!("invalid occupancy_count scalars")
         };
-        let [f, c] = [f, c].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [f, c] = [f, c].map(|x| get_contig(handles, x));
         let client = f.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.OccupancyCountOp");
         let n = c.meta.shape().dims::<2>()[0];
@@ -1039,7 +1055,7 @@ impl Operation<FusionCubeRuntime> for OccupancyCompactPointsOp {
         else {
             panic!("invalid occupancy_compact_points scalars")
         };
-        let [f, pr, id, pt] = [f, pr, id, pt].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [f, pr, id, pt] = [f, pr, id, pt].map(|x| get_contig(handles, x));
         let client = f.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.OccupancyCompactPointsOp");
         let n = pr.meta.shape().dims::<2>()[0];
@@ -1123,7 +1139,7 @@ impl Operation<FusionCubeRuntime> for OccupancyApplySelectedOp {
         let [ScalarIr::UInt(valid_n)] = self.desc.scalars.as_slice() else {
             panic!("invalid occupancy_apply_selected scalars")
         };
-        let [id, s, v] = [id, s, v].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [id, s, v] = [id, s, v].map(|x| get_contig(handles, x));
         let v = if v.can_mut() { v } else { v.copy() };
         let client = v.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.OccupancyApplySelectedOp");
@@ -1524,7 +1540,7 @@ impl Operation<FusionCubeRuntime> for ParameterOp {
     ) -> Result<(), ExecutionError> {
         let ([h, f, p, pre, ds, w], [out]) = self.desc.as_fixed();
         let [h, f, p, pre, ds, w] =
-            [h, f, p, pre, ds, w].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+            [h, f, p, pre, ds, w].map(|x| get_contig(handles, x));
         let [
             ScalarIr::UInt(wide),
             ScalarIr::UInt(valid_rows),
@@ -1784,7 +1800,7 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
         else {
             panic!("invalid geometry scalars")
         };
-        let [r, e, s, p, g] = [r, e, s, p, g].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [r, e, s, p, g] = [r, e, s, p, g].map(|x| get_contig(handles, x));
         let client = r.client.clone();
         let _timing = crate::diagnostics::start(&client, "geometry");
         let n_pts = (*valid_points as usize).max(1);
@@ -2003,7 +2019,7 @@ impl Operation<FusionCubeRuntime> for GatherPatchTablesOp {
         else {
             panic!("invalid gather_patch_tables scalars")
         };
-        let [c, vm, gr, pp] = [c, vm, gr, pp].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [c, vm, gr, pp] = [c, vm, gr, pp].map(|x| get_contig(handles, x));
         let client = c.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.GatherPatchTablesOp");
         let n = gr.meta.shape().dims::<2>()[0] * 9;
@@ -2041,8 +2057,8 @@ pub fn gather_patch_tables(
     patch_count: usize,
 ) -> [burn::tensor::Tensor<2>; 2] {
     let device = coords.device();
-    let gr_buf = burn::tensor::Tensor::<2>::empty([patch_count, 39], &device);
-    let pp_buf = burn::tensor::Tensor::<2>::empty([patch_count, 123], &device);
+    let gr_buf = crate::field::empty_2d(patch_count, 39, &device);
+    let pp_buf = crate::field::empty_2d(patch_count, 123, &device);
     let inputs = [coords, view_meta, gr_buf, pp_buf]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -2111,7 +2127,7 @@ impl Operation<FusionCubeRuntime> for MeshSlabPointsOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([pr, p], [op]) = self.desc.as_fixed();
-        let [pr, p] = [pr, p].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [pr, p] = [pr, p].map(|x| get_contig(handles, x));
         let client = p.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.MeshSlabPointsOp");
         let n = p.meta.shape().dims::<2>()[0];
@@ -2260,7 +2276,7 @@ impl Operation<FusionCubeRuntime> for Scan2dPairsOp {
         let [ScalarIr::UInt(n_rows), ScalarIr::UInt(mode)] = self.desc.scalars.as_slice() else {
             panic!("invalid scan_2d_pairs scalars")
         };
-        let [c, e, p, m] = [c, e, p, m].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [c, e, p, m] = [c, e, p, m].map(|x| get_contig(handles, x));
         let client = c.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.Scan2dPairsOp");
         scan_2d_pairs_and_pack_kernel::launch(
@@ -2375,7 +2391,7 @@ impl Operation<FusionCubeRuntime> for Scan1dOp {
         let [ScalarIr::UInt(n_rows)] = self.desc.scalars.as_slice() else {
             panic!("invalid scan_1d scalars")
         };
-        let [c, p] = [c, p].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [c, p] = [c, p].map(|x| get_contig(handles, x));
         let client = c.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.Scan1dOp");
         scan_1d_kernel::launch(
@@ -2467,7 +2483,7 @@ impl Operation<FusionCubeRuntime> for MeshCoarsePointsOp {
         else {
             panic!("invalid mesh_coarse_points scalars")
         };
-        let p = handles.get_float_tensor::<CubeBackend>(p);
+        let p = get_contig(handles, p);
         let client = p.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.MeshCoarsePointsOp");
         let n = p.meta.shape().dims::<2>()[0];
@@ -2558,7 +2574,7 @@ impl Operation<FusionCubeRuntime> for MeshSparseBandPointsOp {
         else {
             panic!("invalid mesh_sparse_band_points scalars")
         };
-        let [xy, p] = [xy, p].map(|x| handles.get_float_tensor::<CubeBackend>(x));
+        let [xy, p] = [xy, p].map(|x| get_contig(handles, x));
         let client = p.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.MeshSparseBandPointsOp");
         let n = p.meta.shape().dims::<2>()[0];
@@ -2586,7 +2602,7 @@ pub fn mesh_sparse_band_points(
     let total = k * z_count;
     let inv_res_m1 = 1.0_f32 / (res - 1) as f32;
     let device = xy_coords.device();
-    let p_buf = burn::tensor::Tensor::<2>::empty([total, 3], &device);
+    let p_buf = crate::field::empty_2d(total, 3, &device);
     let inputs = [xy_coords, p_buf].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let out = TensorIr::uninit(
