@@ -1380,6 +1380,8 @@ fn fused_field_kernel(
     preactivation: &mut Tensor<f32>,
     active: u32,
     valid_n: u32,
+    chunk_offset: u32,
+    total_cap: u32,
     hashmap_size: u32,
     scale_cutoff: f32,
     #[comptime] cache: bool,
@@ -1389,7 +1391,7 @@ fn fused_field_kernel(
     #[comptime] point_tiles: usize,
     #[comptime] subgroup_width: usize,
     #[comptime] selective_weights: bool,
-    #[comptime] occupancy: bool,
+    #[comptime] count_mode: u32,
     #[comptime] scale_encoding: bool,
 ) {
     // CubeCL workgroup coordinates are u32; tensor/shared indices are usize.
@@ -1401,12 +1403,42 @@ fn fused_field_kernel(
     }
     let group_base = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * point_tiles;
     let mut n_valid = usize::cast_from(valid_n);
-    if occupancy {
+    if count_mode == 1u32 {
         n_valid = usize::cast_from(count_prefix[count_prefix.shape(0) - 1]);
+    } else if count_mode == 2u32 {
+        let tot = usize::min(
+            usize::cast_from(count_prefix[count_prefix.shape(0) * 2 - 1]),
+            usize::cast_from(total_cap),
+        );
+        let off = usize::cast_from(chunk_offset);
+        n_valid = if tot > off {
+            usize::min(tot - off, usize::cast_from(valid_n))
+        } else {
+            0usize
+        };
+    } else if count_mode == 3u32 {
+        let tot_ep = usize::min(
+            usize::cast_from(count_prefix[count_prefix.shape(0) * 2 - 1]),
+            usize::cast_from(total_cap),
+        );
+        let tot = tot_ep * 9usize;
+        let off = usize::cast_from(chunk_offset);
+        n_valid = if tot > off {
+            usize::min(tot - off, usize::cast_from(valid_n))
+        } else {
+            0usize
+        };
     }
     // Uniform workgroup exit before any barrier, weights or point reads.
-    // Occupancy uses a bounded grid; the actual workload remains device-resident.
-    if group_base * 4 >= n_valid {
+    // On subgroup-enabled backends (CUDA, Vulkan), exit against device `n_valid`;
+    // on portable subgroup_width == 0 (DX12 FXC), use cbuffer `valid_n` so every
+    // barrier remains in static cbuffer-uniform control flow (avoiding FXC X4026).
+    let loop_bound = if subgroup_width > 0usize {
+        n_valid
+    } else {
+        usize::cast_from(valid_n)
+    };
+    if group_base * 4 >= loop_bound {
         terminate!();
     }
     let mut shared_weights = Shared::new_slice(2113usize);
@@ -1442,7 +1474,7 @@ fn fused_field_kernel(
     let mut wave_base = group_base;
     let active_cols = 3usize + usize::cast_from(active) * 2usize;
     let fast_tile_sync = corner_parallel && subgroup_width == 32usize;
-    while wave_base * 4 < n_valid {
+    while wave_base * 4 < loop_bound {
         // Reuse the staged weights for several bounded four-point tiles.
         for point_tile in 0..point_tiles {
             let group = wave_base + point_tile;
@@ -1500,7 +1532,7 @@ fn fused_field_kernel(
                             selected_ids,
                             point_idx,
                             sum + shared_weights[2112],
-                            occupancy,
+                            count_mode == 1u32,
                         );
                     }
                 } else if fast_tile_sync {
@@ -1516,7 +1548,7 @@ fn fused_field_kernel(
                             selected_ids,
                             point_idx,
                             partials[slot * 2] + partials[slot * 2 + 1] + shared_weights[2112],
-                            occupancy,
+                            count_mode == 1u32,
                         );
                     }
                 } else {
@@ -1528,7 +1560,7 @@ fn fused_field_kernel(
                             selected_ids,
                             point_idx,
                             partials[slot * 64] + partials[slot * 64 + 32] + shared_weights[2112],
-                            occupancy,
+                            count_mode == 1u32,
                         );
                     }
                 }
@@ -1549,7 +1581,7 @@ fn fused_field_kernel(
                         selected_ids,
                         point_idx,
                         partials[slot * 64] + shared_weights[2112],
-                        occupancy,
+                        count_mode == 1u32,
                     );
                 }
             }
@@ -1559,7 +1591,7 @@ fn fused_field_kernel(
                 sync_cube();
             }
         }
-        if occupancy {
+        if count_mode == 1u32 {
             if !fast_tile_sync {
                 sync_cube();
             }
@@ -1652,7 +1684,7 @@ pub fn pack_mlp_weights(inputs: [burn::tensor::Tensor<2>; 4]) -> burn::tensor::T
     let device = inputs[0].device();
     let inputs: Vec<_> = inputs
         .into_iter()
-        .chain([BT::empty([1, 2113], &device)])
+        .chain([crate::field::empty_2d(1, 2113, &device)])
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
     let client = inputs[0].client.clone();
@@ -1691,6 +1723,8 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
         let [
             ScalarIr::UInt(active),
             ScalarIr::UInt(valid_n),
+            ScalarIr::UInt(chunk_offset),
+            ScalarIr::UInt(total_cap),
             ScalarIr::UInt(cache),
             ScalarIr::UInt(cache_preactivation),
             ScalarIr::UInt(local_hash),
@@ -1698,7 +1732,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             ScalarIr::UInt(point_tiles),
             ScalarIr::UInt(subgroup_reduce),
             ScalarIr::UInt(selective_weights),
-            ScalarIr::UInt(occupancy),
+            ScalarIr::UInt(count_mode),
             ScalarIr::UInt(scale_encoding),
             ScalarIr::UInt(hashmap_size),
             ScalarIr::Float(scale_cutoff),
@@ -1717,7 +1751,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             features,
             hidden,
         ] = [p, t, m, w, c, i, y, f, h].map(|ir| get_contig(handles, ir));
-        let output = if *occupancy != 0 && !output.can_mut() {
+        let output = if *count_mode == 1 && !output.can_mut() {
             output.copy()
         } else {
             output
@@ -1725,7 +1759,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
         let client = points.client.clone();
         let _timing = crate::diagnostics::start(
             &client,
-            if *occupancy != 0 {
+            if *count_mode == 1 {
                 "occupancy.fused_field_apply"
             } else {
                 "field_forward"
@@ -1749,7 +1783,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
         static NOTICE: std::sync::Once = std::sync::Once::new();
         NOTICE.call_once(|| eprintln!("Field forward: {} points/group; subgroup reduction width {} (0 = portable shared tree)", point_tiles * 4, subgroup_width));
         let mut groups = (*valid_n as usize).div_ceil(4 * point_tiles).max(1);
-        if *occupancy != 0 {
+        if *count_mode == 1 {
             groups = groups.min(4096);
         }
         let gx = groups.min(65535).max(1);
@@ -1768,6 +1802,8 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             hidden.clone().into_tensor_arg(),
             *active as u32,
             *valid_n as u32,
+            *chunk_offset as u32,
+            *total_cap as u32,
             *hashmap_size as u32,
             *scale_cutoff as f32,
             *cache != 0,
@@ -1777,7 +1813,7 @@ impl Operation<FusionCubeRuntime> for FusedFieldOp {
             point_tiles,
             subgroup_width,
             *selective_weights != 0,
-            *occupancy != 0,
+            *count_mode as u32,
             *scale_encoding != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&oy.id, output);
@@ -1802,25 +1838,14 @@ pub fn fused_field(
     hashmap_size: usize,
     scale_cutoff: f32,
 ) -> [burn::tensor::Tensor<2>; 3] {
-    let dims = inputs[0].dims();
-    let n = dims[0];
-    let scale_encoding = dims[1] == 4;
-    let feat_cols = if scale_encoding { 32 } else { 31 };
-    let device = inputs[0].device();
-    // `fused_field_kernel` zeroes all 32 `shared_features` slots and writes all
-    // columns of `features` for every valid point, so `Tensor::empty` is safe
-    // regardless of `active`.
-    let buffers = [
-        crate::field::empty_2d(valid_n.max(1), 1, &device),
-        crate::field::empty_2d(if cache { n } else { 1 }, feat_cols, &device),
-        crate::field::empty_2d(if cache_preactivation { n } else { 1 }, 64, &device),
-    ];
     let [points, tables, metadata, weights] = inputs;
-    let dummy = points.clone();
-    fused_field_op(
-        [points, tables, metadata, weights, dummy.clone(), dummy],
-        buffers,
+    let prefix = points.clone();
+    fused_field_device_count(
+        [points, tables, metadata, weights, prefix],
         valid_n,
+        0,
+        0,
+        0,
         active,
         cache,
         cache_preactivation,
@@ -1829,7 +1854,58 @@ pub fn fused_field(
         point_tiles,
         subgroup_reduce,
         selective_weights,
-        false,
+        hashmap_size,
+        scale_cutoff,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fused_field_device_count(
+    inputs: [burn::tensor::Tensor<2>; 5],
+    valid_n: usize,
+    chunk_offset: usize,
+    total_cap: usize,
+    count_mode: u32,
+    active: usize,
+    cache: bool,
+    cache_preactivation: bool,
+    local_hash: bool,
+    corner_parallel: bool,
+    point_tiles: usize,
+    subgroup_reduce: bool,
+    selective_weights: bool,
+    hashmap_size: usize,
+    scale_cutoff: f32,
+) -> [burn::tensor::Tensor<2>; 3] {
+    let dims = inputs[0].dims();
+    let n = dims[0];
+    let scale_encoding = dims[1] == 4;
+    let feat_cols = if scale_encoding { 32 } else { 31 };
+    let device = inputs[0].device();
+    // `fused_field_kernel` zeroes all 32 `shared_features` slots and writes all
+    // columns of `features` for every valid point, so `empty_2d` is safe.
+    let buffers = [
+        crate::field::empty_2d(valid_n.max(1), 1, &device),
+        crate::field::empty_2d(if cache { n } else { 1 }, feat_cols, &device),
+        crate::field::empty_2d(if cache_preactivation { n } else { 1 }, 64, &device),
+    ];
+    let [points, tables, metadata, weights, count_prefix] = inputs;
+    let dummy_ids = points.clone();
+    fused_field_op(
+        [points, tables, metadata, weights, count_prefix, dummy_ids],
+        buffers,
+        valid_n,
+        chunk_offset,
+        total_cap,
+        active,
+        cache,
+        cache_preactivation,
+        local_hash,
+        corner_parallel,
+        point_tiles,
+        subgroup_reduce,
+        selective_weights,
+        count_mode,
         scale_encoding,
         hashmap_size,
         scale_cutoff,
@@ -1849,7 +1925,6 @@ pub fn fused_occupancy_field(
     selective_weights: bool,
     hashmap_size: usize,
 ) -> burn::tensor::Tensor<2> {
-    use burn::tensor::Tensor as BT;
     let [points, tables, metadata, weights, prefix, ids, values] = inputs;
     let cap = points.dims()[0];
     assert!(cap == values.dims()[0] && ids.dims()[0] >= cap);
@@ -1859,10 +1934,12 @@ pub fn fused_occupancy_field(
         [points, tables, metadata, weights, prefix, ids],
         [
             values,
-            BT::empty([1, 31], &device),
-            BT::empty([1, 64], &device),
+            crate::field::empty_2d(1, 31, &device),
+            crate::field::empty_2d(1, 64, &device),
         ],
         cap,
+        0,
+        0,
         active,
         false,
         false,
@@ -1871,7 +1948,7 @@ pub fn fused_occupancy_field(
         point_tiles,
         subgroup_reduce,
         selective_weights,
-        true,
+        1,
         false,
         hashmap_size,
         0.0,
@@ -1884,6 +1961,8 @@ fn fused_field_op(
     inputs: [burn::tensor::Tensor<2>; 6],
     buffers: [burn::tensor::Tensor<2>; 3],
     valid_n: usize,
+    chunk_offset: usize,
+    total_cap: usize,
     active: usize,
     cache: bool,
     cache_preactivation: bool,
@@ -1892,7 +1971,7 @@ fn fused_field_op(
     point_tiles: usize,
     subgroup_reduce: bool,
     selective_weights: bool,
-    occupancy: bool,
+    count_mode: u32,
     scale_encoding: bool,
     hashmap_size: usize,
     scale_cutoff: f32,
@@ -1914,6 +1993,8 @@ fn fused_field_op(
         vec![
             ScalarIr::UInt(active as u64),
             ScalarIr::UInt(valid_n as u64),
+            ScalarIr::UInt(chunk_offset as u64),
+            ScalarIr::UInt(total_cap as u64),
             ScalarIr::UInt(cache as u64),
             ScalarIr::UInt(cache_preactivation as u64),
             ScalarIr::UInt(local_hash as u64),
@@ -1921,7 +2002,7 @@ fn fused_field_op(
             ScalarIr::UInt(point_tiles as u64),
             ScalarIr::UInt(subgroup_reduce as u64),
             ScalarIr::UInt(selective_weights as u64),
-            ScalarIr::UInt(occupancy as u64),
+            ScalarIr::UInt(count_mode as u64),
             ScalarIr::UInt(scale_encoding as u64),
             ScalarIr::UInt(hashmap_size as u64),
             ScalarIr::Float(scale_cutoff as f64),
@@ -2265,6 +2346,7 @@ fn composite_kernel(
 #[cube(launch)]
 fn reduce_composite_stats_kernel(
     raw_stats: &Tensor<f32>,
+    patches: &Tensor<f32>,
     out_stats: &mut Tensor<f32>,
     rays: u32,
     vscale: f32,
@@ -2292,7 +2374,16 @@ fn reduce_composite_stats_kernel(
     if unit == 0usize {
         let mut total = sh[0];
         if col == 3usize {
-            total = total * vscale;
+            let mut eff_vscale = vscale;
+            if eff_vscale < 0.0_f32 {
+                let dev_inv = patches[2];
+                if dev_inv > 1.0001e-6_f32 && dev_inv < 999999.0_f32 {
+                    eff_vscale = 10.0_f32 * dev_inv;
+                } else {
+                    eff_vscale = 0.0_f32;
+                }
+            }
+            total = total * eff_vscale;
         }
         out_stats[col] = total;
     }
@@ -2314,6 +2405,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             ScalarIr::UInt(coalesced_scratch),
             ScalarIr::UInt(compact_cache),
             ScalarIr::UInt(reuse_endpoints),
+            ScalarIr::UInt(device_counts),
             ScalarIr::Float(vscale),
         ] = self.desc.scalars.as_slice()
         else {
@@ -2333,8 +2425,8 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             s.into_tensor_arg(),
             g.into_tensor_arg(),
             i.into_tensor_arg(),
-            p.into_tensor_arg(),
-            vp.into_tensor_arg(),
+            p.clone().into_tensor_arg(),
+            vp.clone().into_tensor_arg(),
             w.clone().into_tensor_arg(),
             l.clone().into_tensor_arg(),
             compact,
@@ -2352,11 +2444,13 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             dim,
             w.into_tensor_arg(),
             r.into_tensor_arg(),
+            vp.into_tensor_arg(),
             d.clone().into_tensor_arg(),
             *valid_points as u32,
             compact,
             *coalesced_scratch != 0,
             *compact_cache != 0,
+            *device_counts != 0,
         );
         drop(timing_g);
         let _timing_r = crate::diagnostics::start(&client, "composite_stats_reduce");
@@ -2365,6 +2459,7 @@ impl Operation<FusionCubeRuntime> for CompositeOp {
             CubeCount::Static(5, 1, 1),
             CubeDim::new_1d(256),
             l.into_tensor_arg(),
+            p.into_tensor_arg(),
             rl.clone().into_tensor_arg(),
             rays as u32,
             *vscale as f32,
@@ -2383,11 +2478,32 @@ pub fn composite_gpu(
     reuse_endpoints: bool,
     vscale: f32,
 ) -> [burn::tensor::Tensor<2>; 2] {
+    composite_gpu_ext(
+        inputs,
+        valid_points,
+        compact_tables,
+        coalesced_scratch,
+        compact_cache,
+        reuse_endpoints,
+        false,
+        vscale,
+    )
+}
+pub fn composite_gpu_ext(
+    inputs: [burn::tensor::Tensor<2>; 9],
+    valid_points: usize,
+    compact_tables: bool,
+    coalesced_scratch: bool,
+    compact_cache: bool,
+    reuse_endpoints: bool,
+    device_counts: bool,
+    vscale: f32,
+) -> [burn::tensor::Tensor<2>; 2] {
     assert_eq!(inputs[5].dims()[1], if compact_cache { 63 } else { 90 });
     let device = inputs[0].device();
     let inputs: Vec<_> = inputs
         .into_iter()
-        .chain([burn::tensor::Tensor::<2>::empty([1, 5], &device)])
+        .chain([crate::field::empty_2d(1, 5, &device)])
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
     let client = inputs[0].client.clone();
@@ -2406,6 +2522,7 @@ pub fn composite_gpu(
             ScalarIr::UInt(coalesced_scratch as u64),
             ScalarIr::UInt(compact_cache as u64),
             ScalarIr::UInt(reuse_endpoints as u64),
+            ScalarIr::UInt(device_counts as u64),
             ScalarIr::Float(vscale as f64),
         ],
     );
@@ -3052,7 +3169,6 @@ pub fn field_backward(
     selective_weights: bool,
     replay_hash: bool,
 ) -> [burn::tensor::Tensor<2>; 4] {
-    use burn::tensor::Tensor as BT;
     assert!(
         adjoint_offset <= inputs[1].dims()[0] && valid_n <= inputs[1].dims()[0] - adjoint_offset
     );
@@ -3069,8 +3185,8 @@ pub fn field_backward(
     let inputs: Vec<_> = inputs
         .into_iter()
         .chain([
-            BT::empty([if write_dh { n } else { 1 }, 64], &device),
-            BT::empty([dw1_rows, 64], &device),
+            crate::field::empty_2d(if write_dh { n } else { 1 }, 64, &device),
+            crate::field::empty_2d(dw1_rows, 64, &device),
         ])
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap())
         .collect();
@@ -3107,21 +3223,32 @@ pub fn field_backward(
             FieldBackwardOp { desc },
         )
         .outputs();
-    result.map(BT::<2>::from_primitive::<GpuBackend>)
+    result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
 #[cube(launch)]
 fn composite_gather_kernel(
     scratch: &Tensor<f32>,
     reverse: &Tensor<f32>,
+    vis_prefix: &Tensor<f32>,
     ds: &mut Tensor<f32>,
     valid_points: u32,
     #[comptime] compact_reverse: bool,
     #[comptime] coalesced_scratch: bool,
     #[comptime] compact_cache: bool,
+    #[comptime] device_counts: bool,
 ) {
     let point = ABSOLUTE_POS;
-    if point >= usize::cast_from(valid_points) {
+    let mut limit = usize::cast_from(valid_points);
+    if device_counts {
+        let max_ep = limit / 9usize;
+        let dev_ep = usize::min(
+            usize::cast_from(vis_prefix[vis_prefix.shape(0) * 2 - 1]),
+            max_ep,
+        );
+        limit = dev_ep * 9usize;
+    }
+    if point >= limit {
         terminate!();
     }
     let mut total = 0.0_f32;
@@ -4133,7 +4260,7 @@ pub fn cached_mlp_preactivation(
 ) -> burn::tensor::Tensor<2> {
     use burn::tensor::Tensor as BT;
     assert!(valid_n > 0 && valid_n <= features.dims()[0] && active <= 14);
-    let output = BT::empty([features.dims()[0], 64], &features.device());
+    let output = crate::field::empty_2d(features.dims()[0], 64, &features.device());
     let inputs =
         [features, weights, output].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -4179,6 +4306,7 @@ fn field_backward_fused_native_kernel(
     dw1_partials: &mut Tensor<f32>,
     active: u32,
     valid_n: u32,
+    total_ep_cap: u32,
     aggregation_levels: u32,
     adjoint_offset: u32,
     hashmap_size: u32,
@@ -4191,6 +4319,7 @@ fn field_backward_fused_native_kernel(
     #[comptime] subgroup_width: usize,
     #[comptime] active_columns_only: bool,
     #[comptime] scale_encoding: bool,
+    #[comptime] device_counts: bool,
 ) {
     let mut unit = usize::cast_from(UNIT_POS);
     if subgroup_width > 0 {
@@ -4212,7 +4341,23 @@ fn field_backward_fused_native_kernel(
     let first_active = p_col < feat_cols;
     let second_active = p_col + 16usize < feat_cols || p_col + 16usize == 31usize;
 
-    let n_valid = usize::cast_from(valid_n);
+    let mut n_valid = usize::cast_from(valid_n);
+    if device_counts {
+        let tot_ep = usize::min(
+            usize::cast_from(pre[pre.shape(0) * 2 - 1]),
+            usize::cast_from(total_ep_cap),
+        );
+        let tot_pts = tot_ep * 9usize;
+        let off = usize::cast_from(adjoint_offset);
+        n_valid = if tot_pts > off {
+            usize::min(tot_pts - off, usize::cast_from(valid_n))
+        } else {
+            0usize
+        };
+        if n_valid == 0usize && accumulate {
+            terminate!();
+        }
+    }
     let total_groups = (n_valid + 3usize) / 4usize;
     let part = usize::cast_from(CUBE_POS_X);
     let stride = usize::cast_from(CUBE_COUNT_X);
@@ -4265,7 +4410,10 @@ fn field_backward_fused_native_kernel(
         level_res = u32::cast_from(metadata[level * 2]);
         level_offset = usize::cast_from(metadata[level * 2 + 1]);
     }
-    let lane_base = (u32::cast_from(UNIT_POS_PLANE) >> 2u32) << 2u32;
+    let mut lane_base = 0u32;
+    if subgroup_width > 0 {
+        lane_base = (u32::cast_from(UNIT_POS_PLANE) >> 2u32) << 2u32;
+    }
     let use_agg = aggregate_hash
         && subgroup_width >= 32usize
         && level < usize::cast_from(aggregation_levels);
@@ -4587,6 +4735,7 @@ fn field_backward_fused_cas_kernel(
     dw1_partials: &mut Tensor<f32>,
     active: u32,
     valid_n: u32,
+    total_ep_cap: u32,
     aggregation_levels: u32,
     adjoint_offset: u32,
     hashmap_size: u32,
@@ -4599,6 +4748,7 @@ fn field_backward_fused_cas_kernel(
     #[comptime] subgroup_width: usize,
     #[comptime] active_columns_only: bool,
     #[comptime] scale_encoding: bool,
+    #[comptime] device_counts: bool,
 ) {
     let mut unit = usize::cast_from(UNIT_POS);
     if subgroup_width > 0 {
@@ -4620,8 +4770,29 @@ fn field_backward_fused_cas_kernel(
     let first_active = p_col < feat_cols;
     let second_active = p_col + 16usize < feat_cols || p_col + 16usize == 31usize;
 
-    let n_valid = usize::cast_from(valid_n);
-    let total_groups = (n_valid + 3usize) / 4usize;
+    let mut n_valid = usize::cast_from(valid_n);
+    if device_counts {
+        let tot_ep = usize::min(
+            usize::cast_from(pre[pre.shape(0) * 2 - 1]),
+            usize::cast_from(total_ep_cap),
+        );
+        let tot_pts = tot_ep * 9usize;
+        let off = usize::cast_from(adjoint_offset);
+        n_valid = if tot_pts > off {
+            usize::min(tot_pts - off, usize::cast_from(valid_n))
+        } else {
+            0usize
+        };
+        if subgroup_width > 0usize && n_valid == 0usize && accumulate {
+            terminate!();
+        }
+    }
+    let loop_valid = if subgroup_width > 0usize {
+        n_valid
+    } else {
+        usize::cast_from(valid_n)
+    };
+    let total_groups = (loop_valid + 3usize) / 4usize;
     let part = usize::cast_from(CUBE_POS_X);
     let stride = usize::cast_from(CUBE_COUNT_X);
 
@@ -4672,7 +4843,10 @@ fn field_backward_fused_cas_kernel(
         level_res = u32::cast_from(metadata[level * 2]);
         level_offset = usize::cast_from(metadata[level * 2 + 1]);
     }
-    let lane_base = (u32::cast_from(UNIT_POS_PLANE) >> 2u32) << 2u32;
+    let mut lane_base = 0u32;
+    if subgroup_width > 0 {
+        lane_base = (u32::cast_from(UNIT_POS_PLANE) >> 2u32) << 2u32;
+    }
     let use_agg = aggregate_hash
         && subgroup_width >= 32usize
         && level < usize::cast_from(aggregation_levels);
@@ -4717,40 +4891,41 @@ fn field_backward_fused_cas_kernel(
         let ds1 = slot_ds[1];
         let ds2 = slot_ds[2];
         let ds3 = slot_ds[3];
-        if ds0 != 0.0_f32 || ds1 != 0.0_f32 || ds2 != 0.0_f32 || ds3 != 0.0_f32 {
-            let point = group * 4 + slot;
-            let ds_val = slot_ds[slot];
-            let mut v = 0.0_f32;
-            if point < n_valid && ds_val != 0.0_f32 {
-                let mut h = 0.0_f32;
-                if replay_features {
-                    for col in 0..active_cols {
-                        let wi = if local_hash {
-                            lane * 31 + col
-                        } else {
-                            col * 64 + lane
-                        };
-                        h += shared_feat[slot * 32 + col] * shared_weights[wi];
-                    }
-                    h += shared_weights[1984 + lane];
-                } else {
-                    h = pre[point * 64 + lane];
+        let any_ds = ds0 != 0.0_f32 || ds1 != 0.0_f32 || ds2 != 0.0_f32 || ds3 != 0.0_f32;
+        let point = group * 4 + slot;
+        let ds_val = slot_ds[slot];
+        let mut v = 0.0_f32;
+        if any_ds && point < n_valid && ds_val != 0.0_f32 {
+            let mut h = 0.0_f32;
+            if replay_features {
+                for col in 0..active_cols {
+                    let wi = if local_hash {
+                        lane * 31 + col
+                    } else {
+                        col * 64 + lane
+                    };
+                    h += shared_feat[slot * 32 + col] * shared_weights[wi];
                 }
-                let scaled = h * 100.0_f32;
-                let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
-                let derivative = if scaled > 20.0_f32 {
-                    1.0_f32
-                } else {
-                    exp_pos / (1.0_f32 + exp_pos)
-                };
-                v = ds_val * shared_weights[2048 + lane] * derivative;
-                let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
-                let hidden = if scaled > 20.0_f32 { h } else { soft };
-                dw1_reg += ds_val * hidden;
+                h += shared_weights[1984 + lane];
+            } else {
+                h = pre[point * 64 + lane];
             }
-            shared_dh[slot * 68 + lane] = v;
-            sync_cube();
+            let scaled = h * 100.0_f32;
+            let exp_pos = f32::exp(f32::min(scaled, 20.0_f32));
+            let derivative = if scaled > 20.0_f32 {
+                1.0_f32
+            } else {
+                exp_pos / (1.0_f32 + exp_pos)
+            };
+            v = ds_val * shared_weights[2048 + lane] * derivative;
+            let soft = f32::ln(1.0_f32 + exp_pos) * 0.01_f32;
+            let hidden = if scaled > 20.0_f32 { h } else { soft };
+            dw1_reg += ds_val * hidden;
+        }
+        shared_dh[slot * 68 + lane] = v;
+        sync_cube();
 
+        if any_ds {
             for s in 0..4usize {
                 if slot_ds[s] != 0.0_f32 {
                     let h0 = shared_dh[s * 68 + p_row];
@@ -4773,56 +4948,59 @@ fn field_backward_fused_cas_kernel(
                     }
                 }
             }
+        }
 
-            let hash_point = group * 4 + hash_slot;
-            let active_lane = hash_point < n_valid
-                && level < usize::cast_from(active)
-                && slot_ds[hash_slot] != 0.0_f32;
-            let mut p_g0 = 0.0_f32;
-            let mut p_g1 = 0.0_f32;
-            if active_lane {
-                let col = 3 + level * 2;
-                for j_off in 0..16usize {
-                    let j = j_off * 4 + sub_part;
-                    let h = shared_dh[hash_slot * 68 + j];
-                    let w0 = if local_hash {
-                        j * 31 + col
-                    } else {
-                        col * 64 + j
-                    };
-                    let w1 = if local_hash {
-                        j * 31 + col + 1
-                    } else {
-                        (col + 1) * 64 + j
-                    };
-                    p_g0 += h * shared_weights[w0];
-                    p_g1 += h * shared_weights[w1];
-                }
+        let hash_point = group * 4 + hash_slot;
+        let active_lane = any_ds
+            && hash_point < n_valid
+            && level < usize::cast_from(active)
+            && slot_ds[hash_slot] != 0.0_f32;
+        let mut p_g0 = 0.0_f32;
+        let mut p_g1 = 0.0_f32;
+        if active_lane {
+            let col = 3 + level * 2;
+            for j_off in 0..16usize {
+                let j = j_off * 4 + sub_part;
+                let h = shared_dh[hash_slot * 68 + j];
+                let w0 = if local_hash {
+                    j * 31 + col
+                } else {
+                    col * 64 + j
+                };
+                let w1 = if local_hash {
+                    j * 31 + col + 1
+                } else {
+                    (col + 1) * 64 + j
+                };
+                p_g0 += h * shared_weights[w0];
+                p_g1 += h * shared_weights[w1];
             }
-            let (g0, g1) = if subgroup_width >= 32usize {
-                let s0 = p_g0 + plane_shuffle_xor(p_g0, 4u32);
-                let fg0 = s0 + plane_shuffle_xor(s0, 8u32);
-                let s1 = p_g1 + plane_shuffle_xor(p_g1, 4u32);
-                let fg1 = s1 + plane_shuffle_xor(s1, 8u32);
+        }
+        let (g0, g1) = if subgroup_width >= 32usize {
+            let s0 = p_g0 + plane_shuffle_xor(p_g0, 4u32);
+            let fg0 = s0 + plane_shuffle_xor(s0, 8u32);
+            let s1 = p_g1 + plane_shuffle_xor(p_g1, 4u32);
+            let fg1 = s1 + plane_shuffle_xor(s1, 8u32);
+            (fg0, fg1)
+        } else {
+            if level < 14usize {
+                fallback_partials[unit * 2] = p_g0;
+                fallback_partials[unit * 2 + 1] = p_g1;
+            }
+            sync_cube();
+            if active_lane {
+                let base_p = (level * 16 + hash_slot) * 2;
+                let fg0 = (fallback_partials[base_p] + fallback_partials[base_p + 8])
+                    + (fallback_partials[base_p + 16] + fallback_partials[base_p + 24]);
+                let fg1 = (fallback_partials[base_p + 1] + fallback_partials[base_p + 9])
+                    + (fallback_partials[base_p + 17] + fallback_partials[base_p + 25]);
                 (fg0, fg1)
             } else {
-                if level < 14usize {
-                    fallback_partials[unit * 2] = p_g0;
-                    fallback_partials[unit * 2 + 1] = p_g1;
-                }
-                sync_cube();
-                if active_lane {
-                    let base_p = (level * 16 + hash_slot) * 2;
-                    let fg0 = (fallback_partials[base_p] + fallback_partials[base_p + 8])
-                        + (fallback_partials[base_p + 16] + fallback_partials[base_p + 24]);
-                    let fg1 = (fallback_partials[base_p + 1] + fallback_partials[base_p + 9])
-                        + (fallback_partials[base_p + 17] + fallback_partials[base_p + 25]);
-                    (fg0, fg1)
-                } else {
-                    (0.0_f32, 0.0_f32)
-                }
-            };
+                (0.0_f32, 0.0_f32)
+            }
+        };
 
+        if any_ds {
             let do_hash = active_lane && (g0 != 0.0_f32 || g1 != 0.0_f32);
             let mut base0 = 0u32;
             let mut w0 = 0.0_f32;
@@ -4987,6 +5165,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
         let [
             ScalarIr::UInt(active),
             ScalarIr::UInt(valid_n),
+            ScalarIr::UInt(total_ep_cap),
             ScalarIr::UInt(local_hash),
             ScalarIr::UInt(aggregate_hash),
             ScalarIr::UInt(aggregation_levels),
@@ -4996,6 +5175,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
             ScalarIr::UInt(accumulate),
             ScalarIr::UInt(active_columns_only),
             ScalarIr::UInt(scale_encoding),
+            ScalarIr::UInt(device_counts),
             ScalarIr::UInt(hashmap_size),
             ScalarIr::Float(scale_cutoff),
         ] = self.desc.scalars.as_slice()
@@ -5066,6 +5246,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 dw1p.clone().into_tensor_arg(),
                 *active as u32,
                 *valid_n as u32,
+                *total_ep_cap as u32,
                 *aggregation_levels as u32,
                 *adjoint_offset as u32,
                 *hashmap_size as u32,
@@ -5078,6 +5259,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 subgroup_width,
                 *active_columns_only != 0,
                 *scale_encoding != 0,
+                *device_counts != 0,
             );
         } else {
             field_backward_fused_cas_kernel::launch(
@@ -5094,6 +5276,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 dw1p.clone().into_tensor_arg(),
                 *active as u32,
                 *valid_n as u32,
+                *total_ep_cap as u32,
                 *aggregation_levels as u32,
                 *adjoint_offset as u32,
                 *hashmap_size as u32,
@@ -5106,6 +5289,7 @@ impl Operation<FusionCubeRuntime> for FieldBackwardFusedOp {
                 subgroup_width,
                 *active_columns_only != 0,
                 *scale_encoding != 0,
+                *device_counts != 0,
             );
         }
         handles.register_float_tensor::<CubeBackend>(&ot.id, t);
@@ -5131,7 +5315,43 @@ pub fn field_backward_fused(
     hashmap_size: usize,
     scale_cutoff: f32,
 ) -> [burn::tensor::Tensor<2>; 3] {
-    use burn::tensor::Tensor as BT;
+    field_backward_fused_ext(
+        inputs,
+        valid_n,
+        0,
+        false,
+        active,
+        local_hash,
+        aggregate_hash,
+        aggregation_levels,
+        replay_features,
+        adjoint_offset,
+        selective_weights,
+        accumulate,
+        active_columns_only,
+        hashmap_size,
+        scale_cutoff,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn field_backward_fused_ext(
+    inputs: [burn::tensor::Tensor<2>; 8],
+    valid_n: usize,
+    total_ep_cap: usize,
+    device_counts: bool,
+    active: usize,
+    local_hash: bool,
+    aggregate_hash: bool,
+    aggregation_levels: usize,
+    replay_features: bool,
+    adjoint_offset: usize,
+    selective_weights: bool,
+    accumulate: bool,
+    active_columns_only: bool,
+    hashmap_size: usize,
+    scale_cutoff: f32,
+) -> [burn::tensor::Tensor<2>; 3] {
     assert!(
         adjoint_offset <= inputs[2].dims()[0] && valid_n <= inputs[2].dims()[0] - adjoint_offset
     );
@@ -5151,6 +5371,7 @@ pub fn field_backward_fused(
         vec![
             ScalarIr::UInt(active as u64),
             ScalarIr::UInt(valid_n as u64),
+            ScalarIr::UInt(total_ep_cap as u64),
             ScalarIr::UInt(local_hash as u64),
             ScalarIr::UInt(aggregate_hash as u64),
             ScalarIr::UInt(aggregation_levels as u64),
@@ -5160,6 +5381,7 @@ pub fn field_backward_fused(
             ScalarIr::UInt(accumulate as u64),
             ScalarIr::UInt(active_columns_only as u64),
             ScalarIr::UInt(scale_encoding as u64),
+            ScalarIr::UInt(device_counts as u64),
             ScalarIr::UInt(hashmap_size as u64),
             ScalarIr::Float(scale_cutoff as f64),
         ],
@@ -5171,7 +5393,7 @@ pub fn field_backward_fused(
             FieldBackwardFusedOp { desc },
         )
         .outputs();
-    result.map(BT::<2>::from_primitive::<GpuBackend>)
+    result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
 #[cube(launch)]
@@ -5243,14 +5465,13 @@ pub fn reduce_mlp_partials(
     dw0_partials: burn::tensor::Tensor<2>,
     dw1_partials: burn::tensor::Tensor<2>,
 ) -> [burn::tensor::Tensor<2>; 3] {
-    use burn::tensor::Tensor as BT;
     let device = dw0_partials.device();
     let inputs = [
         dw0_partials,
         dw1_partials,
-        BT::empty([64, 31], &device),
-        BT::empty([1, 64], &device),
-        BT::empty([1, 64], &device),
+        crate::field::empty_2d(64, 31, &device),
+        crate::field::empty_2d(1, 64, &device),
+        crate::field::empty_2d(1, 64, &device),
     ]
     .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -5272,7 +5493,7 @@ pub fn reduce_mlp_partials(
             ReduceMlpPartialsOp { desc },
         )
         .outputs();
-    result.map(BT::<2>::from_primitive::<GpuBackend>)
+    result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
 #[cube]
@@ -5472,7 +5693,6 @@ pub fn fused_mlp_step(
     inv_bc2: f64,
     lr: f64,
 ) -> [burn::tensor::Tensor<2>; 3] {
-    use burn::tensor::Tensor as BT;
     let device = mlp_state.device();
     let inputs = [
         mlp_state,
@@ -5480,8 +5700,8 @@ pub fn fused_mlp_step(
         db0,
         dw1,
         stats,
-        BT::empty([1, 2113], &device),
-        BT::empty([1, 1], &device),
+        crate::field::empty_2d(1, 2113, &device),
+        crate::field::empty_2d(1, 1, &device),
     ]
     .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -5507,7 +5727,7 @@ pub fn fused_mlp_step(
             FusedMlpStepOp { desc },
         )
         .outputs();
-    result.map(BT::<2>::from_primitive::<GpuBackend>)
+    result.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
 /// Numerical GPU-vs-CPU parity test for SNSR scale-encoded forward (`fused_field`)

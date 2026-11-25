@@ -276,6 +276,26 @@ pub struct DevicePreparedGeometry {
     pub valid_points: usize,
 }
 
+pub struct DeviceVisibleBatchAsync {
+    pub marched: burn::tensor::Tensor<2>,
+    pub vis_m_begin: burn::tensor::Tensor<2>,
+    pub vis_prefix: burn::tensor::Tensor<2>,
+    pub coords_tensor: burn::tensor::Tensor<2>,
+    pub max_vis_cap: usize,
+    pub max_ep_cap: usize,
+}
+
+pub struct DevicePreparedGeometryAsync {
+    pub unique_points: burn::tensor::Tensor<2>,
+    pub geometry: burn::tensor::Tensor<2>,
+    pub mapping: burn::tensor::Tensor<2>,
+    pub reverse: burn::tensor::Tensor<2>,
+    pub vis_prefix: burn::tensor::Tensor<2>,
+    pub packed_patches: burn::tensor::Tensor<2>,
+    pub max_vis_cap: usize,
+    pub max_ep_cap: usize,
+}
+
 pub fn sigmoid(x: f32) -> f32 {
     1. / (1. + (-x).exp())
 }
@@ -1506,6 +1526,52 @@ pub fn composite_device_tables(
     (adjoints, stats)
 }
 
+/// Zero-sync device-driven compositor variant: uses `device_counts = true` and on-device
+/// `vscale` (`-1.0` sentinel reads `inv` from `packed_patches[2]`).
+#[allow(clippy::too_many_arguments)]
+pub fn composite_device_tables_async(
+    patch_count: usize,
+    max_vis_cap: usize,
+    max_ep_cap: usize,
+    vis_prefix: burn::tensor::Tensor<2>,
+    packed_patches: burn::tensor::Tensor<2>,
+    geometry: burn::tensor::Tensor<2>,
+    mapping: burn::tensor::Tensor<2>,
+    reverse: burn::tensor::Tensor<2>,
+    sdf: burn::tensor::Tensor<2>,
+    coalesced_scratch: bool,
+    compact_cache: bool,
+    reuse_endpoints: bool,
+) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
+    let device = sdf.device();
+    let max_points = (max_ep_cap * 9).max(1);
+    assert!(
+        max_points < (1 << 24),
+        "compositor index exceeds exact f32 integer range"
+    );
+    let [adjoints, stats] = crate::kernels::composite_gpu_ext(
+        [
+            sdf,
+            geometry,
+            mapping,
+            packed_patches,
+            vis_prefix,
+            crate::field::empty_2d(max_vis_cap.max(1), if compact_cache { 63 } else { 90 }, &device),
+            crate::field::empty_2d(max_points, 1, &device),
+            crate::field::empty_2d(patch_count * 9, 5, &device),
+            reverse,
+        ],
+        max_points,
+        true,
+        coalesced_scratch,
+        compact_cache,
+        reuse_endpoints,
+        true,
+        -1.0_f32,
+    );
+    (adjoints, stats)
+}
+
 /// March into bounded per-ray storage, then compact in stable order on the GPU.
 /// A scalar total determines the final allocation; existing geometry preparation
 /// still consumes the compact samples on the host when legacy CPU visibility is used.
@@ -2061,6 +2127,184 @@ pub fn prepare_geometry_from_device_batch(
         visible_count: vis_count,
         valid_points,
     })
+}
+
+/// Zero-sync GPU ray marching + visibility filtering: builds march rays on the GPU from
+/// `[n_patches, 40]` `coords_tensor`, bounds prefixes to `(hwm_marched, hwm_march_ep)` and
+/// `(hwm_vis, hwm_vis_ep)` on-device, and returns `(vis_batch, march_meta, vis_meta)` with
+/// ZERO host readbacks so multiple training steps queue back-to-back without stalling.
+#[allow(clippy::too_many_arguments)]
+pub fn march_and_filter_device_async(
+    field: &Field,
+    dataset: &crate::data::Dataset,
+    coords_tensor: burn::tensor::Tensor<2>,
+    occ: &mut Occupancy,
+    step_size: f32,
+    query: usize,
+    hwm_marched: usize,
+    hwm_march_ep: usize,
+    hwm_vis: usize,
+    hwm_vis_ep: usize,
+) -> Result<(
+    DeviceVisibleBatchAsync,
+    burn::tensor::Tensor<2>,
+    burn::tensor::Tensor<2>,
+)> {
+    use crate::field::tensor;
+    let device = &field.device;
+    let n_patches = coords_tensor.dims()[0];
+    let max_steps_per_ray = ((2.05_f32 / step_size).ceil() as usize + 2).max(16);
+    let raw_sample_cap = n_patches
+        .checked_mul(max_steps_per_ray)
+        .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
+    anyhow::ensure!(
+        raw_sample_cap < (1 << 24),
+        "march batch exceeds exact index range; reduce batch size"
+    );
+    let dev_ds = dataset.device_dataset(device);
+    let rays = crate::sampling_gpu::build_march_rays(
+        coords_tensor.clone(),
+        dev_ds.view_meta,
+        step_size,
+        max_steps_per_ray,
+        occ.resolution,
+        field.scale_encoding,
+    );
+    let flags = occ
+        .device_flags
+        .get_or_insert_with(|| {
+            tensor(
+                occ.flags.iter().map(|&v| if v { 1. } else { 0. }).collect(),
+                [occ.flags.len(), 1],
+                device,
+            )
+        })
+        .clone();
+    let sample_cap = crate::sampling_gpu::bucket_capacity(raw_sample_cap);
+    let [samples, counts] = crate::sampling_gpu::march([
+        rays.clone(),
+        flags,
+        crate::field::empty_2d(sample_cap, 2, device),
+        crate::field::empty_2d(n_patches, 2, device),
+    ]);
+    let m_cap = crate::sampling_gpu::bucket_capacity(hwm_marched.max(1));
+    let m_ep_cap = Field::padded_point_capacity(hwm_march_ep.max(1), query);
+    let [march_prefix, march_meta] = crate::sampling_gpu::scan_2d_pairs_and_pack_bounded(
+        counts,
+        None,
+        n_patches,
+        0u32,
+        m_cap,
+        m_ep_cap,
+    );
+    let [marched, unique_pts, pairs, ranges] = crate::sampling_gpu::compact_and_center_endpoints(
+        rays,
+        samples,
+        march_prefix.clone(),
+        m_cap,
+        m_ep_cap,
+        field.scale_encoding,
+    );
+    let [vis_out, vis_m_begin] = field.visibility_device_async(
+        unique_pts,
+        m_ep_cap,
+        march_prefix,
+        pairs,
+        ranges,
+        query,
+    );
+    let max_vis_cap = crate::sampling_gpu::bucket_capacity(hwm_vis.max(1));
+    let max_ep_cap = crate::sampling_gpu::bucket_capacity(hwm_vis_ep.max(1));
+    let [vis_prefix, vis_meta] = crate::sampling_gpu::scan_2d_pairs_and_pack_bounded(
+        vis_out,
+        None,
+        n_patches,
+        2u32,
+        max_vis_cap,
+        max_ep_cap,
+    );
+    Ok((
+        DeviceVisibleBatchAsync {
+            marched,
+            vis_m_begin,
+            vis_prefix,
+            coords_tensor,
+            max_vis_cap,
+            max_ep_cap,
+        },
+        march_meta,
+        vis_meta,
+    ))
+}
+
+/// Zero-sync 3x3 stencil point + geometry + mapping/reverse + patch-table preparation.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_geometry_device_async(
+    dataset: &crate::data::Dataset,
+    vis_batch: &DeviceVisibleBatchAsync,
+    n_patches: usize,
+    query: usize,
+    variance_tensor: burn::tensor::Tensor<2>,
+    normal_den: f32,
+    pixel_den: f32,
+    scale_encoding: bool,
+    device: &burn::tensor::Device,
+) -> DevicePreparedGeometryAsync {
+    let max_vis_cap = vis_batch.max_vis_cap;
+    let max_ep_cap = vis_batch.max_ep_cap;
+    let max_points = (max_ep_cap * 9).max(1);
+    assert!(
+        max_points < (1 << 24) && max_vis_cap * 18 < (1 << 24),
+        "geometry index exceeds exact f32 range"
+    );
+    let [endpoints, descriptors, mapping, reverse] =
+        crate::sampling_gpu::build_visible_geometry_tables(
+            vis_batch.marched.clone(),
+            vis_batch.vis_m_begin.clone(),
+            vis_batch.vis_prefix.clone(),
+            0,
+            n_patches,
+            0,
+            0,
+            max_vis_cap,
+            max_ep_cap,
+        );
+    let dev_ds = dataset.device_dataset(device);
+    let [geom_rays, packed_patches] = crate::sampling_gpu::gather_patch_tables_device(
+        vis_batch.coords_tensor.clone(),
+        dev_ds.view_meta,
+        vis_batch.vis_prefix.clone(),
+        variance_tensor,
+        0,
+        0,
+        normal_den,
+        pixel_den,
+        n_patches,
+    );
+    let padded_pts = Field::padded_point_capacity(max_points, query);
+    let pt_cols = if scale_encoding { 4 } else { 3 };
+    let [unique_points, geometry] = crate::sampling_gpu::geometry_device_counts(
+        [
+            geom_rays,
+            endpoints,
+            descriptors,
+            crate::field::empty_2d(padded_pts, pt_cols, device),
+            crate::field::empty_2d(max_vis_cap, 27, device),
+            vis_batch.vis_prefix.clone(),
+        ],
+        max_points,
+        max_vis_cap,
+    );
+    DevicePreparedGeometryAsync {
+        unique_points,
+        geometry,
+        mapping,
+        reverse,
+        vis_prefix: vis_batch.vis_prefix.clone(),
+        packed_patches,
+        max_vis_cap,
+        max_ep_cap,
+    }
 }
 
 /// Upload compact endpoint descriptors instead of 18 expanded XYZs and 27

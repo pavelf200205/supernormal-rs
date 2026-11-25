@@ -47,6 +47,185 @@ pub fn bucket_capacity(n: usize) -> usize {
 }
 
 #[cube(launch)]
+fn build_march_rays_kernel(
+    coords: &Tensor<f32>,
+    view_meta: &Tensor<f32>,
+    rays: &mut Tensor<f32>,
+    step_size: f32,
+    max_steps_per_ray: u32,
+    occ_res: f32,
+    #[comptime] scale_encoding: bool,
+) {
+    let ray = ABSOLUTE_POS;
+    if ray >= coords.shape(0) {
+        terminate!();
+    }
+    let c_stride = coords.shape(1);
+    let c_idx = ray * c_stride;
+    let v = usize::cast_from(coords[c_idx]);
+    let x = coords[c_idx + 1];
+    let y = coords[c_idx + 2];
+    let jitter = coords[c_idx + 39];
+
+    let vm = v * 24;
+    let ox = view_meta[vm];
+    let oy = view_meta[vm + 1];
+    let oz = view_meta[vm + 2];
+    let plx = view_meta[vm + 3];
+    let ply = view_meta[vm + 4];
+    let plz = view_meta[vm + 5];
+    let ux = view_meta[vm + 6];
+    let uy = view_meta[vm + 7];
+    let uz = view_meta[vm + 8];
+    let vx = view_meta[vm + 9];
+    let vy = view_meta[vm + 10];
+    let vz = view_meta[vm + 11];
+    let k00 = view_meta[vm + 15];
+    let k01 = view_meta[vm + 16];
+    let k02 = view_meta[vm + 17];
+    let k10 = view_meta[vm + 18];
+    let k11 = view_meta[vm + 19];
+    let k12 = view_meta[vm + 20];
+    let k20 = view_meta[vm + 21];
+    let k21 = view_meta[vm + 22];
+    let k22 = view_meta[vm + 23];
+
+    let cx = k00 * x + k01 * y + k02;
+    let cy = k10 * x + k11 * y + k12;
+    let cz = k20 * x + k21 * y + k22;
+    let inv_len = 1.0_f32 / f32::sqrt(cx * cx + cy * cy + cz * cz);
+    let dx = (ux * cx + vx * cy + plx * cz) * inv_len;
+    let dy = (uy * cx + vy * cy + ply * cz) * inv_len;
+    let dz = (uz * cx + vz * cy + plz * cz) * inv_len;
+
+    let a = dx * dx + dy * dy + dz * dz;
+    let b = 2.0_f32 * (ox * dx + oy * dy + oz * dz);
+    let c = ox * ox + oy * oy + oz * oz - 1.0_f32;
+    let disc = b * b - 4.0_f32 * a * c;
+    let mut near = 0.0_f32;
+    let mut far = 0.0_f32;
+    let mut count_f = 0.0_f32;
+    let max_cap_f = f32::cast_from(max_steps_per_ray);
+    if disc > 0.0_f32 {
+        let s_disc = f32::sqrt(disc);
+        let inv_2a = 1.0_f32 / (2.0_f32 * a);
+        near = (-b - s_disc) * inv_2a + jitter * step_size;
+        far = (-b + s_disc) * inv_2a;
+        let raw_steps = f32::max(f32::ceil((far - near) / step_size), 0.0_f32);
+        count_f = f32::min(raw_steps, max_cap_f);
+    }
+    let offset_f = f32::cast_from(ray * usize::cast_from(max_steps_per_ray));
+    let r_stride = rays.shape(1);
+    let rb = ray * r_stride;
+    rays[rb] = ox;
+    rays[rb + 1] = oy;
+    rays[rb + 2] = oz;
+    rays[rb + 3] = dx;
+    rays[rb + 4] = dy;
+    rays[rb + 5] = dz;
+    rays[rb + 6] = near;
+    rays[rb + 7] = far;
+    rays[rb + 8] = step_size;
+    rays[rb + 9] = offset_f;
+    rays[rb + 10] = count_f;
+    rays[rb + 11] = occ_res;
+    if scale_encoding {
+        let center_dot = f32::abs(dx * plx + dy * ply + dz * plz);
+        let ang_pix = f32::sqrt(f32::abs(k00 * k11)) * center_dot;
+        let t_base_c = c_idx + 3 + 16;
+        let gnx = coords[t_base_c];
+        let gny = coords[t_base_c + 1];
+        let gnz = coords[t_base_c + 2];
+        let gmask = coords[t_base_c + 3];
+        let mut cos_view = 1.0_f32;
+        if gmask > 0.5_f32 {
+            cos_view = f32::clamp(-(dx * gnx + dy * gny + dz * gnz), 0.15_f32, 1.0_f32);
+        }
+        rays[rb + 12] = ang_pix / f32::sqrt(cos_view);
+    }
+}
+
+#[derive(Debug)]
+struct BuildMarchRaysOp {
+    desc: CustomOpIr,
+}
+impl Operation<FusionCubeRuntime> for BuildMarchRaysOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<CubeFusionHandle>,
+    ) -> Result<(), ExecutionError> {
+        let ([c, vm, r], [or]) = self.desc.as_fixed();
+        let [
+            ScalarIr::Float(step_size),
+            ScalarIr::UInt(max_steps_per_ray),
+            ScalarIr::Float(occ_res),
+        ] = self.desc.scalars.as_slice()
+        else {
+            panic!("invalid build_march_rays scalars")
+        };
+        let [c, vm, r] = [c, vm, r].map(|x| get_contig(handles, x));
+        let scale_encoding = r.meta.shape().dims::<2>()[1] == 13;
+        let client = c.client.clone();
+        let _timing = crate::diagnostics::start(&client, "sampling.BuildMarchRaysOp");
+        let n = c.meta.shape().dims::<2>()[0].max(1);
+        let dim = CubeDim::new(&client, n);
+        build_march_rays_kernel::launch(
+            &client,
+            cubecl::calculate_cube_count_elemwise(&client, n, dim),
+            dim,
+            c.into_tensor_arg(),
+            vm.into_tensor_arg(),
+            r.clone().into_tensor_arg(),
+            *step_size as f32,
+            *max_steps_per_ray as u32,
+            *occ_res as f32,
+            scale_encoding,
+        );
+        handles.register_float_tensor::<CubeBackend>(&or.id, r);
+        Ok(())
+    }
+}
+pub fn build_march_rays(
+    coords: burn::tensor::Tensor<2>,
+    view_meta: burn::tensor::Tensor<2>,
+    step_size: f32,
+    max_steps_per_ray: usize,
+    occ_res: usize,
+    scale_encoding: bool,
+) -> burn::tensor::Tensor<2> {
+    let n_rays = coords.dims()[0];
+    let ray_cols = if scale_encoding { 13 } else { 12 };
+    let device = coords.device();
+    let r_buf = crate::field::empty_2d(n_rays, ray_cols, &device);
+    let inputs = [coords, view_meta, r_buf]
+        .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
+    let client = inputs[0].client.clone();
+    let out = TensorIr::uninit(
+        client.create_empty_handle(),
+        inputs[2].shape.clone(),
+        inputs[2].dtype,
+    );
+    let desc = CustomOpIr::with_scalars(
+        "supernormal_build_march_rays",
+        &inputs.map(|t| t.into_ir()),
+        &[out],
+        vec![
+            ScalarIr::Float(step_size as f64),
+            ScalarIr::UInt(max_steps_per_ray as u64),
+            ScalarIr::Float(occ_res as f64),
+        ],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            BuildMarchRaysOp { desc },
+        )
+        .outputs();
+    burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>(out)
+}
+
+#[cube(launch)]
 fn march_kernel(
     rays: &Tensor<f32>,
     flags: &Tensor<f32>,
@@ -886,7 +1065,7 @@ pub fn occupancy_grid_points(
     seed: u32,
     device: &burn::tensor::Device,
 ) -> burn::tensor::Tensor<2> {
-    let p_buf = burn::tensor::Tensor::<2>::empty([padded_n, 3], device);
+    let p_buf = crate::field::empty_2d(padded_n, 3, device);
     let [p] = [p_buf].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = p.client.clone();
     let out = TensorIr::uninit(client.create_empty_handle(), p.shape.clone(), p.dtype);
@@ -1021,7 +1200,7 @@ pub fn occupancy_count(
     seed: u32,
 ) -> burn::tensor::Tensor<2> {
     let device = flags.device();
-    let c_buf = burn::tensor::Tensor::<2>::empty([num_blocks, 1], &device);
+    let c_buf = crate::field::empty_2d(num_blocks, 1, &device);
     let inputs = [flags, c_buf].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let out = TensorIr::uninit(
@@ -1103,8 +1282,8 @@ pub fn occupancy_compact_points(
 ) -> [burn::tensor::Tensor<2>; 2] {
     let device = flags.device();
     let id_cap = bucket_capacity(total_selected);
-    let id_buf = burn::tensor::Tensor::<2>::empty([id_cap, 1], &device);
-    let pt_buf = burn::tensor::Tensor::<2>::empty([padded_pts_cap, 3], &device);
+    let id_buf = crate::field::empty_2d(id_cap, 1, &device);
+    let pt_buf = crate::field::empty_2d(padded_pts_cap, 3, &device);
     let inputs = [flags, prefix, id_buf, pt_buf]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -1721,12 +1900,23 @@ fn parameter_gradients_impl(
 fn points_kernel(
     rays: &Tensor<f32>,
     endpoints: &Tensor<f32>,
+    vis_prefix: &Tensor<f32>,
     points: &mut Tensor<f32>,
     valid_points: u32,
     #[comptime] scale_encoding: bool,
+    #[comptime] device_counts: bool,
 ) {
     let id = ABSOLUTE_POS;
-    if id >= usize::cast_from(valid_points) {
+    let mut limit = usize::cast_from(valid_points);
+    if device_counts {
+        let max_ep = limit / 9usize;
+        let dev_ep = usize::min(
+            usize::cast_from(vis_prefix[vis_prefix.shape(0) * 2 - 1]),
+            max_ep,
+        );
+        limit = dev_ep * 9usize;
+    }
+    if id >= limit {
         terminate!();
     }
     let endpoint = id / 9;
@@ -1758,11 +1948,22 @@ fn geometry_kernel(
     rays: &Tensor<f32>,
     samples: &Tensor<f32>,
     points: &Tensor<f32>,
+    vis_prefix: &Tensor<f32>,
     geometry: &mut Tensor<f32>,
     valid_sample_pixels: u32,
+    #[comptime] device_counts: bool,
 ) {
     let id = ABSOLUTE_POS;
-    if id >= usize::cast_from(valid_sample_pixels) {
+    let mut limit = usize::cast_from(valid_sample_pixels);
+    if device_counts {
+        let max_vis = limit / 9usize;
+        let dev_vis = usize::min(
+            usize::cast_from(vis_prefix[(vis_prefix.shape(0) - 1) * 2]),
+            max_vis,
+        );
+        limit = dev_vis * 9usize;
+    }
+    if id >= limit {
         terminate!();
     }
     let sample = id / 9;
@@ -1814,14 +2015,18 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([r, e, s, p, g], [po, go]) = self.desc.as_fixed();
-        let [ScalarIr::UInt(valid_points), ScalarIr::UInt(valid_samples)] =
-            self.desc.scalars.as_slice()
+        let ([r, e, s, p, g, vp], [po, go]) = self.desc.as_fixed();
+        let [
+            ScalarIr::UInt(valid_points),
+            ScalarIr::UInt(valid_samples),
+            ScalarIr::UInt(device_counts),
+        ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid geometry scalars")
         };
-        let [r, e, s, p, g] = [r, e, s, p, g].map(|x| get_contig(handles, x));
+        let [r, e, s, p, g, vp] = [r, e, s, p, g, vp].map(|x| get_contig(handles, x));
         let scale_encoding = p.meta.shape().dims::<2>()[1] == 4;
+        let dev_counts = *device_counts != 0;
         let client = r.client.clone();
         let _timing = crate::diagnostics::start(&client, "geometry");
         let n_pts = (*valid_points as usize).max(1);
@@ -1832,9 +2037,11 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
             dim_pts,
             r.clone().into_tensor_arg(),
             e.into_tensor_arg(),
+            vp.clone().into_tensor_arg(),
             p.clone().into_tensor_arg(),
             *valid_points as u32,
             scale_encoding,
+            dev_counts,
         );
         let n_sp = ((*valid_samples as usize) * 9).max(1);
         let dim_sp = CubeDim::new(&client, n_sp);
@@ -1845,8 +2052,10 @@ impl Operation<FusionCubeRuntime> for GeometryOp {
             r.into_tensor_arg(),
             s.into_tensor_arg(),
             p.clone().into_tensor_arg(),
+            vp.into_tensor_arg(),
             g.clone().into_tensor_arg(),
             n_sp as u32,
+            dev_counts,
         );
         handles.register_float_tensor::<CubeBackend>(&po.id, p);
         handles.register_float_tensor::<CubeBackend>(&go.id, g);
@@ -1858,6 +2067,25 @@ pub fn geometry(
     inputs: [burn::tensor::Tensor<2>; 5],
     valid_points: usize,
     valid_samples: usize,
+) -> [burn::tensor::Tensor<2>; 2] {
+    let [r, e, s, p, g] = inputs;
+    let dummy_vp = r.clone();
+    geometry_impl([r, e, s, p, g, dummy_vp], valid_points, valid_samples, false)
+}
+
+pub fn geometry_device_counts(
+    inputs: [burn::tensor::Tensor<2>; 6],
+    max_points: usize,
+    max_samples: usize,
+) -> [burn::tensor::Tensor<2>; 2] {
+    geometry_impl(inputs, max_points, max_samples, true)
+}
+
+fn geometry_impl(
+    inputs: [burn::tensor::Tensor<2>; 6],
+    valid_points: usize,
+    valid_samples: usize,
+    device_counts: bool,
 ) -> [burn::tensor::Tensor<2>; 2] {
     let inputs = inputs.map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -1878,6 +2106,7 @@ pub fn geometry(
         vec![
             ScalarIr::UInt(valid_points as u64),
             ScalarIr::UInt(valid_samples as u64),
+            ScalarIr::UInt(device_counts as u64),
         ],
     );
     let outputs: [_; 2] = client
@@ -1890,14 +2119,16 @@ pub fn geometry(
     outputs.map(burn::tensor::Tensor::<2>::from_primitive::<GpuBackend>)
 }
 
-/// Build `geom_rays` `[n_patches, 39]` and `packed_patches` `[n_patches, 123]`
-/// in parallel across `n_patches * 9` threads on the GPU from compact `[n_patches, 39]`
-/// patch descriptors (`[v, x, y, 9 * (nx, ny, nz, mask)]`) and the `[num_views, 24]`
+/// Build `geom_rays` `[n_patches, 40]` and `packed_patches` `[n_patches, 123]`
+/// in parallel across `n_patches * 9` threads on the GPU from compact `[n_patches, 39|40]`
+/// patch descriptors (`[v, x, y, 9 * (nx, ny, nz, mask), ...]`) and the `[num_views, 24]`
 /// camera matrix table (`view_meta`), avoiding multi-gigabyte per-pixel GPU buffers.
 #[cube(launch)]
 fn gather_patch_tables_kernel(
     coords: &Tensor<f32>,
     view_meta: &Tensor<f32>,
+    vis_prefix: &Tensor<f32>,
+    variance: &Tensor<f32>,
     geom_rays: &mut Tensor<f32>,
     packed_patches: &mut Tensor<f32>,
     patch_start_u: u32,
@@ -1906,6 +2137,7 @@ fn gather_patch_tables_kernel(
     normal_den: f32,
     pixel_den: f32,
     sample_den: f32,
+    #[comptime] device_counts: bool,
 ) {
     let id = ABSOLUTE_POS;
     let n_patches = geom_rays.shape(0);
@@ -1916,7 +2148,8 @@ fn gather_patch_tables_kernel(
     let i = id % 9;
     let patch_start = usize::cast_from(patch_start_u);
 
-    let c_idx = (patch_start + p) * 39;
+    let c_stride = coords.shape(1);
+    let c_idx = (patch_start + p) * c_stride;
     let v = usize::cast_from(coords[c_idx]);
     let x = coords[c_idx + 1];
     let y = coords[c_idx + 2];
@@ -1954,12 +2187,19 @@ fn gather_patch_tables_kernel(
         geom_rays[gr + 1] = oy;
         geom_rays[gr + 2] = oz;
         let g_ray = patch_start + p;
+        let mut eff_inv = inv;
+        let mut eff_sample_den = sample_den;
+        if device_counts {
+            eff_inv = f32::clamp(f32::exp(variance[0] * 10.0_f32), 1e-6_f32, 1e6_f32);
+            let tot_vis = vis_prefix[(vis_prefix.shape(0) - 1) * 2];
+            eff_sample_den = f32::max(tot_vis * 9.0_f32, 1.0_f32);
+        }
         packed_patches[pb] = -(f32::cast_from(g_ray)) - 1.0_f32;
         packed_patches[pb + 1] = s_base;
-        packed_patches[pb + 2] = inv;
+        packed_patches[pb + 2] = eff_inv;
         packed_patches[pb + 3] = normal_den;
         packed_patches[pb + 4] = pixel_den;
-        packed_patches[pb + 5] = sample_den;
+        packed_patches[pb + 5] = eff_sample_den;
     }
 
     // Center ray (px = 1, py = 1 -> xx = x, yy = y) dot plane:
@@ -1978,11 +2218,10 @@ fn gather_patch_tables_kernel(
         let gny = coords[t_base_c + 1];
         let gnz = coords[t_base_c + 2];
         let gmask = coords[t_base_c + 3];
-        let cos_view = if gmask > 0.5_f32 {
-            f32::clamp(-(d4x * gnx + d4y * gny + d4z * gnz), 0.15_f32, 1.0_f32)
-        } else {
-            1.0_f32
-        };
+        let mut cos_view = 1.0_f32;
+        if gmask > 0.5_f32 {
+            cos_view = f32::clamp(-(d4x * gnx + d4y * gny + d4z * gnz), 0.15_f32, 1.0_f32);
+        }
         geom_rays[gr + 39] = ang_pix / f32::sqrt(cos_view);
     }
 
@@ -2043,7 +2282,7 @@ impl Operation<FusionCubeRuntime> for GatherPatchTablesOp {
         &self,
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
-        let ([c, vm, gr, pp], [ogr, opp]) = self.desc.as_fixed();
+        let ([c, vm, vp, var, gr, pp], [ogr, opp]) = self.desc.as_fixed();
         let [
             ScalarIr::UInt(patch_start),
             ScalarIr::Float(s_base),
@@ -2051,11 +2290,13 @@ impl Operation<FusionCubeRuntime> for GatherPatchTablesOp {
             ScalarIr::Float(normal_den),
             ScalarIr::Float(pixel_den),
             ScalarIr::Float(sample_den),
+            ScalarIr::UInt(device_counts),
         ] = self.desc.scalars.as_slice()
         else {
             panic!("invalid gather_patch_tables scalars")
         };
-        let [c, vm, gr, pp] = [c, vm, gr, pp].map(|x| get_contig(handles, x));
+        let [c, vm, vp, var, gr, pp] =
+            [c, vm, vp, var, gr, pp].map(|x| get_contig(handles, x));
         let client = c.client.clone();
         let _timing = crate::diagnostics::start(&client, "sampling.GatherPatchTablesOp");
         let n = gr.meta.shape().dims::<2>()[0] * 9;
@@ -2066,6 +2307,8 @@ impl Operation<FusionCubeRuntime> for GatherPatchTablesOp {
             dim,
             c.into_tensor_arg(),
             vm.into_tensor_arg(),
+            vp.into_tensor_arg(),
+            var.into_tensor_arg(),
             gr.clone().into_tensor_arg(),
             pp.clone().into_tensor_arg(),
             *patch_start as u32,
@@ -2074,6 +2317,7 @@ impl Operation<FusionCubeRuntime> for GatherPatchTablesOp {
             *normal_den as f32,
             *pixel_den as f32,
             *sample_den as f32,
+            *device_counts != 0,
         );
         handles.register_float_tensor::<CubeBackend>(&ogr.id, gr);
         handles.register_float_tensor::<CubeBackend>(&opp.id, pp);
@@ -2092,13 +2336,74 @@ pub fn gather_patch_tables(
     sample_den: f32,
     patch_count: usize,
 ) -> [burn::tensor::Tensor<2>; 2] {
+    let dummy_vp = coords.clone();
+    let dummy_var = coords.clone();
+    gather_patch_tables_impl(
+        coords,
+        view_meta,
+        dummy_vp,
+        dummy_var,
+        patch_start,
+        s_base,
+        inv,
+        normal_den,
+        pixel_den,
+        sample_den,
+        patch_count,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gather_patch_tables_device(
+    coords: burn::tensor::Tensor<2>,
+    view_meta: burn::tensor::Tensor<2>,
+    vis_prefix: burn::tensor::Tensor<2>,
+    variance: burn::tensor::Tensor<2>,
+    patch_start: usize,
+    s_base: usize,
+    normal_den: f32,
+    pixel_den: f32,
+    patch_count: usize,
+) -> [burn::tensor::Tensor<2>; 2] {
+    gather_patch_tables_impl(
+        coords,
+        view_meta,
+        vis_prefix,
+        variance,
+        patch_start,
+        s_base,
+        0.0,
+        normal_den,
+        pixel_den,
+        1.0,
+        patch_count,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gather_patch_tables_impl(
+    coords: burn::tensor::Tensor<2>,
+    view_meta: burn::tensor::Tensor<2>,
+    vis_prefix: burn::tensor::Tensor<2>,
+    variance: burn::tensor::Tensor<2>,
+    patch_start: usize,
+    s_base: usize,
+    inv: f32,
+    normal_den: f32,
+    pixel_den: f32,
+    sample_den: f32,
+    patch_count: usize,
+    device_counts: bool,
+) -> [burn::tensor::Tensor<2>; 2] {
     let device = coords.device();
     let gr_buf = crate::field::empty_2d(patch_count, 40, &device);
     let pp_buf = crate::field::empty_2d(patch_count, 123, &device);
-    let inputs = [coords, view_meta, gr_buf, pp_buf]
+    let inputs = [coords, view_meta, vis_prefix, variance, gr_buf, pp_buf]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
-    let outputs: Vec<_> = [2usize, 3usize]
+    let outputs: Vec<_> = [4usize, 5usize]
         .into_iter()
         .map(|i| {
             TensorIr::uninit(
@@ -2119,6 +2424,7 @@ pub fn gather_patch_tables(
             ScalarIr::Float(normal_den as f64),
             ScalarIr::Float(pixel_den as f64),
             ScalarIr::Float(sample_den as f64),
+            ScalarIr::UInt(device_counts as u64),
         ],
     );
     let result: [_; 2] = client
@@ -2197,7 +2503,7 @@ pub fn mesh_slab_points_batch(
     let n = slab_count * res * res;
     let inv = 1.0_f32 / (res - 1) as f32;
     let params = tensor(vec![res as f32, inv, z_start as f32], [3, 1], device);
-    let out_buf = burn::tensor::Tensor::<2>::empty([n, 3], device);
+    let out_buf = crate::field::empty_2d(n, 3, device);
     let inputs = [params, out_buf].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let out = TensorIr::uninit(
@@ -2232,6 +2538,8 @@ fn scan_2d_pairs_and_pack_kernel(
     prefix: &mut Tensor<f32>,
     meta: &mut Tensor<f32>,
     n_rows: u32,
+    cap0_u: u32,
+    cap1_u: u32,
     #[comptime] mode: u32,
 ) {
     let unit = usize::cast_from(UNIT_POS);
@@ -2280,15 +2588,46 @@ fn scan_2d_pairs_and_pack_kernel(
     } else {
         sh1[unit - 1usize]
     };
+    let raw_tot0 = sh0[255];
+    let raw_tot1 = sh1[255];
+    let cap0_f = f32::cast_from(cap0_u);
+    let cap1_f = f32::cast_from(cap1_u);
+    let mut local_fit0 = 0.0_f32;
+    let mut local_fit1 = 0.0_f32;
+    let mut b0 = base0;
+    let mut b1 = base1;
+    for i in start..end {
+        b0 += counts[i * 2];
+        b1 += counts[i * 2 + 1];
+        if b0 <= cap0_f && b1 <= cap1_f {
+            local_fit0 = b0;
+            local_fit1 = b1;
+        }
+    }
+    sync_cube();
+    sh0[unit] = local_fit0;
+    sh1[unit] = local_fit1;
+    sync_cube();
+    let mut stride = 128usize;
+    for _ in 0..8usize {
+        if unit < stride {
+            sh0[unit] = f32::max(sh0[unit], sh0[unit + stride]);
+            sh1[unit] = f32::max(sh1[unit], sh1[unit + stride]);
+        }
+        sync_cube();
+        stride = stride >> 1usize;
+    }
+    let max_fit0 = sh0[0];
+    let max_fit1 = sh1[0];
     for i in start..end {
         base0 += counts[i * 2];
         base1 += counts[i * 2 + 1];
-        prefix[i * 2] = base0;
-        prefix[i * 2 + 1] = base1;
+        prefix[i * 2] = f32::min(base0, max_fit0);
+        prefix[i * 2 + 1] = f32::min(base1, max_fit1);
     }
     if unit == 0usize {
-        meta[0] = sh0[255];
-        meta[1] = sh1[255];
+        meta[0] = raw_tot0;
+        meta[1] = raw_tot1;
         if mode == 1u32 {
             meta[2] = extra[0];
             meta[3] = extra[1];
@@ -2309,7 +2648,13 @@ impl Operation<FusionCubeRuntime> for Scan2dPairsOp {
         handles: &mut HandleContainer<CubeFusionHandle>,
     ) -> Result<(), ExecutionError> {
         let ([c, e, p, m], [op, om]) = self.desc.as_fixed();
-        let [ScalarIr::UInt(n_rows), ScalarIr::UInt(mode)] = self.desc.scalars.as_slice() else {
+        let [
+            ScalarIr::UInt(n_rows),
+            ScalarIr::UInt(mode),
+            ScalarIr::UInt(cap0),
+            ScalarIr::UInt(cap1),
+        ] = self.desc.scalars.as_slice()
+        else {
             panic!("invalid scan_2d_pairs scalars")
         };
         let [c, e, p, m] = [c, e, p, m].map(|x| get_contig(handles, x));
@@ -2324,6 +2669,8 @@ impl Operation<FusionCubeRuntime> for Scan2dPairsOp {
             p.clone().into_tensor_arg(),
             m.clone().into_tensor_arg(),
             *n_rows as u32,
+            *cap0 as u32,
+            *cap1 as u32,
             *mode as u32,
         );
         handles.register_float_tensor::<CubeBackend>(&op.id, p);
@@ -2337,6 +2684,16 @@ pub fn scan_2d_pairs_and_pack(
     n_rows: usize,
     mode: u32,
 ) -> [burn::tensor::Tensor<2>; 2] {
+    scan_2d_pairs_and_pack_bounded(counts, extra, n_rows, mode, (1 << 24) - 1, (1 << 24) - 1)
+}
+pub fn scan_2d_pairs_and_pack_bounded(
+    counts: burn::tensor::Tensor<2>,
+    extra: Option<burn::tensor::Tensor<2>>,
+    n_rows: usize,
+    mode: u32,
+    cap0: usize,
+    cap1: usize,
+) -> [burn::tensor::Tensor<2>; 2] {
     let device = counts.device();
     let meta_len = match mode {
         1 => 5,
@@ -2344,8 +2701,8 @@ pub fn scan_2d_pairs_and_pack(
         _ => 2,
     };
     let extra_t = extra.unwrap_or_else(|| counts.clone());
-    let prefix_buf = burn::tensor::Tensor::<2>::empty([n_rows, 2], &device);
-    let meta_buf = burn::tensor::Tensor::<2>::empty([meta_len, 1], &device);
+    let prefix_buf = crate::field::empty_2d(n_rows, 2, &device);
+    let meta_buf = crate::field::empty_2d(meta_len, 1, &device);
     let inputs = [counts, extra_t, prefix_buf, meta_buf]
         .map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
@@ -2363,7 +2720,12 @@ pub fn scan_2d_pairs_and_pack(
         "supernormal_scan_2d_pairs",
         &inputs.map(|t| t.into_ir()),
         &outputs,
-        vec![ScalarIr::UInt(n_rows as u64), ScalarIr::UInt(mode as u64)],
+        vec![
+            ScalarIr::UInt(n_rows as u64),
+            ScalarIr::UInt(mode as u64),
+            ScalarIr::UInt(cap0 as u64),
+            ScalarIr::UInt(cap1 as u64),
+        ],
     );
     let result: [_; 2] = client
         .register(
@@ -2445,7 +2807,7 @@ impl Operation<FusionCubeRuntime> for Scan1dOp {
 pub fn scan_1d(counts: burn::tensor::Tensor<2>) -> burn::tensor::Tensor<2> {
     let n_rows = counts.dims()[0];
     let device = counts.device();
-    let prefix_buf = burn::tensor::Tensor::<2>::empty([n_rows, 1], &device);
+    let prefix_buf = crate::field::empty_2d(n_rows, 1, &device);
     let inputs = [counts, prefix_buf].map(|t| t.inner().try_into_primitive::<GpuBackend>().unwrap());
     let client = inputs[0].client.clone();
     let out = TensorIr::uninit(
@@ -2547,7 +2909,7 @@ pub fn mesh_coarse_points(
     let c_res = nb + 1;
     let total = c_res * c_res * c_res;
     let inv_res_m1 = 1.0_f32 / (res - 1) as f32;
-    let p_buf = burn::tensor::Tensor::<2>::empty([total, 3], device);
+    let p_buf = crate::field::empty_2d(total, 3, device);
     let p = p_buf.inner().try_into_primitive::<GpuBackend>().unwrap();
     let client = p.client.clone();
     let out = TensorIr::uninit(client.create_empty_handle(), p.shape.clone(), p.dtype);

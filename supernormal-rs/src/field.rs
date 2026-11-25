@@ -843,6 +843,75 @@ impl Field {
         self.evaluate_device_tensor_valid(points, count, chunk)
     }
 
+    /// Evaluate center-ray endpoints `[padded_cap, 3|4]` using device-resident `count_prefix`
+    /// (`count_mode = 2`: `min(count_prefix[rows * 2 - 1], max_ep_cap)`), avoiding host count readback.
+    pub fn evaluate_device_tensor_prefix(
+        &self,
+        points: Tensor<2>,
+        max_ep_cap: usize,
+        count_prefix: Tensor<2>,
+        chunk: usize,
+    ) -> Tensor<2> {
+        let dims = points.dims();
+        let total_rows = dims[0];
+        let pt_cols = dims[1];
+        let weights = self.packed_mlp_weights();
+        let (tables, metadata) = self.packed_tables();
+        let active = self.active.min(14);
+        let hashmap_size = self.hashmap_size();
+        let mut outputs: Vec<Tensor<2>> = (0..max_ep_cap.max(1))
+            .step_by(chunk)
+            .map(|start| {
+                let n = (max_ep_cap.max(1) - start).min(chunk);
+                let padded_n = Self::static_bucket_size(n, chunk);
+                let xyz = if start == 0 && total_rows == padded_n {
+                    points.clone()
+                } else if start + padded_n <= total_rows {
+                    points.clone().slice([start..start + padded_n, 0..pt_cols])
+                } else {
+                    let pts = points.clone().slice([start..start + n, 0..pt_cols]);
+                    if padded_n == n {
+                        pts
+                    } else {
+                        Tensor::cat(
+                            vec![pts, empty_2d(padded_n - n, pt_cols, &self.device)],
+                            0,
+                        )
+                    }
+                };
+                let [y, _, _] = crate::kernels::fused_field_device_count(
+                    [
+                        xyz,
+                        tables.clone(),
+                        metadata.clone(),
+                        weights.clone(),
+                        count_prefix.clone(),
+                    ],
+                    n,
+                    start,
+                    max_ep_cap,
+                    2,
+                    active,
+                    false,
+                    false,
+                    self.local_hash,
+                    self.corner_parallel,
+                    self.point_tiles,
+                    self.subgroup_reduce,
+                    self.selective_forward_weights,
+                    hashmap_size,
+                    self.scale_cutoff,
+                );
+                y
+            })
+            .collect();
+        if outputs.len() == 1 {
+            outputs.pop().unwrap()
+        } else {
+            Tensor::cat(outputs, 0)
+        }
+    }
+
     pub fn evaluate(&self, points: &[[f32; 3]], chunk: usize) -> Result<Vec<f32>> {
         Self::read_outputs(self.enqueue_evaluation(points, chunk))
     }
@@ -896,6 +965,36 @@ impl Field {
     ) -> [Tensor<2>; 2] {
         let rays = ranges.dims()[0];
         let sdf = self.evaluate_device_tensor_valid(unique_pts, valid_ep_count, chunk);
+        crate::kernels::visibility_ext(
+            [
+                sdf,
+                pairs,
+                ranges,
+                self.p("variance").without_autodiff(),
+                empty_2d(rays + 1, 2, &self.device),
+                empty_2d(rays.max(1), 1, &self.device),
+            ],
+            self.reuse_endpoints,
+            self.front_prune,
+        )
+    }
+
+    /// Fully asynchronous visibility pass reading active endpoint count from `march_prefix` on GPU.
+    pub fn visibility_device_async(
+        &self,
+        unique_pts: Tensor<2>,
+        max_ep_cap: usize,
+        march_prefix: Tensor<2>,
+        pairs: Tensor<2>,
+        ranges: Tensor<2>,
+        chunk: usize,
+    ) -> [Tensor<2>; 2] {
+        let rays = ranges.dims()[0];
+        let sdf = if self.fused_field {
+            self.evaluate_device_tensor_prefix(unique_pts, max_ep_cap, march_prefix, chunk)
+        } else {
+            self.evaluate_device_tensor_valid(unique_pts, max_ep_cap, chunk)
+        };
         crate::kernels::visibility_ext(
             [
                 sdf,
@@ -1228,6 +1327,82 @@ impl Field {
         self.enqueue_cached_inputs(inputs)
     }
 
+    /// Enqueue cached 3x3 stencil forward evaluation driven by device-resident `vis_prefix`
+    /// (`count_mode = 3`: `min(vis_prefix[rows * 2 - 1], max_ep_cap) * 9`) using feature-only
+    /// retention (`cache_preactivation = false`) so backward replays `h` from shared memory.
+    pub fn enqueue_cached_device_prefix(
+        &self,
+        points: Tensor<2>,
+        max_ep_cap: usize,
+        vis_prefix: Tensor<2>,
+        chunk: usize,
+    ) -> PendingEvaluation {
+        let max_points = (max_ep_cap * 9).max(1);
+        let dims = points.dims();
+        let total_rows = dims[0];
+        let pt_cols = dims[1];
+        let weights = self.packed_mlp_weights();
+        let (tables, metadata) = self.packed_tables();
+        let active = self.active.min(14);
+        let hashmap_size = self.hashmap_size();
+        let mut chunks = Vec::new();
+        let mut pending_outputs = Vec::new();
+        for start in (0..max_points).step_by(chunk) {
+            let n = (max_points - start).min(chunk);
+            let padded_n = Self::static_bucket_size(n, chunk);
+            let pts_tensor = if start == 0 && total_rows == padded_n {
+                points.clone()
+            } else if start + padded_n <= total_rows {
+                points.clone().slice([start..start + padded_n, 0..pt_cols])
+            } else {
+                let sub = points.clone().slice([start..start + n, 0..pt_cols]);
+                if padded_n == n {
+                    sub
+                } else {
+                    Tensor::cat(
+                        vec![sub, empty_2d(padded_n - n, pt_cols, &self.device)],
+                        0,
+                    )
+                }
+            };
+            let [y, feat, _] = crate::kernels::fused_field_device_count(
+                [
+                    pts_tensor.clone(),
+                    tables.clone(),
+                    metadata.clone(),
+                    weights.clone(),
+                    vis_prefix.clone(),
+                ],
+                n,
+                start,
+                max_ep_cap,
+                3,
+                active,
+                true,
+                false,
+                self.local_hash,
+                self.corner_parallel,
+                self.point_tiles,
+                self.subgroup_reduce,
+                self.selective_forward_weights,
+                hashmap_size,
+                self.scale_cutoff,
+            );
+            pending_outputs.push((n, y));
+            chunks.push(FeatureChunk {
+                feat: Some(feat),
+                preactivation: None,
+                pts_tensor,
+                point_count: n,
+                padded_count: padded_n,
+            });
+        }
+        PendingEvaluation {
+            outputs: pending_outputs,
+            cache: chunks,
+        }
+    }
+
     fn enqueue_cached_inputs(
         &self,
         inputs: impl Iterator<Item = (usize, Tensor<2>)>,
@@ -1416,6 +1591,99 @@ impl Field {
         accumulated: &mut Gradients,
     ) {
         self.accumulate_gradients_device_impl(cached, adjoints, accumulated, false);
+    }
+
+    /// Fused backward + parameter gradient accumulation driven on-device by `vis_prefix`
+    /// (`device_counts = true`, passing `vis_prefix` in the unused `pre` slot since
+    /// `replay_features = true` rebuilds `h` in registers from `shared_feat`).
+    pub fn accumulate_training_gradients_device_prefix(
+        &self,
+        cached: Vec<FeatureChunk>,
+        adjoints: Tensor<2>,
+        vis_prefix: Tensor<2>,
+        max_ep_cap: usize,
+        accumulated: &mut Gradients,
+    ) {
+        if cached.is_empty() {
+            return;
+        }
+        let active_levels = self.active.min(14);
+        let (_, metadata) = self.packed_tables();
+        if !accumulated.params.contains_key("encoding.packed") {
+            let total_entries = *self.level_offsets.last().unwrap();
+            let grad_buf = self
+                .persistent_table_grad
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| zeros_2d(total_entries, 2, &self.device));
+            accumulated
+                .params
+                .insert("encoding.packed".into(), grad_buf);
+        }
+        let weights = self
+            .packed_mlp
+            .borrow()
+            .as_ref()
+            .expect("cached forward packs weights")
+            .clone();
+        let hashmap_size = self.hashmap_size();
+        let mut offset = 0usize;
+        let mut fused_partials: Option<(Tensor<2>, Tensor<2>)> = None;
+
+        for chunk in cached {
+            let n = chunk.point_count;
+            let feat = chunk.feat.expect("async cached forward retains features");
+            let table_grad = accumulated.params.remove("encoding.packed").unwrap();
+            let (dw0p, dw1p, accumulate) = match fused_partials.take() {
+                Some((p0, p1)) => (p0, p1, true),
+                None => (
+                    empty_2d(448, 2048, &self.device),
+                    empty_2d(448, 64, &self.device),
+                    false,
+                ),
+            };
+            let [updated, next_dw0p, next_dw1p] = crate::kernels::field_backward_fused_ext(
+                [
+                    vis_prefix.clone(),
+                    feat,
+                    adjoints.clone(),
+                    weights.clone(),
+                    metadata.clone(),
+                    table_grad,
+                    dw0p,
+                    dw1p,
+                ],
+                n,
+                max_ep_cap,
+                true,
+                active_levels,
+                self.local_hash,
+                self.aggregate_hash,
+                self.aggregation_levels,
+                true,
+                offset,
+                self.selective_backward_weights,
+                accumulate,
+                self.active_parameter_columns,
+                hashmap_size,
+                self.scale_cutoff,
+            );
+            accumulated.params.insert("encoding.packed".into(), updated);
+            fused_partials = Some((next_dw0p, next_dw1p));
+            offset += n;
+        }
+
+        if let Some((dw0p, dw1p)) = fused_partials {
+            let [dw0_f, db0_f, dw1_f] = crate::kernels::reduce_mlp_partials(dw0p, dw1p);
+            accumulated.raw_mlp = Some(match accumulated.raw_mlp.take() {
+                Some((a0, ab0, a1)) => (
+                    (a0 + dw0_f).without_autodiff(),
+                    (ab0 + db0_f).without_autodiff(),
+                    (a1 + dw1_f).without_autodiff(),
+                ),
+                None => (dw0_f, db0_f, dw1_f),
+            });
+        }
     }
 
     fn accumulate_gradients_device_impl(
@@ -2090,9 +2358,11 @@ impl Field {
             let (pred_t, cached) = pending.into_device();
             let adj = ((pred_t - target_t).clamp(-0.5, 0.5) * (2.0 / n_pts as f32))
                 .without_autodiff();
+            let db1 = adj.clone().sum_dim(0);
+            let stats = Tensor::cat(vec![zeros_2d(1, 4, &self.device), db1], 1);
             let mut grads = Gradients::default();
-            self.accumulate_gradients_device(cached, adj, &mut grads);
-            self.apply_gradients_packed(grads, 5e-3);
+            self.accumulate_training_gradients_device(cached, adj, &mut grads);
+            self.apply_gradients_packed_with_stats(grads, Some(&stats), 5e-3);
         }
 
         self.reset_optimizer_state();

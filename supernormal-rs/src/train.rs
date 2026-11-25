@@ -425,6 +425,19 @@ struct DeferredStepMetric {
     stats: burn::tensor::Tensor<2>,
 }
 
+struct AsyncStepRecord {
+    step: usize,
+    active: usize,
+    report: bool,
+    cap_m: usize,
+    cap_me: usize,
+    cap_v: usize,
+    cap_ve: usize,
+    march_meta: burn::tensor::Tensor<2>,
+    vis_meta: burn::tensor::Tensor<2>,
+    stats: burn::tensor::Tensor<2>,
+}
+
 pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     let command_clock = std::time::Instant::now();
     let mut checkpoint_seconds = 0.0f64;
@@ -598,6 +611,43 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     let mut first = true;
     let mut deferred_metric: Option<DeferredStepMetric> = None;
 
+    let group_size_init = if args.pipeline_patches == 0 {
+        microbatch
+    } else {
+        microbatch.min(args.pipeline_patches)
+    };
+    let use_async_pipeline = use_gpu_patch_gather
+        && group_size_init >= args.batch
+        && args.batch <= 4096
+        && !args.sync_loss
+        && !args.profile_stages
+        && !args.diagnostics
+        && field.fused_field
+        && field.fused_backward_params
+        && field.tiled_gradients
+        && field.corner_parallel
+        && !field.recompute_parameter_gradients
+        && field.wide_gradient_tiles
+        && field.register_gradient_tiles
+        && !field.cross_corners
+        && field.fused_feature_replay
+        && field.feature_only_cache
+        && field.direct_adjoint_views
+        && field.fused_mlp_packing;
+
+    let sync_window = args.log_every.clamp(1, 16);
+    let mut hwm_calibrated = false;
+    let mut peak_m = 0.0_f64;
+    let mut peak_me = 0.0_f64;
+    let mut peak_v = 0.0_f64;
+    let mut peak_ve = 0.0_f64;
+    let mut hwm_marched = (args.batch * 64).min(262_144);
+    let mut hwm_march_ep = hwm_marched + args.batch;
+    let mut hwm_vis = (args.batch * 32).min(131_072);
+    let mut hwm_vis_ep = hwm_vis + args.batch;
+    let mut async_window: Vec<AsyncStepRecord> = Vec::with_capacity(sync_window);
+    let mut window_clock = std::time::Instant::now();
+
     let flush_deferred = |dm: DeferredStepMetric,
                           loss_override: Option<Loss>,
                           progress: &mut crate::progress::TrainingProgress,
@@ -633,6 +683,282 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     };
 
     while field.step < final_step {
+        if use_async_pipeline {
+            if async_window.is_empty() {
+                window_clock = std::time::Instant::now();
+            }
+            let step = field.step;
+            if (first && !restored_state) || step % 8 == 0 {
+                occ.update(
+                    &field,
+                    if first && !restored_state { 0 } else { step },
+                    args.query,
+                    &mut rng,
+                )?;
+            }
+            first = false;
+            field.active = (step / args.increase_bandwidth_every + 1).min(14);
+            let (coords_tensor, normal_den) =
+                dataset.random_patch_coords_tensor(args.batch, &mut rng, &field.device);
+            let total_patches = args.batch;
+            let pixel_den = (total_patches * 9) as f32;
+            let log_start = args.start_step_size.log10();
+            let log_end = args.end_step_size.log10();
+            let step_size =
+                10f32.powf(log_start + (log_end - log_start) * (step as f32 / args.end_iter as f32));
+
+            let (vis_batch, march_meta, vis_meta) = render::march_and_filter_device_async(
+                &field,
+                &dataset,
+                coords_tensor,
+                &mut occ,
+                step_size,
+                args.query,
+                hwm_marched,
+                hwm_march_ep,
+                hwm_vis,
+                hwm_vis_ep,
+            )?;
+            let cap_m = crate::sampling_gpu::bucket_capacity(hwm_marched.max(1));
+            let cap_me = Field::padded_point_capacity(hwm_march_ep.max(1), args.query);
+            let cap_v = vis_batch.max_vis_cap;
+            let cap_ve = vis_batch.max_ep_cap;
+
+            let prep = render::prepare_geometry_device_async(
+                &dataset,
+                &vis_batch,
+                total_patches,
+                args.query,
+                field.p("variance").without_autodiff(),
+                normal_den,
+                pixel_den,
+                field.scale_encoding,
+                &field.device,
+            );
+            let pending = field.enqueue_cached_device_prefix(
+                prep.unique_points,
+                prep.max_ep_cap,
+                prep.vis_prefix.clone(),
+                args.query,
+            );
+            let (sdf, cache) = pending.into_device();
+            let (adjoints, stats) = render::composite_device_tables_async(
+                total_patches,
+                prep.max_vis_cap,
+                prep.max_ep_cap,
+                prep.vis_prefix.clone(),
+                prep.packed_patches,
+                prep.geometry,
+                prep.mapping,
+                prep.reverse,
+                sdf,
+                !args.legacy_composite_scratch,
+                !args.legacy_composite_cache,
+                !args.no_endpoint_reuse,
+            );
+            let mut gradients = crate::field::Gradients::default();
+            field.accumulate_training_gradients_device_prefix(
+                cache,
+                adjoints,
+                prep.vis_prefix,
+                prep.max_ep_cap,
+                &mut gradients,
+            );
+
+            let factor = if step < 500 {
+                step as f64 / 500.
+            } else {
+                let prog = (step - 500) as f64 / (args.end_iter - 500) as f64;
+                ((prog * std::f64::consts::PI).cos() + 1.) * 0.5 * 0.95 + 0.05
+            };
+            field.apply_gradients_packed_with_stats(gradients, Some(&stats), args.lr * factor);
+            field.step += 1;
+
+            let report = field.step % args.log_every == 0 || field.step == final_step;
+            let will_checkpoint =
+                args.save_freq > 0 && field.step % args.save_freq == 0 || field.step == final_step;
+            let will_mesh = args.mesh_freq > 0 && field.step % args.mesh_freq == 0;
+            let will_cleanup = field.step == 1000;
+            let will_trim = args.trim_interval > 0 && field.step % args.trim_interval == 0;
+
+            async_window.push(AsyncStepRecord {
+                step: field.step,
+                active: field.active,
+                report,
+                cap_m,
+                cap_me,
+                cap_v,
+                cap_ve,
+                march_meta,
+                vis_meta,
+                stats,
+            });
+
+            let sync_now = !hwm_calibrated
+                || async_window.len() >= sync_window
+                || will_checkpoint
+                || will_mesh
+                || will_cleanup
+                || will_trim
+                || field.step == final_step;
+
+            if !sync_now {
+                field
+                    .device
+                    .flush()
+                    .map_err(|e| anyhow::anyhow!("GPU submission failed: {e:?}"))?;
+                continue;
+            }
+
+            let win_len = async_window.len();
+            let mut packets = Vec::with_capacity(sync_window * 3);
+            for rec in &async_window {
+                packets.push(rec.march_meta.clone());
+                packets.push(rec.vis_meta.clone());
+                packets.push(rec.stats.clone().slice([0..1, 0..3]).reshape([3, 1]));
+            }
+            if let Some(last) = async_window.last() {
+                let tail_s = last.stats.clone().slice([0..1, 0..3]).reshape([3, 1]);
+                for _ in win_len..sync_window {
+                    packets.push(last.march_meta.clone());
+                    packets.push(last.vis_meta.clone());
+                    packets.push(tail_s.clone());
+                }
+            }
+            let flat = burn::tensor::Tensor::cat(packets, 0).try_into_vec_as::<f32>()?;
+            let win_secs = window_clock.elapsed().as_secs_f64();
+            let per_step_secs = win_secs / (win_len as f64);
+
+            let mut max_m = 0usize;
+            let mut max_me = 0usize;
+            let mut max_v = 0usize;
+            let mut max_ve = 0usize;
+            let mut hit_clamp = false;
+
+            for (idx, rec) in async_window.drain(..).enumerate() {
+                let b = idx * 8;
+                let raw_m = flat[b] as usize;
+                let raw_me = flat[b + 1] as usize;
+                let raw_v = flat[b + 2] as usize;
+                let raw_ve = flat[b + 3] as usize;
+                field.variance_host = flat[b + 4];
+                if raw_v == 0 {
+                    anyhow::bail!(
+                        "empty occupancy batch at step {}; checkpoint/config requires investigation",
+                        rec.step - 1
+                    );
+                }
+                max_m = max_m.max(raw_m);
+                max_me = max_me.max(raw_me);
+                max_v = max_v.max(raw_v);
+                max_ve = max_ve.max(raw_ve);
+                if raw_m * 100 >= rec.cap_m * 92
+                    || raw_me * 100 >= rec.cap_me * 92
+                    || raw_v * 100 >= rec.cap_v * 92
+                    || raw_ve * 100 >= rec.cap_ve * 92
+                {
+                    hit_clamp = true;
+                }
+                let loss = Loss {
+                    normal: flat[b + 5] as f64,
+                    mask: flat[b + 6] as f64,
+                    eikonal: flat[b + 7] as f64,
+                };
+                progress.update(rec.step, per_step_secs, loss.total(), rec.report);
+                writeln!(
+                    metrics,
+                    "{},{},{},{},{},{},{},{}",
+                    rec.step,
+                    loss.normal,
+                    loss.mask,
+                    loss.eikonal,
+                    loss.total(),
+                    raw_v.min(rec.cap_v),
+                    per_step_secs,
+                    rec.active
+                )?;
+                if rec.report {
+                    metrics.flush()?;
+                }
+            }
+
+            if !hwm_calibrated {
+                peak_m = max_m as f64;
+                peak_me = max_me as f64;
+                peak_v = max_v as f64;
+                peak_ve = max_ve as f64;
+                hwm_calibrated = true;
+            } else {
+                peak_m = (peak_m * 0.985).max(max_m as f64);
+                peak_me = (peak_me * 0.985).max(max_me as f64);
+                peak_v = (peak_v * 0.985).max(max_v as f64);
+                peak_ve = (peak_ve * 0.985).max(max_ve as f64);
+                if hit_clamp {
+                    peak_m = peak_m.max((max_m as f64) * 1.35);
+                    peak_me = peak_me.max((max_me as f64) * 1.35);
+                    peak_v = peak_v.max((max_v as f64) * 1.35);
+                    peak_ve = peak_ve.max((max_ve as f64) * 1.35);
+                }
+            }
+            let max_f32_int = (1usize << 24) - 1;
+            hwm_marched = (((peak_m * 1.35) as usize) + 2048).min(max_f32_int);
+            hwm_march_ep = (((peak_me * 1.35) as usize) + 2048).min(max_f32_int);
+            hwm_vis = (((peak_v * 1.35) as usize) + 2048).min(max_f32_int / 18);
+            hwm_vis_ep = (((peak_ve * 1.35) as usize) + 2048).min(max_f32_int / 9);
+
+            if will_cleanup {
+                let _ = field.device.sync();
+                field.device.memory_cleanup();
+            } else if will_trim {
+                field.trim_memory();
+            }
+
+            if will_checkpoint {
+                let checkpoint_clock = std::time::Instant::now();
+                progress.clear();
+                metrics.flush()?;
+                let dest = args.out.join(format!("checkpoint_{:06}", field.step));
+                eprintln!("Saving checkpoint {}", dest.display());
+                let temp = args
+                    .out
+                    .join(format!("checkpoint_{:06}.partial", field.step));
+                field.save(&temp)?;
+                occ.sync_values()?;
+                let state = State {
+                    rng: rng.clone(),
+                    occupancy: Occupancy {
+                        resolution: occ.resolution,
+                        values: occ.values.clone(),
+                        flags: occ.flags.clone(),
+                        device_values: None,
+                        device_flags: None,
+                        cpu_update: false,
+                    },
+                    args: args.clone(),
+                };
+                std::fs::write(temp.join("training.json"), serde_json::to_vec(&state)?)?;
+                std::fs::rename(temp, dest)?;
+                checkpoint_seconds += checkpoint_clock.elapsed().as_secs_f64();
+            }
+            if will_mesh {
+                let mesh_clock = std::time::Instant::now();
+                progress.clear();
+                crate::mesh::extract_with_dataset(
+                    &field,
+                    Some(&dataset),
+                    &args.out.join(format!("mesh_{:06}.ply", field.step)),
+                    args.mesh_resolution,
+                    args.query,
+                    dataset.scale,
+                    dataset.offset,
+                )?;
+                let _ = field.device.sync();
+                field.device.memory_cleanup();
+                mesh_seconds += mesh_clock.elapsed().as_secs_f64();
+            }
+            continue;
+        }
+
         let started = std::time::Instant::now();
         let step = field.step;
         if (first && !restored_state) || step % 8 == 0 {

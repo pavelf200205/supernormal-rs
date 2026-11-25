@@ -293,6 +293,53 @@ impl Dataset {
         (coords, mask_sum + 1e-5)
     }
 
+    /// Sample `count` random patches + ray jitter and upload a single `[count, 40]`
+    /// descriptor tensor (`[v, x, y, 9 * (nx, ny, nz, mask), jitter]`) to `device`,
+    /// driving both GPU ray-sphere marching and 3x3 patch table construction.
+    pub fn random_patch_coords_tensor(
+        &self,
+        count: usize,
+        rng: &mut impl Rng,
+        device: &Device,
+    ) -> (Tensor<2>, f32) {
+        let mut draws = Vec::with_capacity(count);
+        let mut mask_sum = 0.0_f32;
+        for _ in 0..count {
+            let v = self.sample_view_index(rng);
+            let view = &self.views[v];
+            let x = rng.random_range(1..view.width - 2);
+            let y = rng.random_range(1..view.height - 2);
+            let jitter = rng.random::<f32>();
+            mask_sum += view.patch_mask_sums[y * view.width + x];
+            draws.push((v, x, y, jitter));
+        }
+        let mut flat = vec![0.0_f32; count * 40];
+        let views = &self.views;
+        flat.par_chunks_exact_mut(40)
+            .zip(draws.par_iter())
+            .for_each(|(dst, &(v, x, y, jitter))| {
+                let view = &views[v];
+                dst[0] = v as f32;
+                dst[1] = x as f32;
+                dst[2] = y as f32;
+                let mut k = 3usize;
+                for py in 0..3 {
+                    let row_off = (y + py - 1) * view.width;
+                    for px in 0..3 {
+                        let idx = row_off + (x + px - 1);
+                        let n = view.normals[idx];
+                        dst[k] = n[0].to_f32();
+                        dst[k + 1] = n[1].to_f32();
+                        dst[k + 2] = n[2].to_f32();
+                        dst[k + 3] = if view.mask[idx] { 1.0_f32 } else { 0.0_f32 };
+                        k += 4;
+                    }
+                }
+                dst[39] = jitter;
+            });
+        (crate::field::tensor(flat, [count, 40], device), mask_sum + 1e-5)
+    }
+
     pub fn random_patches(&self, count: usize, rng: &mut impl Rng) -> Vec<Patch> {
         // Draw random coordinates sequentially to preserve exact deterministic RNG state,
         // then gather precomputed patch ray bases and 3x3 inversions in parallel.
