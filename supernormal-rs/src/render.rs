@@ -35,6 +35,22 @@ impl Occupancy {
         }
     }
 
+    pub fn init_from_hull_sdf(&mut self, hull_sdf: &[f32]) {
+        assert_eq!(hull_sdf.len(), self.values.len());
+        let mut sum = 0.0_f64;
+        for (v, &d) in self.values.iter_mut().zip(hull_sdf) {
+            let density = 1.0_f32 / (1.0_f32 + (80.0_f32 * d).exp());
+            *v = density;
+            sum += density as f64;
+        }
+        let threshold = ((sum / self.values.len() as f64) as f32).min(0.1);
+        for (f, &v) in self.flags.iter_mut().zip(&self.values) {
+            *f = v > threshold;
+        }
+        self.device_values = None;
+        self.device_flags = None;
+    }
+
     pub fn sync_values(&mut self) -> Result<()> {
         if let Some(values) = &self.device_values {
             self.values = values.clone().try_into_vec_as::<f32>()?;
@@ -238,7 +254,7 @@ pub struct Sample {
 /// entirely on the GPU without downloading or re-uploading sample arrays.
 pub struct DeviceVisibleBatch {
     pub marched: burn::tensor::Tensor<2>,
-    pub march_prefix: burn::tensor::Tensor<2>,
+    pub vis_m_begin: burn::tensor::Tensor<2>,
     pub vis_prefix: burn::tensor::Tensor<2>,
     pub vis_prefix_host: Vec<usize>,
     pub vis_ep_prefix_host: Vec<usize>,
@@ -1335,7 +1351,6 @@ pub fn composite_device(
     reuse_endpoints: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use crate::field::tensor;
-    use burn::tensor::Tensor;
     let device = sdf.device();
     let n = sdf.dims()[0];
     assert!(
@@ -1394,10 +1409,10 @@ pub fn composite_device(
             geometry,
             tensor(mapping, [count, 18], &device),
             tensor(packed, [patches.len(), 123], &device),
-            Tensor::empty([1, 2], &device),
-            Tensor::empty([vis_cap, if compact_cache { 63 } else { 90 }], &device),
-            Tensor::empty([n, 1], &device),
-            Tensor::empty([patches.len() * 9, 5], &device),
+            crate::field::empty_2d(1, 2, &device),
+            crate::field::empty_2d(vis_cap, if compact_cache { 63 } else { 90 }, &device),
+            crate::field::empty_2d(n, 1, &device),
+            crate::field::empty_2d(patches.len() * 9, 5, &device),
             tensor(reverse, [n, 2], &device),
         ],
         n,
@@ -1434,7 +1449,6 @@ pub fn composite_device_tables(
     reuse_endpoints: bool,
 ) -> (burn::tensor::Tensor<2>, burn::tensor::Tensor<2>) {
     use crate::field::tensor;
-    use burn::tensor::Tensor;
     let device = sdf.device();
     let n = sdf.dims()[0];
     assert!(
@@ -1477,9 +1491,9 @@ pub fn composite_device_tables(
             mapping,
             patches_tensor,
             vis_prefix,
-            Tensor::empty([vis_cap, if compact_cache { 63 } else { 90 }], &device),
-            Tensor::empty([n, 1], &device),
-            Tensor::empty([patch_count * 9, 5], &device),
+            crate::field::empty_2d(vis_cap, if compact_cache { 63 } else { 90 }, &device),
+            crate::field::empty_2d(n, 1, &device),
+            crate::field::empty_2d(patch_count * 9, 5, &device),
             reverse,
         ],
         n,
@@ -1503,7 +1517,6 @@ pub fn march_device(
     device: &burn::tensor::Device,
 ) -> Result<Vec<Sample>> {
     use crate::field::tensor;
-    use burn::tensor::Tensor;
     let mut rays = Vec::with_capacity(patches.len() * 12);
     let mut capacity = 0usize;
     for patch in patches {
@@ -1560,8 +1573,8 @@ pub fn march_device(
     let [samples, counts] = crate::sampling_gpu::march([
         rays.clone(),
         flags,
-        Tensor::empty([sample_cap, 2], device),
-        Tensor::empty([patches.len(), 1], device),
+        crate::field::empty_2d(sample_cap, 2, device),
+        crate::field::empty_2d(patches.len(), 1, device),
     ]);
     let prefix = counts.cumsum(0);
     let total = prefix
@@ -1572,8 +1585,12 @@ pub fn march_device(
     if total == 0 {
         return Ok(Vec::new());
     }
-    let [packed] =
-        crate::sampling_gpu::compact([rays, samples, prefix, Tensor::empty([total, 3], device)]);
+    let [packed] = crate::sampling_gpu::compact([
+        rays,
+        samples,
+        prefix,
+        crate::field::empty_2d(total, 3, device),
+    ]);
     let packed = packed.try_into_vec_as::<f32>()?;
     Ok(packed
         .chunks_exact(3)
@@ -1605,14 +1622,17 @@ pub fn march_and_filter_device(
     let march_started = std::time::Instant::now();
     let device = &field.device;
     let n_patches = coords.map(|c| c.len()).unwrap_or_else(|| patches.len());
-    let mut rays = Vec::with_capacity(n_patches * 12);
+    let scale_enc = field.scale_encoding;
+    let ray_cols = if scale_enc { 13 } else { 12 };
+    let mut rays = Vec::with_capacity(n_patches * ray_cols);
     let mut capacity = 0usize;
     let r_f32 = occ.resolution as f32;
     if let Some(coord_slice) = coords {
         for &(v, x, y) in coord_slice {
             let view = &dataset.views[v];
             let o: [f32; 3] = view.origin.into();
-            let d = view.cached_dirs[y * view.width + x];
+            let idx = y * view.width + x;
+            let d = view.cached_dirs[idx];
             let a = dot(d, d);
             let b = 2. * dot(o, d);
             let c = dot(o, o) - 1.;
@@ -1633,6 +1653,20 @@ pub fn march_and_filter_device(
             rays.extend(o);
             rays.extend(d);
             rays.extend([near, far, step_size, capacity as f32, count as f32, r_f32]);
+            if scale_enc {
+                let plane = view.rotation.column(2);
+                let center_dot = (d[0] * plane[0] + d[1] * plane[1] + d[2] * plane[2]).abs();
+                let ang_pix =
+                    (view.inv_k[(0, 0)].abs() * view.inv_k[(1, 1)].abs()).sqrt() * center_dot;
+                let cos_v = if view.mask[idx] {
+                    let gn = view.normals[idx];
+                    (-(d[0] * gn[0].to_f32() + d[1] * gn[1].to_f32() + d[2] * gn[2].to_f32()))
+                        .clamp(0.15, 1.0)
+                } else {
+                    1.0
+                };
+                rays.push(ang_pix / cos_v.sqrt());
+            }
             capacity = capacity
                 .checked_add(count)
                 .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
@@ -1661,6 +1695,26 @@ pub fn march_and_filter_device(
             rays.extend(o);
             rays.extend(d);
             rays.extend([near, far, step_size, capacity as f32, count as f32, r_f32]);
+            if scale_enc {
+                let center = dot(patch.dirs[4], patch.plane);
+                let r3 = center / dot(patch.dirs[3], patch.plane);
+                let r5 = center / dot(patch.dirs[5], patch.plane);
+                let r1 = center / dot(patch.dirs[1], patch.plane);
+                let r7 = center / dot(patch.dirs[7], patch.plane);
+                let dx = std::array::from_fn::<f32, 3, _>(|k| {
+                    patch.dirs[5][k] * r5 - patch.dirs[3][k] * r3
+                });
+                let dy = std::array::from_fn::<f32, 3, _>(|k| {
+                    patch.dirs[7][k] * r7 - patch.dirs[1][k] * r1
+                });
+                let ang = 0.5 * (dot(dx, dx).sqrt() * dot(dy, dy).sqrt()).sqrt();
+                let cos_v = if patch.mask[4] > 0.5 {
+                    (-dot(patch.dirs[4], patch.normals[4])).clamp(0.15, 1.0)
+                } else {
+                    1.0
+                };
+                rays.push(ang / cos_v.sqrt());
+            }
             capacity = capacity
                 .checked_add(count)
                 .ok_or_else(|| anyhow::anyhow!("march capacity overflow"))?;
@@ -1683,13 +1737,13 @@ pub fn march_and_filter_device(
             )
         })
         .clone();
-    let rays = tensor(rays, [n_patches, 12], device);
+    let rays = tensor(rays, [n_patches, ray_cols], device);
     let sample_cap = crate::sampling_gpu::bucket_capacity(capacity);
     let [samples, counts] = crate::sampling_gpu::march([
         rays.clone(),
         flags,
-        Tensor::empty([sample_cap, 2], device),
-        Tensor::empty([n_patches, 2], device),
+        crate::field::empty_2d(sample_cap, 2, device),
+        crate::field::empty_2d(n_patches, 2, device),
     ]);
     let (march_prefix, total_marched, unique_ep_count, prev_loss) = if n_patches <= 4096 {
         let mode = if prev_stats.is_some() { 1u32 } else { 0u32 };
@@ -1732,9 +1786,9 @@ pub fn march_and_filter_device(
     if total_marched == 0 {
         return Ok((
             DeviceVisibleBatch {
-                marched: Tensor::empty([1, 3], device),
-                march_prefix,
-                vis_prefix: Tensor::zeros([n_patches, 2], device),
+                marched: crate::field::empty_2d(1, 3, device),
+                vis_m_begin: crate::field::zeros_2d(n_patches, 1, device),
+                vis_prefix: crate::field::zeros_2d(n_patches, 2, device),
                 vis_prefix_host: vec![0; n_patches],
                 vis_ep_prefix_host: vec![0; n_patches],
                 total_visible: 0,
@@ -1754,14 +1808,16 @@ pub fn march_and_filter_device(
     let [marched, unique_pts, pairs, ranges] = crate::sampling_gpu::compact_and_center_endpoints(
         rays,
         samples,
-        march_prefix.clone(),
+        march_prefix,
         total_marched,
         padded_ep_cap,
+        scale_enc,
     );
     let march_seconds = march_started.elapsed().as_secs_f64();
 
     let vis_started = std::time::Instant::now();
-    let vis_out = field.visibility_device(unique_pts, unique_ep_count, pairs, ranges, query);
+    let [vis_out, vis_m_begin] =
+        field.visibility_device(unique_pts, unique_ep_count, pairs, ranges, query);
     let (vis_prefix, vis_prefix_host, vis_ep_prefix_host, total_visible, total_visible_endpoints, coords_tensor) =
         if group_size >= n_patches && n_patches <= 4096 {
             let [vp, meta_t] =
@@ -1859,7 +1915,7 @@ pub fn march_and_filter_device(
     Ok((
         DeviceVisibleBatch {
             marched,
-            march_prefix,
+            vis_m_begin,
             vis_prefix,
             vis_prefix_host,
             vis_ep_prefix_host,
@@ -1889,6 +1945,7 @@ pub fn prepare_geometry_from_device_batch(
     normal_den: f32,
     pixel_den: f32,
     sample_den: f32,
+    scale_encoding: bool,
     device: &burn::tensor::Device,
 ) -> Option<DevicePreparedGeometry> {
     use crate::field::tensor;
@@ -1928,7 +1985,7 @@ pub fn prepare_geometry_from_device_batch(
     let [endpoints, descriptors, mapping, reverse] =
         crate::sampling_gpu::build_visible_geometry_tables(
             vis_batch.marched.clone(),
-            vis_batch.march_prefix.clone(),
+            vis_batch.vis_m_begin.clone(),
             vis_batch.vis_prefix.clone(),
             start,
             patch_count,
@@ -1955,23 +2012,38 @@ pub fn prepare_geometry_from_device_batch(
         (gr, Some(pp))
     } else {
         let sub_patches = &patches[start..end];
-        let mut rays = Vec::with_capacity(sub_patches.len() * 39);
+        let mut rays = Vec::with_capacity(sub_patches.len() * 40);
         for p in sub_patches {
             rays.extend(p.origin);
             rays.extend(p.dirs.iter().flatten().copied());
             let center = dot(p.dirs[4], p.plane);
-            rays.extend(p.dirs.iter().map(|&d| center / dot(d, p.plane)));
+            let ratios: [f32; 9] = std::array::from_fn(|j| center / dot(p.dirs[j], p.plane));
+            rays.extend(ratios);
+            let dx = std::array::from_fn::<f32, 3, _>(|k| {
+                p.dirs[5][k] * ratios[5] - p.dirs[3][k] * ratios[3]
+            });
+            let dy = std::array::from_fn::<f32, 3, _>(|k| {
+                p.dirs[7][k] * ratios[7] - p.dirs[1][k] * ratios[1]
+            });
+            let ang = 0.5 * (dot(dx, dx).sqrt() * dot(dy, dy).sqrt()).sqrt();
+            let cos_v = if p.mask[4] > 0.5 {
+                (-dot(p.dirs[4], p.normals[4])).clamp(0.15, 1.0)
+            } else {
+                1.0
+            };
+            rays.push(ang / cos_v.sqrt());
         }
-        (tensor(rays, [sub_patches.len(), 39], device), None)
+        (tensor(rays, [sub_patches.len(), 40], device), None)
     };
     let padded_pts = Field::padded_point_capacity(valid_points, query);
     let vis_cap = crate::sampling_gpu::bucket_capacity(vis_count);
+    let pt_cols = if scale_encoding { 4 } else { 3 };
     let [unique_points, geometry] = crate::sampling_gpu::geometry(
         [
             geom_rays,
             endpoints,
             descriptors,
-            crate::field::empty_2d(padded_pts, 3, device),
+            crate::field::empty_2d(padded_pts, pt_cols, device),
             crate::field::empty_2d(vis_cap, 27, device),
         ],
         valid_points,
@@ -2005,14 +2077,14 @@ pub fn prepare_geometry_device(
     burn::tensor::Tensor<2>,
 ) {
     use crate::field::tensor;
-    use burn::tensor::Tensor;
     assert!(!samples.is_empty());
-    let mut rays = Vec::with_capacity(patches.len() * 39);
+    let mut rays = Vec::with_capacity(patches.len() * 40);
     for p in patches {
         rays.extend(p.origin);
         rays.extend(p.dirs.iter().flatten().copied());
         let center = dot(p.dirs[4], p.plane);
         rays.extend(p.dirs.iter().map(|&d| center / dot(d, p.plane)));
+        rays.push(0.0);
     }
     let mut endpoints = Vec::with_capacity(samples.len() * 4);
     let mut descriptors = Vec::with_capacity(samples.len() * 5);
@@ -2052,11 +2124,11 @@ pub fn prepare_geometry_device(
     let vis_cap = crate::sampling_gpu::bucket_capacity(samples.len());
     let [points, geometry] = crate::sampling_gpu::geometry(
         [
-            tensor(rays, [patches.len(), 39], device),
+            tensor(rays, [patches.len(), 40], device),
             tensor(endpoints, [count, 2], device),
             tensor(descriptors, [samples.len(), 5], device),
-            Tensor::empty([padded_pts, 3], device),
-            Tensor::empty([vis_cap, 27], device),
+            crate::field::empty_2d(padded_pts, 3, device),
+            crate::field::empty_2d(vis_cap, 27, device),
         ],
         valid_points,
         samples.len(),

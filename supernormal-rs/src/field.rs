@@ -10,12 +10,44 @@ pub struct ParameterMeta {
     pub file: String,
 }
 
+fn default_scale_cutoff() -> f32 {
+    0.45
+}
+fn default_base_resolution() -> usize {
+    32
+}
+fn default_max_resolution() -> usize {
+    1175
+}
+fn default_log2_hashmap_size() -> u32 {
+    19
+}
+
+pub fn hash_level_resolution(base_res: usize, max_res: usize, level: usize) -> usize {
+    if base_res == 32 && max_res == 1175 {
+        (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as usize
+    } else {
+        let growth = (max_res as f64 / base_res as f64).powf(1.0 / 13.0);
+        (base_res as f64 * growth.powi(level as i32)).floor() as usize
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
     pub format_version: u32,
     pub step: usize,
     pub active_levels: usize,
     pub parameters: Vec<ParameterMeta>,
+    #[serde(default)]
+    pub scale_encoding: bool,
+    #[serde(default = "default_scale_cutoff")]
+    pub scale_cutoff: f32,
+    #[serde(default = "default_base_resolution")]
+    pub base_resolution: usize,
+    #[serde(default = "default_max_resolution")]
+    pub max_resolution: usize,
+    #[serde(default = "default_log2_hashmap_size")]
+    pub log2_hashmap_size: u32,
 }
 
 pub struct Parameter {
@@ -66,6 +98,12 @@ pub struct Field {
     pub hybrid_activation_cache: bool,
     pub fused_mlp_packing: bool,
     pub fused_backward_params: bool,
+    pub front_prune: bool,
+    pub scale_encoding: bool,
+    pub scale_cutoff: f32,
+    pub base_resolution: usize,
+    pub max_resolution: usize,
+    pub log2_hashmap_size: u32,
     packed_mlp: std::cell::RefCell<Option<Tensor<2>>>,
     packed_mlp_state: Option<(Tensor<2>, usize)>,
     inference_weights: std::cell::RefCell<Option<(Tensor<2>, Tensor<2>)>>,
@@ -216,8 +254,15 @@ impl PendingEvaluation {
 const MAX_CACHED_CHUNKS: usize = 6;
 
 impl Field {
+    #[inline]
+    pub fn hashmap_size(&self) -> usize {
+        1usize << self.log2_hashmap_size
+    }
+
     fn build_packed_embedding(
         params: &BTreeMap<String, Parameter>,
+        base_resolution: usize,
+        max_resolution: usize,
         device: &Device,
     ) -> (Parameter, Tensor<2>, Vec<usize>, Vec<usize>) {
         let mut values = Vec::with_capacity(14);
@@ -230,7 +275,7 @@ impl Field {
         offsets.push(0);
 
         for level in 0..14 {
-            let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as usize;
+            let res = hash_level_resolution(base_resolution, max_resolution, level);
             let name = format!("encoding.embeddings.{level}");
             let p = &params[&name];
             let rows = p.value.dims()[0];
@@ -344,7 +389,24 @@ impl Field {
         self.sync_packed_mlp_to_params();
     }
 
+    #[allow(dead_code)]
     pub fn new(device: Device, seed: u64) -> Self {
+        Self::new_with_encoding(
+            device,
+            seed,
+            default_base_resolution(),
+            default_max_resolution(),
+            default_log2_hashmap_size(),
+        )
+    }
+
+    pub fn new_with_encoding(
+        device: Device,
+        seed: u64,
+        base_resolution: usize,
+        max_resolution: usize,
+        log2_hashmap_size: u32,
+    ) -> Self {
         use rand::{Rng, SeedableRng};
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
         let mut params = BTreeMap::new();
@@ -353,15 +415,16 @@ impl Field {
                 name,
                 Parameter {
                     value: tensor(values, shape, &device).require_grad(),
-                    m: Tensor::zeros(shape, &device),
-                    v: Tensor::zeros(shape, &device),
+                    m: zeros_2d(shape[0], shape[1], &device),
+                    v: zeros_2d(shape[0], shape[1], &device),
                     updates: 0,
                 },
             );
         };
-        for l in 0..14 {
-            let res = (32f64 * 1.3195079107728942f64.powi(l)).floor() as usize;
-            let entries = ((res + 1).pow(3)).min(524288);
+        let hashmap_size = 1usize << log2_hashmap_size;
+        for l in 0..14usize {
+            let res = hash_level_resolution(base_resolution, max_resolution, l);
+            let entries = (res + 1).saturating_pow(3).min(hashmap_size);
             add(
                 format!("encoding.embeddings.{l}"),
                 (0..entries * 2)
@@ -404,7 +467,7 @@ impl Field {
         add("variance".into(), vec![0.5], [1, 1]);
 
         let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
-            Self::build_packed_embedding(&params, &device);
+            Self::build_packed_embedding(&params, base_resolution, max_resolution, &device);
         let packed_mlp_state = Self::build_packed_mlp_state(&params);
 
         let _ = device.sync();
@@ -454,6 +517,12 @@ impl Field {
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
             fused_backward_params: true,
+            front_prune: true,
+            scale_encoding: false,
+            scale_cutoff: default_scale_cutoff(),
+            base_resolution,
+            max_resolution,
+            log2_hashmap_size,
             packed_mlp: std::cell::RefCell::new(None),
             packed_mlp_state,
             inference_weights: std::cell::RefCell::new(None),
@@ -489,8 +558,8 @@ impl Field {
                 (m, v, updates)
             } else {
                 (
-                    Tensor::zeros(p.shape, &device),
-                    Tensor::zeros(p.shape, &device),
+                    zeros_2d(p.shape[0], p.shape[1], &device),
+                    zeros_2d(p.shape[0], p.shape[1], &device),
                     0,
                 )
             };
@@ -511,7 +580,7 @@ impl Field {
             .without_autodiff()
             .into_scalar();
         let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
-            Self::build_packed_embedding(&params, &device);
+            Self::build_packed_embedding(&params, m.base_resolution, m.max_resolution, &device);
         let packed_mlp_state = Self::build_packed_mlp_state(&params);
 
         let _ = device.sync();
@@ -561,6 +630,12 @@ impl Field {
             hybrid_activation_cache: false,
             fused_mlp_packing: true,
             fused_backward_params: true,
+            front_prune: true,
+            scale_encoding: m.scale_encoding,
+            scale_cutoff: m.scale_cutoff,
+            base_resolution: m.base_resolution,
+            max_resolution: m.max_resolution,
+            log2_hashmap_size: m.log2_hashmap_size,
             packed_mlp: std::cell::RefCell::new(None),
             packed_mlp_state,
             inference_weights: std::cell::RefCell::new(None),
@@ -576,6 +651,11 @@ impl Field {
             step: self.step,
             active_levels: self.active,
             parameters: vec![],
+            scale_encoding: self.scale_encoding,
+            scale_cutoff: self.scale_cutoff,
+            base_resolution: self.base_resolution,
+            max_resolution: self.max_resolution,
+            log2_hashmap_size: self.log2_hashmap_size,
         };
         for (name, p) in &self.params {
             let file = format!("{}.bin", name.replace('.', "_"));
@@ -716,6 +796,7 @@ impl Field {
                 }
             };
         }
+        let pt_cols = points.dims()[1];
         let mut outputs: Vec<Tensor<2>> = (0..valid_count)
             .step_by(chunk)
             .map(|start| {
@@ -724,13 +805,16 @@ impl Field {
                 let xyz = if start == 0 && total_rows == padded_n {
                     points.clone()
                 } else if start + padded_n <= total_rows {
-                    points.clone().slice([start..start + padded_n, 0..3])
+                    points.clone().slice([start..start + padded_n, 0..pt_cols])
                 } else {
-                    let pts = points.clone().slice([start..start + n, 0..3]);
+                    let pts = points.clone().slice([start..start + n, 0..pt_cols]);
                     if padded_n == n {
                         pts
                     } else {
-                        Tensor::cat(vec![pts, Tensor::empty([padded_n - n, 3], &self.device)], 0)
+                        Tensor::cat(
+                            vec![pts, empty_2d(padded_n - n, pt_cols, &self.device)],
+                            0,
+                        )
                     }
                 };
                 if self.fused_field {
@@ -791,7 +875,7 @@ impl Field {
                 tensor(pairs, [samples, 2], &self.device),
                 tensor(ranges, [rays, 2], &self.device),
                 self.p("variance").without_autodiff(),
-                Tensor::empty([rays + 1, 1], &self.device),
+                empty_2d(rays + 1, 1, &self.device),
             ],
             self.reuse_endpoints,
         );
@@ -801,7 +885,7 @@ impl Field {
     }
 
     /// Evaluate visibility on device-resident center points, pairs, and ranges,
-    /// returning the `[rays + 1, 2]` result tensor without host transfers.
+    /// returning `[vis_out [rays + 1, 2], vis_m_begin [rays, 1]]` without host transfers.
     pub fn visibility_device(
         &self,
         unique_pts: Tensor<2>,
@@ -809,18 +893,20 @@ impl Field {
         pairs: Tensor<2>,
         ranges: Tensor<2>,
         chunk: usize,
-    ) -> Tensor<2> {
+    ) -> [Tensor<2>; 2] {
         let rays = ranges.dims()[0];
         let sdf = self.evaluate_device_tensor_valid(unique_pts, valid_ep_count, chunk);
-        crate::kernels::visibility(
+        crate::kernels::visibility_ext(
             [
                 sdf,
                 pairs,
                 ranges,
                 self.p("variance").without_autodiff(),
-                Tensor::empty([rays + 1, 2], &self.device),
+                empty_2d(rays + 1, 2, &self.device),
+                empty_2d(rays.max(1), 1, &self.device),
             ],
             self.reuse_endpoints,
+            self.front_prune,
         )
     }
 
@@ -846,11 +932,15 @@ impl Field {
             &self.device,
         );
         let active_levels = self.active.min(14);
+        let base_res = self.base_resolution;
+        let max_res = self.max_resolution;
+        let hashmap_size = self.hashmap_size();
+        let hash_mask = (hashmap_size - 1) as u32;
         let (all_indices, all_weights): (Vec<Vec<i32>>, Vec<Vec<f32>>) = (0..active_levels)
             .into_par_iter()
             .map(|level| {
-                let res = (32f64 * 1.3195079107728942f64.powi(level as i32)).floor() as u32;
-                let dense = (res as usize + 1).pow(3) <= 524288;
+                let res = hash_level_resolution(base_res, max_res, level) as u32;
+                let dense = (res as usize + 1).saturating_pow(3) <= hashmap_size;
                 let mut indices = Vec::with_capacity(n * 8);
                 let mut weights = Vec::with_capacity(n * 8);
                 for point in points {
@@ -873,7 +963,7 @@ impl Field {
                             v[0] + v[1] * (res + 1) + v[2] * (res + 1) * (res + 1)
                         } else {
                             (v[0] ^ v[1].wrapping_mul(2654435761) ^ v[2].wrapping_mul(805459861))
-                                & 524287
+                                & hash_mask
                         };
                         indices.push(idx as i32);
                         weights.push(weight);
@@ -991,12 +1081,12 @@ impl Field {
         let n = xyz.shape().dims::<2>()[0];
         let active = self.active.min(14);
         if active == 0 {
-            return Tensor::cat(vec![xyz, Tensor::zeros([n, 28], &self.device)], 1);
+            return Tensor::cat(vec![xyz, zeros_2d(n, 28, &self.device)], 1);
         }
         let features = if active < 14 {
-            Tensor::zeros([n, 31], &self.device)
+            zeros_2d(n, 31, &self.device)
         } else {
-            Tensor::empty([n, 31], &self.device)
+            empty_2d(n, 31, &self.device)
         };
         let (tables, metadata) = self.packed_tables();
         crate::kernels::forward_packed(xyz, tables, metadata, features, active)
@@ -1063,6 +1153,7 @@ impl Field {
             self.point_tiles,
             self.subgroup_reduce,
             self.selective_forward_weights,
+            self.hashmap_size(),
         )
     }
 
@@ -1086,6 +1177,8 @@ impl Field {
             self.point_tiles,
             self.subgroup_reduce,
             self.selective_forward_weights,
+            self.hashmap_size(),
+            self.scale_cutoff,
         )
     }
 
@@ -1100,7 +1193,7 @@ impl Field {
         self.enqueue_cached_inputs(inputs)
     }
 
-    /// Consume generated GPU coordinates `[padded_cap, 3]` with `valid_count`
+    /// Consume generated GPU coordinates `[padded_cap, 3|4]` with `valid_count`
     /// points in static power-of-two `chunk` buckets without downloading/re-uploading
     /// or issuing `Tensor::zeros` + `Tensor::cat` padding copies.
     pub fn enqueue_cached_device_valid(
@@ -1109,20 +1202,25 @@ impl Field {
         valid_count: usize,
         chunk: usize,
     ) -> PendingEvaluation {
-        let total_rows = points.dims()[0];
+        let dims = points.dims();
+        let total_rows = dims[0];
+        let pt_cols = dims[1];
         let inputs = (0..valid_count).step_by(chunk).map(|start| {
             let n = (valid_count - start).min(chunk);
             let padded = Self::static_bucket_size(n, chunk);
             let pts = if start == 0 && total_rows == padded {
                 points.clone()
             } else if start + padded <= total_rows {
-                points.clone().slice([start..start + padded, 0..3])
+                points.clone().slice([start..start + padded, 0..pt_cols])
             } else {
-                let sub = points.clone().slice([start..start + n, 0..3]);
+                let sub = points.clone().slice([start..start + n, 0..pt_cols]);
                 if padded == n {
                     sub
                 } else {
-                    Tensor::cat(vec![sub, Tensor::empty([padded - n, 3], &self.device)], 0)
+                    Tensor::cat(
+                        vec![sub, empty_2d(padded - n, pt_cols, &self.device)],
+                        0,
+                    )
                 }
             };
             (n, pts)
@@ -1409,7 +1507,7 @@ impl Field {
                     crate::diagnostics::count("field.fused_feature_replay_points", n);
                     // Placeholder only: the shader rebuilds h in registers from f.
                     // Keep this separate from the feature output binding.
-                    (f, Tensor::empty([1, 64], &self.device))
+                    (f, empty_2d(1, 64, &self.device))
                 }
                 (Some(f), None) => {
                     crate::diagnostics::count("field.mlp_only_recomputed_points", n);
@@ -1431,7 +1529,9 @@ impl Field {
                     if self.fused_field
                         && self.fused_hash_replay
                         && self.fused_feature_replay
-                        && !self.recompute_parameter_gradients =>
+                        && !self.recompute_parameter_gradients
+                        && !self.scale_encoding
+                        && self.log2_hashmap_size == 19 =>
                 {
                     replay_features = true;
                     replay_hash = true;
@@ -1439,8 +1539,8 @@ impl Field {
                     // Backward writes f and consumes h directly in registers.
                     // No forward SDF or [N,64] preactivation allocation is needed.
                     (
-                        Tensor::empty([padded_n, 31], &self.device),
-                        Tensor::empty([1, 64], &self.device),
+                        empty_2d(padded_n, 31, &self.device),
+                        empty_2d(1, 64, &self.device),
                     )
                 }
                 _ => {
@@ -1496,6 +1596,8 @@ impl Field {
                     self.selective_backward_weights,
                     accumulate,
                     self.active_parameter_columns,
+                    self.hashmap_size(),
+                    self.scale_cutoff,
                 );
                 accumulated.params.insert("encoding.packed".into(), updated);
                 fused_partials = Some((next_dw0p, next_dw1p));
@@ -1869,12 +1971,133 @@ impl Field {
             p.value = updated.autodiff().require_grad();
         }
         let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
-            Self::build_packed_embedding(&self.params, &self.device);
+            Self::build_packed_embedding(
+                &self.params,
+                self.base_resolution,
+                self.max_resolution,
+                &self.device,
+            );
         self.packed_embedding = Some(packed_embedding);
         self.packed_metadata = Some(packed_metadata);
         self.level_offsets = level_offsets;
         self.level_u32_updates = level_u32_updates;
         self.packed_mlp_state = Self::build_packed_mlp_state(&self.params);
+    }
+
+    pub fn reset_optimizer_state(&mut self) {
+        self.sync_packed_to_params();
+        self.inference_weights.get_mut().take();
+        self.packed_mlp.get_mut().take();
+        self.persistent_table_grad.get_mut().take();
+        for p in self.params.values_mut() {
+            let dims = p.value.dims();
+            p.m = zeros_2d(dims[0], dims[1], &self.device);
+            p.v = zeros_2d(dims[0], dims[1], &self.device);
+            p.updates = 0;
+        }
+        let (packed_embedding, packed_metadata, level_offsets, level_u32_updates) =
+            Self::build_packed_embedding(
+                &self.params,
+                self.base_resolution,
+                self.max_resolution,
+                &self.device,
+            );
+        self.packed_embedding = Some(packed_embedding);
+        self.packed_metadata = Some(packed_metadata);
+        self.level_offsets = level_offsets;
+        self.level_u32_updates = level_u32_updates;
+        self.packed_mlp_state = Self::build_packed_mlp_state(&self.params);
+    }
+
+    /// Rapidly fit the coarse SDF field (`active = 2`) to a conservative 3D visual-hull
+    /// signed distance grid `hull_sdf` (`res^3`, layout `(cx * res + cy) * res + cz`,
+    /// `> 0` outside, `< 0` inside), then reset Adam moments before Step 1.
+    pub fn warmstart_from_hull_sdf(&mut self, hull_sdf: &[f32], res: usize, seed: u64) {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed ^ 0x5648_554C_4C30_u64);
+        let rr = res * res;
+        let band_cells: Vec<usize> = hull_sdf
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| (d.abs() < 0.08).then_some(i))
+            .collect();
+
+        let sample_trilinear = |p: [f32; 3]| -> f32 {
+            let max_c = (res - 1) as f32;
+            let gx = ((p[0] + 1.0) * 0.5 * res as f32 - 0.5).clamp(0.0, max_c);
+            let gy = ((p[1] + 1.0) * 0.5 * res as f32 - 0.5).clamp(0.0, max_c);
+            let gz = ((p[2] + 1.0) * 0.5 * res as f32 - 0.5).clamp(0.0, max_c);
+            let ix = (gx as usize).min(res - 2);
+            let iy = (gy as usize).min(res - 2);
+            let iz = (gz as usize).min(res - 2);
+            let fx = (gx - ix as f32).clamp(0.0, 1.0);
+            let fy = (gy - iy as f32).clamp(0.0, 1.0);
+            let fz = (gz - iz as f32).clamp(0.0, 1.0);
+            let base = ix * rr + iy * res + iz;
+            let c000 = hull_sdf[base];
+            let c001 = hull_sdf[base + 1];
+            let c010 = hull_sdf[base + res];
+            let c011 = hull_sdf[base + res + 1];
+            let c100 = hull_sdf[base + rr];
+            let c101 = hull_sdf[base + rr + 1];
+            let c110 = hull_sdf[base + rr + res];
+            let c111 = hull_sdf[base + rr + res + 1];
+            let c00 = c000 * (1.0 - fz) + c001 * fz;
+            let c01 = c010 * (1.0 - fz) + c011 * fz;
+            let c10 = c100 * (1.0 - fz) + c101 * fz;
+            let c11 = c110 * (1.0 - fz) + c111 * fz;
+            let c0 = c00 * (1.0 - fy) + c01 * fy;
+            let c1 = c10 * (1.0 - fy) + c11 * fy;
+            c0 * (1.0 - fx) + c1 * fx
+        };
+
+        let prev_active = self.active;
+        self.active = 2;
+        let n_pts = 16384usize;
+        let pt_cols = if self.scale_encoding { 4 } else { 3 };
+        let inv_r = 1.0_f32 / res as f32;
+
+        for _ in 0..80 {
+            let mut pts_flat = Vec::with_capacity(n_pts * pt_cols);
+            let mut targets = Vec::with_capacity(n_pts);
+            for k in 0..n_pts {
+                let p = if k < n_pts / 2 && !band_cells.is_empty() {
+                    let cell = band_cells[rng.random_range(0..band_cells.len())];
+                    let cx = cell / rr;
+                    let cy = (cell / res) % res;
+                    let cz = cell % res;
+                    [
+                        ((cx as f32 + rng.random::<f32>()) * inv_r) * 2.0 - 1.0,
+                        ((cy as f32 + rng.random::<f32>()) * inv_r) * 2.0 - 1.0,
+                        ((cz as f32 + rng.random::<f32>()) * inv_r) * 2.0 - 1.0,
+                    ]
+                } else {
+                    [
+                        rng.random_range(-1.0_f32..1.0),
+                        rng.random_range(-1.0_f32..1.0),
+                        rng.random_range(-1.0_f32..1.0),
+                    ]
+                };
+                pts_flat.extend(p);
+                if self.scale_encoding {
+                    pts_flat.push(0.002_f32);
+                }
+                targets.push(sample_trilinear(p));
+            }
+            let pts_t = tensor(pts_flat, [n_pts, pt_cols], &self.device);
+            let target_t = tensor(targets, [n_pts, 1], &self.device);
+            let pending = self.enqueue_cached_device_valid(pts_t, n_pts, n_pts);
+            let (pred_t, cached) = pending.into_device();
+            let adj = ((pred_t - target_t).clamp(-0.5, 0.5) * (2.0 / n_pts as f32))
+                .without_autodiff();
+            let mut grads = Gradients::default();
+            self.accumulate_gradients_device(cached, adj, &mut grads);
+            self.apply_gradients_packed(grads, 5e-3);
+        }
+
+        self.reset_optimizer_state();
+        self.active = prev_active;
+        let _ = self.device.sync();
     }
 }
 
