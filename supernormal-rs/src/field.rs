@@ -62,6 +62,7 @@ pub struct Field {
     pub active: usize,
     pub step: usize,
     pub device: Device,
+    pub is_cpu: bool,
     pub peak_reserved_bytes: std::cell::Cell<u64>,
     pub packed_embedding: Option<Parameter>,
     pub packed_metadata: Option<Tensor<2>>,
@@ -113,6 +114,15 @@ pub struct Field {
 pub fn tensor<const D: usize>(data: Vec<f32>, shape: [usize; D], device: &Device) -> Tensor<D> {
     let total: usize = shape.iter().product();
     Tensor::<1>::from_data(TensorData::new(data, [total]), device).reshape(shape)
+}
+
+/// Returns `true` if `device` is backed by Burn's CubeCL GPU backend (`Fusion<CubeBackend>`),
+/// and `false` if it is a pure-CPU backend such as `Device::flex()`.
+pub fn is_gpu_device(device: &Device) -> bool {
+    Tensor::<1>::empty([1], device)
+        .inner()
+        .try_into_primitive::<burn_fusion::Fusion<burn_cubecl::CubeBackend>>()
+        .is_ok()
 }
 
 /// Allocate an uninitialized 2D tensor with guaranteed contiguous row-major
@@ -470,6 +480,7 @@ impl Field {
             Self::build_packed_embedding(&params, base_resolution, max_resolution, &device);
         let packed_mlp_state = Self::build_packed_mlp_state(&params);
 
+        let is_cpu = !is_gpu_device(&device);
         let _ = device.sync();
         device.memory_cleanup();
         let peak = device
@@ -481,15 +492,16 @@ impl Field {
             active: 0,
             step: 0,
             device,
+            is_cpu,
             peak_reserved_bytes: std::cell::Cell::new(peak),
             packed_embedding: Some(packed_embedding),
             packed_metadata: Some(packed_metadata),
             level_offsets,
             level_u32_updates,
             variance_host: 0.5,
-            fused_field: true,
-            cpu_visibility: false,
-            tiled_gradients: true,
+            fused_field: !is_cpu,
+            cpu_visibility: is_cpu,
+            tiled_gradients: !is_cpu,
             local_hash: true,
             compact_gradients: true,
             wide_gradient_tiles: true,
@@ -511,12 +523,12 @@ impl Field {
             fused_feature_replay: true,
             fused_hash_replay: true,
             selective_forward_weights: true,
-            device_occupancy_update: true,
+            device_occupancy_update: !is_cpu,
             register_gradient_tiles: true,
             wide_parameter_rows: true,
             hybrid_activation_cache: false,
-            fused_mlp_packing: true,
-            fused_backward_params: true,
+            fused_mlp_packing: !is_cpu,
+            fused_backward_params: !is_cpu,
             front_prune: true,
             scale_encoding: false,
             scale_cutoff: default_scale_cutoff(),
@@ -583,6 +595,7 @@ impl Field {
             Self::build_packed_embedding(&params, m.base_resolution, m.max_resolution, &device);
         let packed_mlp_state = Self::build_packed_mlp_state(&params);
 
+        let is_cpu = !is_gpu_device(&device);
         let _ = device.sync();
         device.memory_cleanup();
         let peak = device
@@ -594,15 +607,16 @@ impl Field {
             active: m.active_levels,
             step: m.step,
             device,
+            is_cpu,
             peak_reserved_bytes: std::cell::Cell::new(peak),
             packed_embedding: Some(packed_embedding),
             packed_metadata: Some(packed_metadata),
             level_offsets,
             level_u32_updates,
             variance_host,
-            fused_field: true,
-            cpu_visibility: false,
-            tiled_gradients: true,
+            fused_field: !is_cpu,
+            cpu_visibility: is_cpu,
+            tiled_gradients: !is_cpu,
             local_hash: true,
             compact_gradients: true,
             wide_gradient_tiles: true,
@@ -624,12 +638,12 @@ impl Field {
             fused_feature_replay: true,
             fused_hash_replay: true,
             selective_forward_weights: true,
-            device_occupancy_update: true,
+            device_occupancy_update: !is_cpu,
             register_gradient_tiles: true,
             wide_parameter_rows: true,
             hybrid_activation_cache: false,
-            fused_mlp_packing: true,
-            fused_backward_params: true,
+            fused_mlp_packing: !is_cpu,
+            fused_backward_params: !is_cpu,
             front_prune: true,
             scale_encoding: m.scale_encoding,
             scale_cutoff: m.scale_cutoff,
@@ -1177,7 +1191,17 @@ impl Field {
     }
 
     pub fn compute_features_gpu(&self, xyz: Tensor<2>) -> Tensor<2> {
-        let n = xyz.shape().dims::<2>()[0];
+        let dims = xyz.dims();
+        let n = dims[0];
+        let cols = dims[1];
+        if self.is_cpu {
+            let flat = xyz.try_into_vec_as::<f32>().expect("CPU xyz read");
+            let pts: Vec<[f32; 3]> = flat
+                .chunks_exact(cols)
+                .map(|c| [c[0], c[1], c[2]])
+                .collect();
+            return self.compute_features_impl(&pts, false).0;
+        }
         let active = self.active.min(14);
         if active == 0 {
             return Tensor::cat(vec![xyz, zeros_2d(n, 28, &self.device)], 1);
@@ -1695,7 +1719,7 @@ impl Field {
     ) {
         let active_levels = self.active.min(14);
         let (tables, metadata) = self.packed_tables();
-        if !accumulated.params.contains_key("encoding.packed") {
+        if !self.is_cpu && !accumulated.params.contains_key("encoding.packed") {
             let total_entries = *self.level_offsets.last().unwrap();
             let grad_buf = self
                 .persistent_table_grad
@@ -2021,16 +2045,83 @@ impl Field {
             }
 
             if let Some(d_feat_tensor) = d_feat_tensor.filter(|_| active_levels > 0) {
-                let table_grad = accumulated.params.remove("encoding.packed").unwrap();
-                let updated = crate::kernels::backward_packed(
-                    chunk.pts_tensor,
-                    d_feat_tensor,
-                    metadata.clone(),
-                    table_grad,
-                    active_levels,
-                    n,
-                );
-                accumulated.params.insert("encoding.packed".into(), updated);
+                if self.is_cpu {
+                    let pt_cols = chunk.pts_tensor.dims()[1];
+                    let pts_flat = chunk
+                        .pts_tensor
+                        .try_into_vec_as::<f32>()
+                        .expect("CPU pts read");
+                    let df_flat = d_feat_tensor
+                        .try_into_vec_as::<f32>()
+                        .expect("CPU d_feat read");
+                    let hashmap_size = self.hashmap_size();
+                    let hash_mask = (hashmap_size - 1) as u32;
+                    if accumulated.host_tables.len() < active_levels {
+                        accumulated.host_tables.resize_with(active_levels, Vec::new);
+                    }
+                    for level in 0..active_levels {
+                        let res =
+                            hash_level_resolution(self.base_resolution, self.max_resolution, level)
+                                as u32;
+                        let entries = (res as usize + 1).saturating_pow(3).min(hashmap_size);
+                        let dense = (res as usize + 1).saturating_pow(3) <= hashmap_size;
+                        let table = &mut accumulated.host_tables[level];
+                        if table.is_empty() {
+                            table.resize(entries * 2, 0.0_f32);
+                        }
+                        let col = 3 + level * 2;
+                        for p_idx in 0..n {
+                            let g0 = df_flat[p_idx * 31 + col];
+                            let g1 = df_flat[p_idx * 31 + col + 1];
+                            if g0 == 0.0 && g1 == 0.0 {
+                                continue;
+                            }
+                            let p = [
+                                pts_flat[p_idx * pt_cols],
+                                pts_flat[p_idx * pt_cols + 1],
+                                pts_flat[p_idx * pt_cols + 2],
+                            ];
+                            let pos =
+                                p.map(|x| ((x + 1.) * 0.5).clamp(0., 1. - 1e-7) * res as f32);
+                            let base = pos.map(|x| x.floor() as u32);
+                            let w = [
+                                pos[0] - base[0] as f32,
+                                pos[1] - base[1] as f32,
+                                pos[2] - base[2] as f32,
+                            ];
+                            for corner in 0..8u32 {
+                                let b0 = corner & 1;
+                                let b1 = (corner >> 1) & 1;
+                                let b2 = (corner >> 2) & 1;
+                                let v0 = base[0] + b0;
+                                let v1 = base[1] + b1;
+                                let v2 = base[2] + b2;
+                                let wt = (if b0 == 0 { 1. - w[0] } else { w[0] })
+                                    * (if b1 == 0 { 1. - w[1] } else { w[1] })
+                                    * (if b2 == 0 { 1. - w[2] } else { w[2] });
+                                let idx = if dense {
+                                    (v0 + v1 * (res + 1) + v2 * (res + 1) * (res + 1)) as usize
+                                } else {
+                                    ((v0 ^ v1.wrapping_mul(2654435761) ^ v2.wrapping_mul(805459861))
+                                        & hash_mask) as usize
+                                };
+                                table[idx * 2] += wt * g0;
+                                table[idx * 2 + 1] += wt * g1;
+                            }
+                        }
+                    }
+                } else {
+                    let table_grad = accumulated.params.remove("encoding.packed").unwrap();
+                    let updated = crate::kernels::backward_packed(
+                        chunk.pts_tensor,
+                        d_feat_tensor,
+                        metadata.clone(),
+                        table_grad,
+                        active_levels,
+                        n,
+                    );
+                    accumulated.params.insert("encoding.packed".into(), updated);
+                }
             }
         }
 
@@ -2115,6 +2206,21 @@ impl Field {
         device_stats: Option<&Tensor<2>>,
         lr: f64,
     ) {
+        if self.is_cpu {
+            if let Some(stats) = device_stats {
+                gradients
+                    .params
+                    .entry("variance".into())
+                    .or_insert_with(|| stats.clone().slice([0..1, 3..4]));
+                gradients
+                    .params
+                    .entry("lin1.bias".into())
+                    .or_insert_with(|| stats.clone().slice([0..1, 4..5]));
+            }
+            let tensors = gradients.into_tensors(self);
+            self.apply_gradients(tensors, lr);
+            return;
+        }
         self.inference_weights.get_mut().take();
         self.packed_mlp.get_mut().take();
 
@@ -2321,7 +2427,7 @@ impl Field {
 
         let prev_active = self.active;
         self.active = 2;
-        let n_pts = 16384usize;
+        let n_pts = if self.is_cpu { 4096usize } else { 16384usize };
         let pt_cols = if self.scale_encoding { 4 } else { 3 };
         let inv_r = 1.0_f32 / res as f32;
 

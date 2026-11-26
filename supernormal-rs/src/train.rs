@@ -505,9 +505,21 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             args.log2_hashmap_size,
         )
     };
-    field.fused_field = !args.unfused_field;
-    field.cpu_visibility = args.cpu_visibility;
-    field.tiled_gradients = !args.untiled_gradients;
+    let is_cpu = field.is_cpu;
+    if is_cpu {
+        ensure!(
+            !args.scale_encoding,
+            "--scale-encoding is only supported on GPU backends; omit --scale-encoding for --cpu"
+        );
+        println!("CPU (Flex) mode active: using pure-CPU march, visibility, compositor, and hash grid.");
+    }
+    let cpu_march = args.cpu_march || is_cpu;
+    let cpu_visibility = args.cpu_visibility || is_cpu;
+    let cpu_composite = args.cpu_composite || is_cpu;
+    let cpu_occupancy = args.cpu_occupancy || is_cpu;
+    field.fused_field = !args.unfused_field && !is_cpu;
+    field.cpu_visibility = cpu_visibility;
+    field.tiled_gradients = !args.untiled_gradients && !is_cpu;
     field.local_hash = !args.legacy_hash_layout;
     field.compact_gradients = !args.legacy_output_gradients;
     field.wide_gradient_tiles = !args.legacy_gradient_tiles;
@@ -536,12 +548,12 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
     field.fused_feature_replay = !args.legacy_feature_replay;
     field.fused_hash_replay = !args.legacy_hash_replay;
     field.selective_forward_weights = !args.dense_forward_weight_loads;
-    field.device_occupancy_update = !args.legacy_occupancy_readback;
+    field.device_occupancy_update = !args.legacy_occupancy_readback && !is_cpu;
     field.register_gradient_tiles = !args.legacy_parameter_kernel;
     field.wide_parameter_rows = !args.legacy_parameter_rows;
     field.hybrid_activation_cache = args.hybrid_activation_cache && !args.no_hybrid_cache;
-    field.fused_mlp_packing = !args.legacy_mlp_packing;
-    field.fused_backward_params = !args.legacy_fused_backward;
+    field.fused_mlp_packing = !args.legacy_mlp_packing && !is_cpu;
+    field.fused_backward_params = !args.legacy_fused_backward && !is_cpu;
     field.front_prune = !args.no_front_prune;
     field.chunked_eval = args.chunked_eval;
     field.scale_encoding = args.scale_encoding;
@@ -586,7 +598,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             );
         }
     }
-    occ.cpu_update = args.cpu_occupancy;
+    occ.cpu_update = cpu_occupancy;
     let final_step = (field.step + args.steps).min(args.end_iter);
     let mut metrics = std::io::BufWriter::new(std::fs::File::create(args.out.join("metrics.csv"))?);
     writeln!(
@@ -598,9 +610,9 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         serde_json::to_vec_pretty(&args)?,
     )?;
 
-    let use_device_pipeline = !args.cpu_march
-        && !args.cpu_visibility
-        && !args.cpu_composite
+    let use_device_pipeline = !cpu_march
+        && !cpu_visibility
+        && !cpu_composite
         && !args.host_sample_compaction;
     let use_gpu_patch_gather = use_device_pipeline && !args.cpu_patch_upload;
     if use_gpu_patch_gather {
@@ -968,7 +980,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 args.query,
                 &mut rng,
             )?;
-            if args.cpu_march && !occ.cpu_update {
+            if cpu_march && !occ.cpu_update {
                 occ.sync_values()?;
             }
         }
@@ -1020,7 +1032,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     flush_deferred(dm, None, &mut progress, &mut metrics)?;
                 }
                 let march_started = std::time::Instant::now();
-                let marched = if args.cpu_march {
+                let marched = if cpu_march {
                     render::march(&patches, &occ, step_size, &mut rng)
                 } else {
                     render::march_device(&patches, &mut occ, step_size, &mut rng, &field.device)?
@@ -1070,7 +1082,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
             normal_den,
             pixel_den,
             sample_den,
-            args.cpu_composite,
+            cpu_composite,
         ));
         t_points += t0.elapsed().as_secs_f64();
         while let Some(batch) = prepared.take() {
@@ -1092,7 +1104,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                 &patches[start..end]
             };
             let t0 = std::time::Instant::now();
-            if !args.cpu_composite && unique_count == 0 {
+            if !cpu_composite && unique_count == 0 {
                 if end < total_patches {
                     let tp = std::time::Instant::now();
                     prepared = Some(prepare_batch(
@@ -1109,13 +1121,13 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         normal_den,
                         pixel_den,
                         sample_den,
-                        args.cpu_composite,
+                        cpu_composite,
                     ));
                     t_points += tp.elapsed().as_secs_f64();
                 }
                 continue;
             }
-            if !args.cpu_composite && unique_count > 0 {
+            if !cpu_composite && unique_count > 0 {
                 let (sdf, cache) = pending.expect("GPU pending evaluation").into_device();
                 t_eval += t0.elapsed().as_secs_f64();
                 let t1 = std::time::Instant::now();
@@ -1186,7 +1198,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                         normal_den,
                         pixel_den,
                         sample_den,
-                        args.cpu_composite,
+                        cpu_composite,
                     ));
                     t_points += tp.elapsed().as_secs_f64();
                 }
@@ -1210,7 +1222,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     normal_den,
                     pixel_den,
                     sample_den,
-                    args.cpu_composite,
+                    cpu_composite,
                 ));
                 field
                     .device
@@ -1265,7 +1277,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
                     normal_den,
                     pixel_den,
                     sample_den,
-                    args.cpu_composite,
+                    cpu_composite,
                 ));
             }
         }
@@ -1280,7 +1292,7 @@ pub fn train(args: TrainArgs, device: Device) -> Result<()> {
         // Keep the two optimizer scalars device-resident. When all MLP gradients
         // came from the fused device path, hand `device_stats` directly to the
         // single-workgroup fused MLP WeightNorm + Adam + pack kernel.
-        if !args.cpu_composite
+        if !cpu_composite
             && variance_grad == 0.0
             && sdf_bias_grad == 0.0
             && device_stats.is_some()

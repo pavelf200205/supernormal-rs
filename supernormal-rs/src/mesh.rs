@@ -507,6 +507,76 @@ fn build_visibility_scale_grid(
     crate::field::tensor(smoothed, [total, 1], device)
 }
 
+fn cpu_mesh_coarse_points(
+    res: usize,
+    block_size: usize,
+    device: &burn::tensor::Device,
+) -> burn::tensor::Tensor<2> {
+    let nb = (res - 1).div_ceil(block_size);
+    let c_res = nb + 1;
+    let inv = 1.0_f32 / (res - 1) as f32;
+    let max_idx = res - 1;
+    let mut flat = Vec::with_capacity(c_res * c_res * c_res * 3);
+    for cz in 0..c_res {
+        let gz = (cz * block_size).min(max_idx) as f32;
+        let pz = -1.0_f32 + 2.0_f32 * gz * inv;
+        for cy in 0..c_res {
+            let gy = (cy * block_size).min(max_idx) as f32;
+            let py = -1.0_f32 + 2.0_f32 * gy * inv;
+            for cx in 0..c_res {
+                let gx = (cx * block_size).min(max_idx) as f32;
+                flat.push(-1.0_f32 + 2.0_f32 * gx * inv);
+                flat.push(py);
+                flat.push(pz);
+            }
+        }
+    }
+    crate::field::tensor(flat, [c_res * c_res * c_res, 3], device)
+}
+
+fn cpu_mesh_sparse_band_points(
+    xy_flat: &[f32],
+    res: usize,
+    z_start: usize,
+    z_count: usize,
+    device: &burn::tensor::Device,
+) -> burn::tensor::Tensor<2> {
+    let k = xy_flat.len() / 2;
+    let inv = 1.0_f32 / (res - 1) as f32;
+    let mut flat = Vec::with_capacity(k * z_count * 3);
+    for lz in 0..z_count {
+        let pz = -1.0_f32 + 2.0_f32 * (z_start + lz) as f32 * inv;
+        for idx in 0..k {
+            flat.push(-1.0_f32 + 2.0_f32 * xy_flat[idx * 2] * inv);
+            flat.push(-1.0_f32 + 2.0_f32 * xy_flat[idx * 2 + 1] * inv);
+            flat.push(pz);
+        }
+    }
+    crate::field::tensor(flat, [k * z_count, 3], device)
+}
+
+fn cpu_mesh_slab_points_batch(
+    res: usize,
+    z_start: usize,
+    slab_count: usize,
+    device: &burn::tensor::Device,
+) -> burn::tensor::Tensor<2> {
+    let inv = 1.0_f32 / (res - 1) as f32;
+    let mut flat = Vec::with_capacity(slab_count * res * res * 3);
+    for slab in 0..slab_count {
+        let pz = -1.0_f32 + 2.0_f32 * (z_start + slab) as f32 * inv;
+        for y in 0..res {
+            let py = -1.0_f32 + 2.0_f32 * y as f32 * inv;
+            for x in 0..res {
+                flat.push(-1.0_f32 + 2.0_f32 * x as f32 * inv);
+                flat.push(py);
+                flat.push(pz);
+            }
+        }
+    }
+    crate::field::tensor(flat, [slab_count * res * res, 3], device)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_sparse_cells(
     field: &Field,
@@ -535,7 +605,11 @@ fn extract_sparse_cells(
         None
     };
 
-    let mut coarse_pts = crate::sampling_gpu::mesh_coarse_points(res, BLOCK_SIZE, &field.device);
+    let mut coarse_pts = if field.is_cpu {
+        cpu_mesh_coarse_points(res, BLOCK_SIZE, &field.device)
+    } else {
+        crate::sampling_gpu::mesh_coarse_points(res, BLOCK_SIZE, &field.device)
+    };
     if let Some((_, median_scale)) = &mesh_views {
         let const_grid = crate::field::tensor(vec![*median_scale; 8], [8, 1], &field.device);
         coarse_pts = crate::sampling_gpu::attach_mesh_scales(coarse_pts, const_grid, 2);
@@ -704,9 +778,12 @@ fn extract_sparse_cells(
     let enqueue_band = |plan: &BandPlan| -> burn::tensor::Tensor<2> {
         let k = plan.xy_indices.len();
         let z_count = plan.z1 - plan.z0 + 1;
-        let xy_tensor = crate::field::tensor(plan.xy_flat.clone(), [k, 2], &field.device);
-        let mut pts =
-            crate::sampling_gpu::mesh_sparse_band_points(xy_tensor, res, plan.z0, z_count);
+        let mut pts = if field.is_cpu {
+            cpu_mesh_sparse_band_points(&plan.xy_flat, res, plan.z0, z_count, &field.device)
+        } else {
+            let xy_tensor = crate::field::tensor(plan.xy_flat.clone(), [k, 2], &field.device);
+            crate::sampling_gpu::mesh_sparse_band_points(xy_tensor, res, plan.z0, z_count)
+        };
         if let Some((sg, sg_res)) = &scale_grid {
             pts = crate::sampling_gpu::attach_mesh_scales(pts, sg.clone(), *sg_res);
         }
@@ -883,8 +960,11 @@ pub fn extract_with_dataset(
                 return None;
             }
             let count = (res - z_start).min(BATCH_SLABS);
-            let mut pts =
-                crate::sampling_gpu::mesh_slab_points_batch(res, z_start, count, &field.device);
+            let mut pts = if field.is_cpu {
+                cpu_mesh_slab_points_batch(res, z_start, count, &field.device)
+            } else {
+                crate::sampling_gpu::mesh_slab_points_batch(res, z_start, count, &field.device)
+            };
             if let Some((sg, sg_res)) = scale_grid.as_ref() {
                 pts = crate::sampling_gpu::attach_mesh_scales(pts, sg.clone(), *sg_res);
             }
@@ -894,7 +974,11 @@ pub fn extract_with_dataset(
             Some((count, neg_sdf))
         };
 
-        let mut first_slab = crate::sampling_gpu::mesh_slab_points(res, 0, &field.device);
+        let mut first_slab = if field.is_cpu {
+            cpu_mesh_slab_points_batch(res, 0, 1, &field.device)
+        } else {
+            crate::sampling_gpu::mesh_slab_points(res, 0, &field.device)
+        };
         if let Some((sg, sg_res)) = scale_grid.as_ref() {
             first_slab = crate::sampling_gpu::attach_mesh_scales(first_slab, sg.clone(), *sg_res);
         }

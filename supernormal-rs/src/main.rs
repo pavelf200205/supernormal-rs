@@ -81,11 +81,15 @@ fn init_wgpu_device(api_str: &str, integrated: bool) -> Result<Device> {
 fn try_init_cuda_device(index: usize) -> Option<Device> {
     std::panic::catch_unwind(|| {
         let dev = Device::cuda(index);
-        // Probe device initialization so missing drivers/GPUs fall back cleanly to WGPU.
         let _ = dev.identity();
-        dev
+        // Probe NVRTC kernel compilation with a tiny op so machines with an NVIDIA
+        // driver (nvcuda.dll) but no CUDA Toolkit / NVRTC fall back cleanly to WGPU/Vulkan.
+        let probe = Tensor::<1>::from_floats([1.0f32], &dev);
+        let ok = (probe.clone() + probe).try_into_vec_as::<f32>().is_ok();
+        ok.then_some(dev)
     })
     .ok()
+    .flatten()
 }
 
 fn main() -> Result<()> {
@@ -106,7 +110,12 @@ fn main() -> Result<()> {
         {
             match try_init_cuda_device(cli.cuda_device) {
                 Some(dev) => dev,
-                None => init_wgpu_device("auto", false)?,
+                None => {
+                    eprintln!(
+                        "CUDA unavailable or NVRTC runtime not found; falling back to WGPU/Vulkan."
+                    );
+                    init_wgpu_device("auto", false)?
+                }
             }
         }
         #[cfg(not(feature = "cuda"))]
